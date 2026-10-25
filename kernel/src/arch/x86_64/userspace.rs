@@ -273,6 +273,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         neu_enter_user(CODE, USER_RSP, paging.root());
     }
     exceptions::configure_user_test(false)?;
+    paging.deactivate_user(&space)?;
     let valid = VALID.load(Ordering::Relaxed) && paging.user_result(&space)? == 42;
     paging.destroy_user(space)?;
     serial::write(format_args!(

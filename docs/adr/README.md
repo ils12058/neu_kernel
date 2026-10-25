@@ -98,3 +98,14 @@ proposals; Phase 2B requires a separate concrete ABI decision.
 ADR 0009 adds real SYSCALL entry and validated IRETQ return. ADR 0008's test-only
 interrupt gate remains an independent regression path. Operation numbers/statuses
 are provisional; this does not freeze the full Node, Thread or execution ABI.
+
+## Phase 3A record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0010: Independent bootstrap Nodes and fault containment](0010-independent-bootstrap-nodes-and-fault-containment.md) | Accepted, two live Nodes with sequential initial Threads | NEU-005/006 boundaries; NEU-007 incomplete; NEU-008/011; NEU-017/018/021/023/024 scoped subsets |
+
+ADR 0010 extends the singleton ownership/lifecycle portions of 0007–0009 while
+preserving the accepted ABI 0.1 contract. Full capability governance, multiple
+runnable Threads and scheduling remain unimplemented; related proposals are not
+accepted wholesale. Architecture v0.2 and the original ADR rationale are retained.

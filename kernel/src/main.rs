@@ -37,7 +37,13 @@ const _: () = assert!(
         + cfg!(feature = "test-native-return-rsp") as u8
         + cfg!(feature = "test-native-return-flags") as u8
         + cfg!(feature = "test-native-return-selectors") as u8
-        + cfg!(feature = "test-native-disabled") as u8)
+        + cfg!(feature = "test-native-disabled") as u8
+        + cfg!(feature = "test-nodes") as u8
+        + cfg!(feature = "test-nodes-a-fault") as u8
+        + cfg!(feature = "test-nodes-b-fault") as u8
+        + cfg!(feature = "test-nodes-cross") as u8
+        + cfg!(feature = "test-nodes-reclaim") as u8
+        + cfg!(feature = "test-nodes-rollback") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -190,7 +196,12 @@ extern "C" fn neu_main() -> ! {
         );
     }
 
-    #[cfg(feature = "native-test")]
+    #[cfg(feature = "node-test")]
+    if let Err(error) = arch::nodes::run(&mut paging) {
+        arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: Nodes {error:?}\n"));
+        arch::halt();
+    }
+    #[cfg(all(feature = "native-test", not(feature = "node-test")))]
     if let Err(error) = arch::native::run(&mut paging) {
         arch::serial::emergency(format_args!(
             "[NEU] BOOT FAILURE: native execution {error:?}\n"

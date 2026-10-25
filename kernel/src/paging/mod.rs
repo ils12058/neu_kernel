@@ -345,6 +345,31 @@ impl PageTree {
 
 pub const DATA_FRAMES: usize = 16;
 pub const MAPPINGS: usize = 64;
+pub const USER_SPACES: usize = 2;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceId {
+    slot: usize,
+    generation: u64,
+}
+impl SpaceId {
+    pub const KERNEL: Self = Self {
+        slot: usize::MAX,
+        generation: 0,
+    };
+    pub fn raw(self) -> u64 {
+        if self == Self::KERNEL {
+            0
+        } else {
+            (self.generation << 8) | (self.slot as u64 + 1)
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Space {
+    generation: u64,
+    live: bool,
+    root: u64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameId {
     slot: usize,
@@ -356,9 +381,11 @@ struct Frame {
     generation: u64,
     live: bool,
     initialized: bool,
+    owner: SpaceId,
 }
 #[derive(Clone, Copy)]
 pub struct Mapping {
+    pub space: SpaceId,
     pub address: u64,
     pub frame: FrameId,
     pub permissions: Permissions,
@@ -367,6 +394,8 @@ pub struct Mapping {
 pub struct Registry {
     frames: [Frame; DATA_FRAMES],
     mappings: [Mapping; MAPPINGS],
+    spaces: [Space; USER_SPACES],
+    active: Option<SpaceId>,
 }
 impl Default for Registry {
     fn default() -> Self {
@@ -381,8 +410,10 @@ impl Registry {
                 generation: 0,
                 live: false,
                 initialized: false,
+                owner: SpaceId::KERNEL,
             }; DATA_FRAMES],
             mappings: [Mapping {
+                space: SpaceId::KERNEL,
                 address: 0,
                 frame: FrameId {
                     slot: 0,
@@ -391,15 +422,112 @@ impl Registry {
                 permissions: Permissions::R,
                 live: false,
             }; MAPPINGS],
+            spaces: [Space {
+                generation: 0,
+                live: false,
+                root: 0,
+            }; USER_SPACES],
+            active: None,
         }
     }
-    pub fn insert(&mut self, physical: u64) -> Result<FrameId> {
-        self::physical(physical, 52)?;
-        if self
-            .frames
+    pub fn create_space(&mut self) -> Result<SpaceId> {
+        if self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        let slot = self
+            .spaces
             .iter()
-            .any(|frame| frame.live && frame.physical == physical)
+            .position(|s| !s.live && s.generation < (u64::MAX >> 8))
+            .ok_or(Error::Capacity)?;
+        let generation = self.spaces[slot].generation + 1;
+        self.spaces[slot] = Space {
+            generation,
+            live: true,
+            root: 0,
+        };
+        Ok(SpaceId { slot, generation })
+    }
+    fn space(&self, id: SpaceId) -> Result<&Space> {
+        self.spaces
+            .get(id.slot)
+            .filter(|s| s.live && s.generation == id.generation)
+            .ok_or(Error::NotOwned)
+    }
+    fn valid_space(&self, id: SpaceId) -> Result<()> {
+        if id == SpaceId::KERNEL {
+            Ok(())
+        } else {
+            self.space(id).map(|_| ())
+        }
+    }
+    pub fn can_allocate(&self, id: SpaceId) -> Result<()> {
+        self.valid_space(id)?;
+        if self.active.is_some() {
+            Err(Error::InUse)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn bind_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
+        self.space(id)?;
+        physical(root, 52)?;
+        if root == 0
+            || self.spaces[id.slot].root != 0
+            || self.spaces.iter().any(|s| s.live && s.root == root)
         {
+            return Err(Error::InUse);
+        }
+        self.spaces[id.slot].root = root;
+        Ok(())
+    }
+    pub fn root(&self, id: SpaceId) -> Result<u64> {
+        Ok(self.space(id)?.root)
+    }
+    pub fn activate_space(&mut self, id: SpaceId) -> Result<()> {
+        if self.root(id)? == 0 || self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        self.active = Some(id);
+        Ok(())
+    }
+    pub fn deactivate_space(&mut self, id: SpaceId) -> Result<()> {
+        self.space(id)?;
+        if self.active != Some(id) {
+            return Err(Error::NotOwned);
+        }
+        self.active = None;
+        Ok(())
+    }
+    pub fn clear_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
+        if self.root(id)? != root
+            || self.active == Some(id)
+            || self.frames.iter().any(|f| f.live && f.owner == id)
+            || self.mappings.iter().any(|m| m.live && m.space == id)
+        {
+            return Err(Error::InUse);
+        }
+        self.spaces[id.slot].root = 0;
+        Ok(())
+    }
+    pub fn retire_space(&mut self, id: SpaceId) -> Result<()> {
+        self.space(id)?;
+        if self.active == Some(id)
+            || self.spaces[id.slot].root != 0
+            || self.frames.iter().any(|f| f.live && f.owner == id)
+            || self.mappings.iter().any(|m| m.live && m.space == id)
+        {
+            return Err(Error::InUse);
+        }
+        self.spaces[id.slot].live = false;
+        Ok(())
+    }
+    pub fn insert(&mut self, physical: u64) -> Result<FrameId> {
+        self.insert_for(SpaceId::KERNEL, physical)
+    }
+    pub fn insert_for(&mut self, owner: SpaceId, address: u64) -> Result<FrameId> {
+        self.can_allocate(owner)?;
+        physical(address, 52)?;
+        if self.frames.iter().any(|f| f.live && f.physical == address) {
             return Err(Error::InUse);
         }
         let slot = self
@@ -409,21 +537,28 @@ impl Registry {
             .ok_or(Error::Capacity)?;
         let generation = self.frames[slot].generation + 1;
         self.frames[slot] = Frame {
-            physical,
+            physical: address,
             generation,
             live: true,
             initialized: false,
+            owner,
         };
         Ok(FrameId { slot, generation })
     }
     fn frame(&self, id: FrameId) -> Result<&Frame> {
-        self.frames
+        let frame = self
+            .frames
             .get(id.slot)
             .filter(|f| f.live && f.generation == id.generation)
-            .ok_or(Error::NotOwned)
+            .ok_or(Error::NotOwned)?;
+        self.valid_space(frame.owner)?;
+        Ok(frame)
     }
     pub fn physical(&self, id: FrameId) -> Result<u64> {
         Ok(self.frame(id)?.physical)
+    }
+    pub fn owner(&self, id: FrameId) -> Result<SpaceId> {
+        Ok(self.frame(id)?.owner)
     }
     pub fn initialize(&mut self, id: FrameId) -> Result<()> {
         self.frame(id)?;
@@ -437,16 +572,18 @@ impl Registry {
             .iter()
             .any(|m| m.live && m.frame == id && m.permissions.execute)
         {
-            return Err(Error::Wx);
+            Err(Error::Wx)
+        } else {
+            Ok(())
         }
-        Ok(())
     }
     pub fn releasable(&self, id: FrameId) -> Result<u64> {
-        let address = self.physical(id)?;
-        if self.mappings.iter().any(|m| m.live && m.frame == id) {
+        let frame = self.frame(id)?;
+        if self.active == Some(frame.owner) || self.mappings.iter().any(|m| m.live && m.frame == id)
+        {
             return Err(Error::InUse);
         }
-        Ok(address)
+        Ok(frame.physical)
     }
     pub fn retire(&mut self, id: FrameId) -> Result<()> {
         self.releasable(id)?;
@@ -454,7 +591,7 @@ impl Registry {
         Ok(())
     }
     pub fn prepare(&self, base: u64, frames: &[FrameId], permissions: Permissions) -> Result<()> {
-        self.prepare_kind(base, frames, permissions, false)
+        self.prepare_kind(Target::KERNEL, base, frames, permissions)
     }
     pub fn prepare_user(
         &self,
@@ -462,16 +599,25 @@ impl Registry {
         frames: &[FrameId],
         permissions: Permissions,
     ) -> Result<()> {
-        self.prepare_kind(base, frames, permissions, true)
+        self.prepare_kind(
+            Target {
+                space: SpaceId::KERNEL,
+                user: true,
+            },
+            base,
+            frames,
+            permissions,
+        )
     }
     fn prepare_kind(
         &self,
+        target: Target,
         base: u64,
         frames: &[FrameId],
         permissions: Permissions,
-        user: bool,
     ) -> Result<()> {
-        if user {
+        self.can_allocate(target.space)?;
+        if target.user {
             user_range(base, frames.len())?;
         } else {
             test_range(base, frames.len())?;
@@ -481,11 +627,15 @@ impl Registry {
             return Err(Error::Capacity);
         }
         for (index, id) in frames.iter().copied().enumerate() {
-            if !self.frame(id)?.initialized {
+            let frame = self.frame(id)?;
+            if frame.owner != target.space {
+                return Err(Error::NotOwned);
+            }
+            if !frame.initialized {
                 return Err(Error::Uninitialized);
             }
             let address = base + index as u64 * PAGE;
-            if self.mapping(address).is_ok() {
+            if self.mapping_for(target.space, address).is_ok() {
                 return Err(Error::AlreadyMapped);
             }
             if self.mappings.iter().any(|m| {
@@ -499,14 +649,13 @@ impl Registry {
         }
         Ok(())
     }
-    /// Called only after a successful prepare and completed page-table transaction.
     pub fn commit(
         &mut self,
         base: u64,
         frames: &[FrameId],
         permissions: Permissions,
     ) -> Result<()> {
-        self.commit_kind(base, frames, permissions, false)
+        self.commit_kind(Target::KERNEL, base, frames, permissions)
     }
     pub fn commit_user(
         &mut self,
@@ -514,16 +663,24 @@ impl Registry {
         frames: &[FrameId],
         permissions: Permissions,
     ) -> Result<()> {
-        self.commit_kind(base, frames, permissions, true)
+        self.commit_kind(
+            Target {
+                space: SpaceId::KERNEL,
+                user: true,
+            },
+            base,
+            frames,
+            permissions,
+        )
     }
     fn commit_kind(
         &mut self,
+        target: Target,
         base: u64,
         frames: &[FrameId],
         permissions: Permissions,
-        user: bool,
     ) -> Result<()> {
-        self.prepare_kind(base, frames, permissions, user)?;
+        self.prepare_kind(target, base, frames, permissions)?;
         for (index, frame) in frames.iter().copied().enumerate() {
             let slot = self
                 .mappings
@@ -531,6 +688,7 @@ impl Registry {
                 .position(|m| !m.live)
                 .ok_or(Error::Corrupt)?;
             self.mappings[slot] = Mapping {
+                space: target.space,
                 address: base + index as u64 * PAGE,
                 frame,
                 permissions,
@@ -540,25 +698,47 @@ impl Registry {
         Ok(())
     }
     pub fn mapping(&self, address: u64) -> Result<Mapping> {
+        self.mapping_for(SpaceId::KERNEL, address)
+    }
+    pub fn mapping_for(&self, space: SpaceId, address: u64) -> Result<Mapping> {
+        self.valid_space(space)?;
         self.mappings
             .iter()
             .copied()
-            .find(|m| m.live && m.address == address)
+            .find(|m| m.live && m.space == space && m.address == address)
             .ok_or(Error::NotMapped)
     }
     pub fn remove(&mut self, address: u64) -> Result<FrameId> {
+        self.remove_for(SpaceId::KERNEL, address)
+    }
+    pub fn remove_for(&mut self, space: SpaceId, address: u64) -> Result<FrameId> {
+        self.valid_space(space)?;
+        if self.active == Some(space) {
+            return Err(Error::InUse);
+        }
         let slot = self
             .mappings
             .iter()
-            .position(|m| m.live && m.address == address)
+            .position(|m| m.live && m.space == space && m.address == address)
             .ok_or(Error::NotMapped)?;
         self.mappings[slot].live = false;
         Ok(self.mappings[slot].frame)
     }
 }
+#[derive(Clone, Copy)]
+struct Target {
+    space: SpaceId,
+    user: bool,
+}
+impl Target {
+    const KERNEL: Self = Self {
+        space: SpaceId::KERNEL,
+        user: false,
+    };
+}
 
-/// Multi-page rollback is shared with the hardware manager. Backing ownership
-/// and mapping references are committed only after every leaf is installed.
+/// Default wrappers address one kernel/simulated tree. Runtime user roots must
+/// use a registered, generation-checked space key via map_user_frames_for.
 pub fn map_frames(
     tree: &PageTree,
     memory: &mut impl TableMemory,
@@ -567,9 +747,16 @@ pub fn map_frames(
     frames: &[FrameId],
     permissions: Permissions,
 ) -> Result<()> {
-    map_frames_kind(tree, memory, registry, base, frames, permissions, false)
+    map_frames_kind(
+        tree,
+        memory,
+        registry,
+        base,
+        frames,
+        permissions,
+        Target::KERNEL,
+    )
 }
-
 pub fn map_user_frames(
     tree: &PageTree,
     memory: &mut impl TableMemory,
@@ -578,9 +765,38 @@ pub fn map_user_frames(
     frames: &[FrameId],
     permissions: Permissions,
 ) -> Result<()> {
-    map_frames_kind(tree, memory, registry, base, frames, permissions, true)
+    map_user_frames_for(
+        tree,
+        memory,
+        registry,
+        SpaceId::KERNEL,
+        base,
+        frames,
+        permissions,
+    )
 }
-
+pub fn map_user_frames_for(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    space: SpaceId,
+    base: u64,
+    frames: &[FrameId],
+    permissions: Permissions,
+) -> Result<()> {
+    if space != SpaceId::KERNEL && registry.root(space)? != tree.root {
+        return Err(Error::NotOwned);
+    }
+    map_frames_kind(
+        tree,
+        memory,
+        registry,
+        base,
+        frames,
+        permissions,
+        Target { space, user: true },
+    )
+}
 fn map_frames_kind(
     tree: &PageTree,
     memory: &mut impl TableMemory,
@@ -588,13 +804,13 @@ fn map_frames_kind(
     base: u64,
     frames: &[FrameId],
     permissions: Permissions,
-    user: bool,
+    target: Target,
 ) -> Result<()> {
-    registry.prepare_kind(base, frames, permissions, user)?;
+    registry.prepare_kind(target, base, frames, permissions)?;
     for (index, frame) in frames.iter().copied().enumerate() {
         let va = base + index as u64 * PAGE;
         let pa = registry.physical(frame)?;
-        let result = if user {
+        let result = if target.user {
             tree.map_user(memory, va, pa, permissions)
         } else {
             tree.map(memory, va, pa, permissions)
@@ -606,7 +822,7 @@ fn map_frames_kind(
             return Err(error);
         }
     }
-    registry.commit_kind(base, frames, permissions, user)
+    registry.commit_kind(target, base, frames, permissions)
 }
 
 #[cfg(test)]

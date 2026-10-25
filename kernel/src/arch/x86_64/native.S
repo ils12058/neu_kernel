@@ -2,7 +2,7 @@
 # storage. No push/call or user-address dereference precedes the trusted RSP.
 .section .bss.native_entry,"aw",@nobits
 .balign 8
-.global neu_native_busy
+.global neu_native_busy, neu_native_observed
 neu_native_busy: .skip 8
 neu_native_saved_user_rsp: .skip 8
 neu_native_observed: .skip 8
@@ -159,13 +159,27 @@ neu_native_before_wait_end:
     cmp rdi, 11
     jne neu_native_failed
     call neu_native_check
+    movabs rcx, 0x401000
+    cmp qword ptr [rcx + 8], 8
+    jb 6f
+    mov rax, [rcx]
+    add rax, 7 # Independent Node seed (35 or 77) produces 42 or 84.
+    movabs rcx, 0x402000
+    mov [rcx], rax
+    xor eax, eax
+    jmp 7f
+6:
     movabs rcx, 0x402000
     mov qword ptr [rcx], 42
+7:
     mov ecx, 0x10000000
 neu_native_after_wait:
     dec ecx
     jne neu_native_after_wait
 neu_native_after_wait_end:
+    movabs rcx, 0x401000
+    cmp qword ptr [rcx + 8], 8
+    jae neu_node_action
     movabs rcx, 0x401000
     cmp qword ptr [rcx + 8], 1
     je 2f
@@ -253,6 +267,28 @@ neu_native_check:
     cmp rsp, rcx
     jne neu_native_failed
     ret
+# Node actions occur only after an actual query return and QMP user sample.
+.global neu_node_cross_site, neu_node_ud_site
+neu_node_action:
+    cmp qword ptr [rcx + 8], 10
+    je neu_node_cross
+    cmp qword ptr [rcx + 8], 11
+    je neu_node_ud_site
+    cmp qword ptr [rcx + 8], 9
+    jne 5b
+    movabs rcx, 0x406000
+    mov rax, [rcx] # B can actually read its own private-only page.
+    movabs rcx, {private_value}
+    cmp rax, rcx
+    jne neu_native_failed
+    jmp 5b
+neu_node_cross:
+    movabs rcx, 0x406000
+neu_node_cross_site:
+    mov rax, [rcx] # Absent in A; B's mapping must confer no authority here.
+    jmp neu_native_failed
+neu_node_ud_site:
+    ud2
 neu_native_failed:
     ud2
 neu_native_payload_end:

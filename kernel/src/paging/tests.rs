@@ -544,3 +544,192 @@ fn private_roots_share_backing_without_sharing_or_reclaiming_child_tables() {
         0x100000
     );
 }
+
+#[test]
+fn simultaneous_spaces_key_same_va_by_identity_and_reject_cross_owner_frames() {
+    let mut memory = Model::new();
+    let a = PageTree::new(&mut memory, 48).unwrap();
+    let b = PageTree::new(&mut memory, 48).unwrap();
+    let mut registry = Registry::new();
+    let sa = registry.create_space().unwrap();
+    let sb = registry.create_space().unwrap();
+    registry.bind_root(sa, a.root).unwrap();
+    registry.bind_root(sb, b.root).unwrap();
+    let fa = registry.insert_for(sa, 0x100000).unwrap();
+    let fb = registry.insert_for(sb, 0x200000).unwrap();
+    registry.initialize(fa).unwrap();
+    registry.initialize(fb).unwrap();
+    let count = memory.pages.len();
+    assert_eq!(
+        map_user_frames_for(
+            &b,
+            &mut memory,
+            &mut registry,
+            sa,
+            USER_BASE,
+            &[fa],
+            Permissions::RW
+        ),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(memory.pages.len(), count);
+    assert!(b.translate(&memory, USER_BASE).unwrap().is_none());
+    map_user_frames_for(
+        &a,
+        &mut memory,
+        &mut registry,
+        sa,
+        USER_BASE,
+        &[fa],
+        Permissions::RW,
+    )
+    .unwrap();
+    map_user_frames_for(
+        &b,
+        &mut memory,
+        &mut registry,
+        sb,
+        USER_BASE,
+        &[fb],
+        Permissions::RW,
+    )
+    .unwrap();
+    assert_eq!(registry.mapping_for(sa, USER_BASE).unwrap().frame, fa);
+    assert_eq!(registry.mapping_for(sb, USER_BASE).unwrap().frame, fb);
+    assert_eq!(registry.mapping(USER_BASE).err(), Some(Error::NotMapped));
+    assert_eq!(
+        map_user_frames_for(
+            &b,
+            &mut memory,
+            &mut registry,
+            sb,
+            USER_BASE + PAGE,
+            &[fa],
+            Permissions::R
+        ),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        a.translate(&memory, USER_BASE).unwrap().unwrap().physical,
+        0x100000
+    );
+    assert_eq!(
+        b.translate(&memory, USER_BASE).unwrap().unwrap().physical,
+        0x200000
+    );
+    a.unmap(&mut memory, USER_BASE).unwrap();
+    registry.remove_for(sa, USER_BASE).unwrap();
+    registry.retire(fa).unwrap();
+    registry.clear_root(sa, a.root).unwrap();
+    registry.retire_space(sa).unwrap();
+    assert_eq!(registry.mapping_for(sb, USER_BASE).unwrap().frame, fb);
+    assert_eq!(registry.releasable(fb), Err(Error::InUse));
+    assert_eq!(
+        b.translate(&memory, USER_BASE).unwrap().unwrap().physical,
+        0x200000
+    );
+}
+
+#[test]
+fn bounded_space_ids_refuse_active_referenced_and_stale_root_lifetimes() {
+    let mut r = Registry::new();
+    let a = r.create_space().unwrap();
+    let b = r.create_space().unwrap();
+    assert_eq!(r.create_space(), Err(Error::Capacity));
+    r.bind_root(a, 0x1000).unwrap();
+    r.bind_root(b, 0x2000).unwrap();
+    let f = r.insert_for(a, 0x100000).unwrap();
+    r.initialize(f).unwrap();
+    assert_eq!(r.retire_space(a), Err(Error::InUse));
+    r.activate_space(a).unwrap();
+    assert_eq!(r.releasable(f), Err(Error::InUse));
+    assert_eq!(r.clear_root(a, 0x1000), Err(Error::InUse));
+    assert_eq!(r.deactivate_space(b), Err(Error::NotOwned));
+    assert_eq!(r.create_space(), Err(Error::InUse));
+    r.deactivate_space(a).unwrap();
+    r.retire(f).unwrap();
+    assert_eq!(r.retire_space(a), Err(Error::InUse)); // bound root still owns a lifetime
+    r.clear_root(a, 0x1000).unwrap();
+    r.retire_space(a).unwrap();
+    let c = r.create_space().unwrap();
+    assert_ne!(a, c);
+    assert_ne!(a.raw(), c.raw());
+    r.bind_root(c, 0x1000).unwrap(); // same physical root may be reused, not its identity
+    assert_eq!(r.root(a), Err(Error::NotOwned));
+    assert_eq!(r.mapping_for(a, USER_BASE).err(), Some(Error::NotOwned));
+    assert_eq!(r.root(b), Ok(0x2000));
+}
+
+#[test]
+fn failed_second_space_mapping_preserves_sibling_refs_tables_and_capacity() {
+    let mut memory = Model::new();
+    let a = PageTree::new(&mut memory, 48).unwrap();
+    let b = PageTree::new(&mut memory, 48).unwrap();
+    let mut r = Registry::new();
+    let sa = r.create_space().unwrap();
+    let sb = r.create_space().unwrap();
+    r.bind_root(sa, a.root).unwrap();
+    r.bind_root(sb, b.root).unwrap();
+    let fa = r.insert_for(sa, 0x100000).unwrap();
+    let fb = r.insert_for(sb, 0x200000).unwrap();
+    r.initialize(fa).unwrap();
+    r.initialize(fb).unwrap();
+    map_user_frames_for(
+        &a,
+        &mut memory,
+        &mut r,
+        sa,
+        USER_BASE,
+        &[fa],
+        Permissions::RW,
+    )
+    .unwrap();
+    let count = memory.pages.len();
+    memory.budget = Some(3);
+    assert_eq!(
+        map_user_frames_for(
+            &b,
+            &mut memory,
+            &mut r,
+            sb,
+            USER_BASE + 511 * PAGE,
+            &[fb, fb],
+            Permissions::R
+        ),
+        Err(Error::Exhausted)
+    );
+    assert_eq!(memory.pages.len(), count);
+    assert_eq!(r.mapping_for(sa, USER_BASE).unwrap().frame, fa);
+    assert!(r.releasable(fb).is_ok());
+    assert_eq!(r.releasable(fa), Err(Error::InUse));
+    assert_eq!(
+        a.translate(&memory, USER_BASE).unwrap().unwrap().physical,
+        0x100000
+    );
+    assert!(
+        b.translate(&memory, USER_BASE + 511 * PAGE)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn space_generation_and_owned_frame_capacity_exhaust_without_wrap_or_leaks() {
+    let mut r = Registry::new();
+    let space = r.create_space().unwrap();
+    let mut frames = Vec::new();
+    for i in 0..DATA_FRAMES {
+        frames.push(r.insert_for(space, 0x100000 + i as u64 * PAGE).unwrap());
+    }
+    assert_eq!(r.insert_for(space, 0x200000), Err(Error::Capacity));
+    for frame in frames {
+        r.retire(frame).unwrap();
+    }
+    r.clear_root(space, 0).unwrap();
+    r.retire_space(space).unwrap();
+    for slot in &mut r.spaces {
+        slot.live = false;
+        slot.generation = u64::MAX >> 8;
+    }
+    assert_eq!(r.create_space(), Err(Error::Capacity));
+}

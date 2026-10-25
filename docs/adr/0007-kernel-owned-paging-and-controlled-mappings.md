@@ -127,3 +127,12 @@ while leaving the old CR3 intact. Post-switch failures use fatal diagnostics.
 Reference: [Intel SDM, Volume 3A](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf),
 paging structures and translation/walk-cache invalidation; the pinned Limine
 protocol reference remains in `boot/limine.lock.json`.
+
+### 2026-10-25 — Phase 3A extension
+
+[ADR 0010](0010-independent-bootstrap-nodes-and-fault-containment.md) extends
+private user-root ownership to two live domains with typed address-space IDs,
+scoped mapping keys and independent cleanup. Each user workspace maps only its
+own table frames; backend inspection/mutation requires the pinned kernel root.
+The original pool bounds and W^X/flush-before-reuse rationale remain accepted.
+This does not introduce shared MemoryObjects or a generalized userspace VMM.

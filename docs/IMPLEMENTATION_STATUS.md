@@ -1,48 +1,53 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-25. **Milestone:** K2 / Phase 2B, native x86-64 SYSCALL and
-first Neu scalar ABI. **Result:** complete against the supplied Phase 2B criteria
-in the documented single-CPU QEMU environment. All original **23 host tests and
-26 QEMU scenarios** remain passing. The current suite has **32 host tests and
-34 QEMU scenarios**. This is a bootstrap-fixture ABI proof, not complete Node or
-Thread lifecycle management or a stable public ABI.
+**Verified:** 2026-10-25. **Milestone:** K3 / Phase 3A, independent bootstrap
+Nodes, private address spaces and user-fault containment. **Result:** complete
+against the supplied Phase 3A criteria in the documented single-CPU QEMU profile.
+The suite has **43 host tests and 40 QEMU scenarios**, preserving all original
+**32 host tests and 34 QEMU scenarios**. Two Nodes retain their resources before
+either initial Thread executes; execution is sequential through trusted control.
+This does not complete capability governance or implement scheduling.
 
 The inspected tree was clean on `main` at
-[`4b6887c`](https://github.com/ils12058/neu_kernel/commit/4b6887c2fb1a6b4eb288672d5e8028ed2f54b141).
-The original 23/26 suite was rerun before implementation, recorded in
-`build/phase2b-baseline.log`. Historical Phase 2A status remains at that commit.
-Architecture v0.2, Rust/target and Limine are unchanged. Current tests are local;
+[`ae69d2e`](https://github.com/ils12058/neu_kernel/commit/ae69d2ea73da4332c0bd122af0a50fb60347dfdc).
+The original 32/34 suite was rerun before implementation, recorded in
+`build/phase3a-baseline.log`. Historical Phase 2B status remains at that commit.
+Architecture v0.2, Rust/target and Limine are unchanged. Tests are local;
 physical hardware and hosted CI have not been validated.
 
 ## Created and modified files
 
 Created:
 
-- `kernel/src/syscall.rs`: central experimental numbers/status/version, scalar
-  dispatch, assembly frame/register layout, return/MSR validation and nine tests.
-- `kernel/src/arch/x86_64/native.rs`: owned MSR configuration, native session,
-  trusted dispatch/return/terminal checks, diagnostics and fixture cleanup.
-- `kernel/src/arch/x86_64/native.S`: stack-independent entry, saved frame,
-  validated IRETQ return, emergency stack and independent user payload.
-- `docs/adr/0009-experimental-native-syscall-and-trusted-return.md`: rationale.
+- `kernel/src/node.rs`: typed Node/Thread identities, associations, bounded
+  lifecycle, copied outcomes and seven host tests.
+- `kernel/src/arch/x86_64/nodes.rs`: trusted two-domain construction, execution,
+  survivor validation, fault checks, rollback and independent reclamation.
+- `docs/adr/0010-independent-bootstrap-nodes-and-fault-containment.md`: rationale.
 
 Modified:
 
-- `kernel/src/arch/x86_64/userspace.rs` and `userspace.S`: retain the Phase 2A
-  path; add an explicit native bridge that preserves the selected SCE setting.
-- `kernel/src/arch/x86_64/exceptions.rs`: native RSP0/terminal IST2 configuration
-  and native user-fault classification; older fatal/#DF behavior remains.
-- `kernel/src/arch/x86_64/paging.rs`: preserve the additional emergency guards.
+- `kernel/src/paging/mod.rs`: two generation-checked user address spaces, frame
+  owners, mapping keys `(SpaceId, VA)`, root binding and active-resource guards.
+- `kernel/src/paging/tests.rs`: four additional host tests for coexistence,
+  cross-owner/root rejection, rollback, stale identities and exhaustion.
+- `kernel/src/arch/x86_64/paging.rs`: multiple private roots, per-owner cleanup,
+  own-only user workspace aliases, kernel-root-only backend access.
+- `kernel/src/arch/x86_64/native.rs` and `native.S`: per-execution trusted binding,
+  session reset, copied Node outcomes, user fault capture and distinct payloads.
+- `kernel/src/arch/x86_64/userspace.rs`: explicitly deactivate ownership metadata
+  after the original interrupt-gate fixture restores the kernel root.
 - `kernel/src/main.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/mod.rs`,
-  `kernel/Cargo.toml`: module/test wiring and mutually exclusive configurations.
-- `tools/neu.py`: eight native cases, emitted SYSCALL-byte/stack checks, actual
-  three-phase QMP observations and independent ABI/return/cleanup verification.
-- `README.md`, this status, `docs/adr/README.md`, ADR 0008: current behavior,
-  evidence and a dated extension preserving the original test-gate rationale.
+  `kernel/Cargo.toml`: module wiring and six mutually exclusive Node scenarios.
+- `tools/neu.py`: per-Node three-phase QMP observations, independent identity,
+  syscall, actual exception, ordering, ownership and accounting verification.
+- `README.md`, this status, `docs/adr/README.md`, ADRs 0007 and 0009: current
+  behavior and dated extensions preserving earlier rationale.
 
-No linker script, boot protocol, host package or external Rust dependency was
-changed. Existing BSS/linker collection includes the new guarded static stack;
-normal and native cold builds revalidated the resulting image layout.
+No linker, boot protocol, exception assembly, syscall numbers/status definitions,
+host package or external Rust dependency changed. Architecture v0.2 is preserved
+byte-for-byte (SHA-256
+`dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`).
 
 ## Tested environment and compatibility
 
@@ -62,7 +67,7 @@ During Phase 0 the named Rust toolchain initially lacked the freestanding target
 added using `rustup target add --toolchain 1.95.0 x86_64-unknown-none`. No Homebrew
 packages or system-wide firmware were installed for this milestone. Installed
 QEMU supplied compatible firmware. ISO utilities and mtools were absent and are
-not required by the selected boot workflow. Phase 2B adds no host packages,
+not required by the selected boot workflow. Phase 3A adds no host packages,
 nightly features, or third-party Rust dependencies.
 
 The firmware pair selected from the installed QEMU distribution was:
@@ -133,6 +138,36 @@ OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make run
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make test
 ```
 
+## Internal Node and Thread model
+
+`node::Nodes` has separate two-slot Node and Thread arrays. `NodeId` and
+`ThreadId` are distinct Rust types with independent slot/generation validation;
+their diagnostic integer encodings may coincide across types. A Node records its
+state, address-space identity and optional outcome. A Thread records its own
+state, associated NodeId, root/SpaceId, entry/RSP and outcome. There is no embedded
+permanent one-Thread field inside Node and no capability-space placeholder.
+
+The trusted controller owns each actual `UserSpace` resource handle separately
+from the model's checked association. Only it constructs bootstrap Nodes; there
+is no public NodeFactory or user-supplied Node selector. Node-local capability
+governance remains incomplete.
+
+| Object | Lifecycle and terminal rule |
+| --- | --- |
+| Node | Created → Configuring → Ready → Active → Exited → Reclaimed. Construction failure can exit Created/Configuring. |
+| Thread | Configuring → Ready → Running → Exited → Reclaimed; one initial Thread per Node is current bootstrap policy. |
+| Normal exit | Ends the bound Thread. Node exits only after its final live associated Thread ends; a model test checks that rule independently of bootstrap policy. |
+| User fault | Ends only that Node's associations, copies actual fault metadata, returns to the trusted controller without resuming the Thread. |
+| Construction failure | Separate `ConstructionFailure` outcome; owned paging resources roll back before model reclamation. |
+| Reclamation | Requires Exited, no active context/live Thread and released address-space association. Outcomes remain until metadata-slot reuse. |
+
+`ExitReason` separates `Normal(u8)`, `UserFault(Fault)` and
+`ConstructionFailure`. `Fault` distinguishes actual CPU exceptions from rejected
+return state and copies vector, error, RIP, RSP, CS, SS, RFLAGS and CR2. No
+user-memory diagnostic structure is dereferenced. Generation exhaustion refuses
+reuse rather than wrapping. This is a small internal model, not a scheduler,
+public object API or multiple-runnable-Thread implementation.
+
 ## Experimental Neu syscall contract
 
 The central definition is `kernel/src/syscall.rs`; the native assembly fixture
@@ -151,13 +186,15 @@ wire layout.
 | RCX/R11 | Caller-clobbered; current return leaves hardware-saved user return RIP/flags, never kernel addresses. |
 | Version/features | Bits 63..48 major 0, 47..32 minor 1, 31..0 features: query bit 0 and exit bit 1. |
 
-`abi_query` has no pointer argument or memory output. The user fixture checks its
+`abi_query` has no pointer argument or memory output. The payload checks its
 status and complete scalar tag. An unknown operation returns -1/RDX=0 and safely
 resumes Ring 3. `thread_exit` checks RDI before narrowing: 0..255 terminates the
-isolated fixture; 256 or a negative value represented as unsigned 64 bits returns
--2/RDX=0. Other arguments are ignored. The conformance fixture must exit with 0;
-nonzero in-range terminal statuses would be recorded as a failing fixture result,
-not a returning syscall. There is no generalized Thread object or exit API yet.
+currently bound initial Thread; 256 or a negative value represented as unsigned
+64 bits returns -2/RDX=0. Other arguments are ignored. The trusted active binding
+supplies Node/Thread identity; userspace supplies only the scalar exit status.
+The conformance cases require status 0. Normal exit ends the Node only when no
+live associated Thread remains. ABI 0.1 and the original single-fixture cases
+are unchanged; there is no public Node-management syscall.
 
 The internal `Registers`/`ReturnContext`/`Frame` C layouts serve assembly only,
 not user-memory ABI structures. No user copying, object syscall, capability table,
@@ -235,78 +272,147 @@ Ordinary builds launch no user fixture and install no native syscall service.
 
 ## Address-space ownership and cleanup
 
-Phase 2A's independently owned PML4/private children remain unchanged: no borrowed
-kernel subtree pointers. The supervisor kernel image/workspace appears in both
-roots, with RX text, R/NX constants and RW/NX data/stacks. User code, constants,
-data and stack use separate fully zeroed backing frames, mapped RX, R/NX, RW/NX
-and RW/NX. The bounded lower fixture range starts at `0x400000`; its stack is
-`0x404000..0x405000`, initial RSP `0x404ff8`, with absent adjacent guards. A wrapper
-CALL gives saved syscall RSP `0x404ff0`. Native bytes are copied from immutable
-kernel R/NX storage to new backing; no kernel executable page becomes user code.
+`SpaceId` is a generation-checked identity for one of two live user scopes.
+Mappings are indexed by `(SpaceId, VA)`, not a global VA. Each user frame has
+exactly one owning scope; duplicate physical ownership, mapping another scope's
+frame, or passing a root that does not match the scope is rejected. Mapping
+references prevent premature release; active metadata prevents mutation/teardown
+until the trusted return has restored the kernel root and deactivated the scope.
+Existing kernel/single-tree wrappers use the explicit kernel scope.
 
-The user root and every table/backing/mapping reference remain live across all
-round trips. Native dispatch does not allocate, unmap or access frame contents.
-The owner remains on the suspended kernel stack. After a terminal return, restore
-MSRs while no user executes, deactivate/clear the private hierarchy and all its
-workspace/leaf references, flush with PGE/PCIDE disabled, remove mapping records,
-and release table aliases and backing identities in the established order. Exact
-frame/table accounting and the original seven pinned kernel tables are checked.
-No active root is reclaimed on an unexpected fatal kernel path.
+Each Node has a fresh PML4 and private children for user and supervisor mappings;
+no kernel or sibling child tables are borrowed. The permanent kernel image
+backing remains supervisor-only RX text, R/NX constants and RW/NX data/stacks.
+Kernel table workspace aliases cover all live owned tables for construction and
+inspection. Each user root maps **only its own table aliases**, supervisor RW/NX.
+Backend table inspection/mutation requires actual CR3 to be the original kernel
+root. A sibling's creation/reclamation therefore never leaves borrowed workspace
+aliases in the surviving root. The scratch slot is absent in both user roots.
 
-The observed layout still needs ten private user tables and four user backing
-frames. The static entry/emergency stacks are image-reserved, not allocations
-freed with the user root. Existing 64-table/16-data-owner/64-mapping bounds remain.
-**All bootloader-reclaimable memory remains reserved.** No loader reclamation,
-MemoryObject or generalized AddressSpace object has been added.
+| User VA | A | B |
+| --- | --- | --- |
+| `0x400000` | Private RX payload frame | Different private RX payload frame |
+| `0x401000` | Private R/NX constants, seed 35 | Different R/NX constants, seed 77 |
+| `0x402000` | Private RW/NX data, result 42 | Different RW/NX data, result 84 |
+| `0x403000` | Absent low stack guard | Absent low stack guard |
+| `0x404000` | Private RW/NX stack | Different RW/NX stack |
+| `0x405000` | Absent high stack guard | Absent high stack guard |
+| `0x406000` | Absent | Private R/NX sentinel `0x5152535461626364` |
+
+All allocated backing is zeroed before initialization/publication. Initial RSP is
+`0x404ff8`; the syscall wrapper CALL gives saved RSP `0x404ff0`. The payload
+checks the complete query output and register canaries, stores seed+7, and B
+actually reads/checks its private-only sentinel. Fixture values are test data,
+not ABI requirements. No user code shares the kernel payload's physical backing.
+
+Both scopes are constructed and verified before either executes. The observed
+profile needs ten private table frames per root, A's four backing frames and B's
+five: 29 domain frames plus seven pinned kernel table frames. Static guarded
+entry/emergency stacks remain image-reserved. The existing bounds are unchanged:
+64 table frames, 16 data owners, 64 controlled mappings. Newly explicit bounds
+are two live user scopes, two Nodes and two Threads. A third scope is rejected
+without allocation changes; host tests also cover exhausted generations/data
+capacity. **All bootloader-reclaimable memory remains reserved.**
+
+The native session binds one copied `ActiveContext` (NodeId, ThreadId, SpaceId,
+root, entry, RSP). It resets counters/observation state, requires a clear busy
+guard, and validates the root and existing sealed return contract at dispatch.
+Only one Thread can be active. No handler accesses the controller's suspended
+mutable model/paging borrow. A terminal path copies an outcome by value, restores
+the original kernel continuation/root, restores/read-backs MSRs, checks the clear
+guard and deactivates scope metadata. The controller then updates lifecycle and
+inspects owned backing. Each later execution gets a fresh binding and contract.
+
+Supported noncritical CPL=3 exceptions copy the real hardware frame/CR2 and
+terminate the bound Node. CPL=0 faults and NMI/#DF/#MC retain the existing fatal
+policy. Diagnostic values never become user pointers. Fault teardown follows the
+same inactive-resource path as normal exit; a faulting Thread is not resumed.
+
+Reclamation clears all of that scope's hierarchy/workspace references, reloads
+the kernel CR3 with PGE/PCIDE disabled, removes only its mapping records, then
+releases its table aliases/frames and user frame identities. Only then clear the
+root binding, retire SpaceId and reclaim Node/Thread metadata. Per-owner deltas
+and surviving hierarchy/reference checks replace the singleton global-baseline
+assumption. The final two-Node cleanup must still return exact global accounting.
+Construction rollback follows this order for partial roots, including before
+root allocation, while preserving the live sibling. Unexpected kernel invariant
+failures halt with ownership retained; arbitrary fatal paths are not claimed to
+restore accounting or recover safely.
 
 ## Actual validation and results
 
 Executed from the repository root:
 
 ```sh
-make doctor
-make check > build/phase2b-check.log 2>&1
-make build
-make test > build/phase2b-test-run.log 2>&1
+make doctor > build/phase3a-doctor.log 2>&1
+make check > build/phase3a-check.log 2>&1
+make build > build/phase3a-build.log 2>&1
+make test > build/phase3a-test-run.log 2>&1
 cargo test --locked --lib --target aarch64-apple-darwin
-python3 tools/neu.py test --case native
+python3 tools/neu.py test --case nodes
+python3 tools/neu.py test --case nodes-a-fault
+python3 tools/neu.py test --case nodes-b-fault
+python3 tools/neu.py test --case nodes-cross
+python3 tools/neu.py test --case nodes-reclaim
+python3 tools/neu.py test --case nodes-rollback
 ```
 
-The other seven native cases were also executed individually. A fresh source copy
-excluding `.git`, `.cache`, `build`, `target` and Python caches then ran:
+All six focused Node cases were also executed before the complete suite. A fresh
+source copy excluding `.git`, `.cache`, `build`, `target` and Python caches ran:
 
 ```sh
 make build
-python3 -c "from tools.neu import build; build('native')"
+python3 -c "from tools.neu import build; build('nodes')"
 ```
 
-Cold normal/native builds both passed: fresh pinned-loader download/checksums,
-compilation, four valid LOAD segments, no writable/executable ELF segment,
-stack/guard validation, native SYSCALL bytes, and EFI artifacts. No host packages
-or external Rust dependencies were installed.
+Both cold builds pass with a fresh pinned-loader download/checksum verification,
+Cargo `--locked`, ELF64/x86-64 four LOAD segments, no writable/executable ELF
+segment, validated stacks/guards, native SYSCALL bytes and EFI artifacts. No host
+packages or external Rust dependencies were installed.
 
 | Check | Actual result |
 | --- | --- |
-| Doctor | Pass: unchanged pinned Rust/target, QEMU and hashed OVMF pair. |
-| Static checks | Pass: formatting and Clippy with warnings denied, 34 kernel configurations plus host library; Python syntax passes. |
-| Host tests | **32 pass**: all prior 23 plus 9 for operation/status/version encoding, dispatch, exit bounds, argument order/preservation, return root/selectors/RIP/RSP/flags, and MSR configuration. |
-| Original QEMU cases | **All 26 pass**, including genuine #DF, guards, paging rollback/zeroing, direct CPL=3 execution and every Phase 2A security violation. |
-| New native cases | **All 8 pass**, described below. |
-| Final halt | **All 34 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, correct final kernel CR3, then host-requested quit/exit 0. |
+| Doctor | Pass: unchanged Rust/target, QEMU and hashed OVMF pair. |
+| Static checks | Pass: formatting and Clippy with warnings denied, 40 kernel configurations plus host library; Python syntax passes. |
+| Host tests | **43 pass**: all prior 32 plus 7 lifecycle/association/outcome tests and 4 scoped paging/ownership/rollback/capacity tests. |
+| Original QEMU cases | **All 34 pass**, including genuine #DF, supervisor faults/guards, paging rollback/zeroing, all 8 Phase 2A cases and all 8 native ABI cases below. |
+| New Node cases | **All 6 pass**, described below, with two live roots before either execution. |
+| Final halt | **All 40 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, correct final kernel CR3 and host-requested quit/exit 0. |
 
-The host independently checks that fixture syscall sites actually contain bytes
-`0f 05`. It requires a direct QMP sample at CPL=3 before the syscall and CPL=0
-inside `neu_native_kernel_wait`, with the actual RSP at the trusted frame, kernel
-CS/SS, user CR3, safe flags and preserved canaries. Returning cases also require
-a direct CPL=3 sample inside the post-query loop with RAX=0/RDX=ABI tag, restored
-user selectors/segments and RSP. The guest validates the same output and canaries
-before reaching that loop. Missing any required sample fails the test.
+The host verifies emitted SYSCALL bytes `0f 05`. For **each Node** it requires
+direct QMP CPU samples before the syscall at CPL=3, at CPL=0 in the guarded native
+entry stack, and at CPL=3 after the first query return. It checks actual CR3,
+selectors, RSP, flags, MSRs, FS/GS zero state and all six callee-saved register
+canaries. Returning RAX=0/RDX=`0x100000003` and the full register-preservation
+contract are checked separately. Faulted Nodes perform a real query round trip
+before faulting; printed synthesized selectors alone cannot pass the CPU checks.
 
-Observed positive flow in the full run used user CR3 `0xc000`, kernel CR3
-`0x1000`, user CS/SS 0x3b/0x33 and kernel CS/SS 0x08/0x10. The fixture performed
-**two successful query round trips and one terminal exit**, with six 64-bit
-callee-saved canaries and preserved argument registers. Physical root values are
-observations, not an ABI or allocator promise.
+Observed positive roots are A=`0xc000`, B=`0x1b000`, with original kernel
+CR3=`0x1000`. At VA `0x400000`, A uses PA `0x8000` and B PA `0x16000`; at VA
+`0x402000`, A uses PA `0xa000` and B PA `0x18000`. Node identities are
+4294967297/4294967298 and SpaceIds 257/258; rollback reuses slots with new
+generations. These physical/numeric values are observations, not stable ABI or
+allocation promises. Both normal Nodes make two queries plus one terminal exit,
+with independent results **42/84** and status 0.
+
+| Node case | Actual verified behavior |
+| --- | --- |
+| `nodes` | A and B both Ready before first execution; distinct roots/backing, actual CPL=3/0/3 per Node, normal A then B, retained outcomes and separate cleanup. |
+| `nodes-a-fault` | A query returns, then actual #UD vector 6/error 0 at the payload UD2 site. A is reclaimed; B remains Ready and executes successfully. |
+| `nodes-b-fault` | B faults first with actual #UD 6/error 0. B is reclaimed; the previously constructed A remains Ready and succeeds. |
+| `nodes-cross` | A reads B-only VA `0x406000`: actual #PF vector 14/error 4, CR2=`0x406000`, user CS/SS=0x3b/0x33 and RSP=`0x404ff8`. A is reclaimed; B reads its intact sentinel and exits successfully. |
+| `nodes-reclaim` | Normal A is destroyed before B executes. B's private tables/mappings, zero result, sentinel and Ready state survive; B then produces 84. |
+| `nodes-rollback` | Ten successive B table-allocation failure points return exact pre-attempt frame/table accounting while A remains Ready/intact. B then constructs successfully; both execute and reclaim normally. |
+
+The runner checks exact ELF-relative exception RIP, vector/error, CR2 for #PF,
+actual saved RSP/CS/SS/flags, trusted handler-stack bounds, and matching
+Node/Thread/SpaceId/root. It verifies both Ready records precede execution,
+per-Node syscall bindings/sequences, terminal outcomes, restored root/MSRs and
+ordered sibling teardown/survival. Baseline and final allocated/free/table
+counts must match within every guest. All finish with seven pinned kernel table
+frames; free totals can differ between images and are not hardcoded.
+
+The original native cases remain independent regressions:
 
 | Native case | Actual verified behavior |
 | --- | --- |
@@ -319,26 +425,24 @@ observations, not an ABI or allocator promise.
 | `native-return-selectors` | Dedicated hook substitutes kernel return CS/SS 0x08/0x10; validator rejects rather than returning at CPL=0. |
 | `native-disabled` | SCE is intentionally cleared after preflight. Actual user SYSCALL raises #UD 6/error 0 at the exact site, with **zero native entries/returns**. Controlled negative containment is not counted as successful native entry. |
 
-Each return-rejection case has one native entry and zero query dispatches or
-returns. Every expected terminal outcome restores the original kernel root,
-MSRs and allocation accounting. Exact operation sequence, arguments, statuses,
-resume RIP/RSP, selector/flag values, kernel-stack bounds and event counts are
-checked separately from human-readable pass labels.
+Every expected terminal native outcome restores original root, MSRs and
+allocation accounting. Return-rejection cases have one entry and zero query
+returns; the disabled-SCE fault has no native entry. Existing supervisor-fault
+scenarios still follow their fatal exception path rather than Node containment.
 
-The default deadline remains 30 seconds per guest. Bounded before/kernel/after
-observation loops are test instrumentation, not benchmark results. An unexpected
-reset, triple fault, emulator exit, wrong CPL/root/stack/context, missing syscall
-MSR evidence, timeout, silent return or permission failure cannot pass. Serial
-messages alone are insufficient. Existing QMP cleanup and no-debug-exit behavior
-remain intact.
+The deadline remains 30 seconds per guest. Bounded observation loops are test
+instrumentation, not benchmarks. Unexpected reset, triple fault, emulator exit,
+wrong privilege/root/stack/context, missing CPU evidence, timeout, early halt or
+permission failure cannot pass. Serial pass messages alone are insufficient.
 
 Local Git-ignored evidence: `build/test-results.json`,
-`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase2b-baseline.log`,
-`build/phase2b-check.log`, `build/phase2b-native-first.log`,
-`build/phase2b-negative-run.log`, `build/phase2b-test-run.log`, and
-`build/phase2b-repro-build.log`. Native JSON includes raw three-phase CPU snapshots,
-parsed MSRs/entries/returns/terminal counters, final root/halt observations,
-ELF/firmware identity, exact QEMU arguments and clean exit status.
+`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase3a-baseline.log`,
+`build/phase3a-doctor.log`, `build/phase3a-check.log`, `build/phase3a-build.log`,
+`build/phase3a-nodes-first.log`, `build/phase3a-isolation-run.log`,
+`build/phase3a-test-run.log`, and `build/phase3a-repro-build.log`. Each Node JSON
+contains separate identity/root/outcome records, raw three-phase CPU snapshots,
+actual fault values, accounting, final halt observations, ELF/firmware identities,
+QEMU arguments and clean exit status.
 
 ## Nested-entry and security limits
 
@@ -361,28 +465,31 @@ isolation: another infinite user loop could occupy the CPU until host timeout.
 Speculative/microarchitectural side channels and arbitrary privileged corruption
 are outside the demonstrated boundary.
 
-No full Nodes/Threads, scheduler, public capabilities, NodeFactory/ResourcePool,
-Channels, object syscalls, pointer-copying API, ELF loader, dynamic linker,
-filesystem/network service, POSIX/Linux compatibility or general runtime exists.
-The trusted continuation and private-root ownership remain explicit bootstrap
-mechanisms, not unrestricted public authority paths.
+The two-Node implementation remains trusted bootstrap machinery. Node-local
+capabilities, public factories/ResourcePools, multiple runnable Threads per Node,
+scheduling, Channels/IPC, shared MemoryObjects, pointer-copy APIs, full ELF
+loading, a userspace runtime, filesystem/network/drivers and POSIX/Linux
+compatibility remain unimplemented. Construction/teardown assumes one trusted
+controller with no asynchronous observers. A future concurrent object system
+must revisit synchronization, references, cancellation and lifetime publication.
 
 ## Architecture relationship and recommended next milestone
 
-[ADR 0009](adr/0009-experimental-native-syscall-and-trusted-return.md) accepts only
-the experimental scalar ABI and trusted single-CPU entry/return contract.
-ADR 0008 retains its original test-gate rationale with a dated Phase 2B extension;
-its eight regressions still pass. Other boot/paging ADR relationships remain
-unchanged. Architecture v0.2 is preserved byte-for-byte. Complete Node/Thread,
-startup/execution and syscall specifications are not accepted by implication;
-`NEU-025` remains open, as does the older optional NeuKMon work.
+[ADR 0010](adr/0010-independent-bootstrap-nodes-and-fault-containment.md) accepts
+the scoped Node/Thread boundaries, two live private roots, sequential bindings,
+local user-fault policy and ordered ownership cleanup. ADRs 0007 and 0009 retain
+their original rationale with dated extensions. The accepted native ABI 0.1 and
+all earlier test paths remain intact. Architecture v0.2 is unchanged; complete
+capability-oriented Nodes and the full MEM/EXEC/SEC/DIAG/TEST proposals are not
+accepted or implemented by implication. `NEU-025` and optional NeuKMon remain open.
 
-Recommended next milestone: **K3 / minimal independent execution-context isolation**:
-two separately owned user roots/backing sets, explicit internal lifecycle and
-fault containment, initially controlled sequential entry/exit. Decide ownership
-and remaining native ABI requirements before expanding beyond the fixture.
-Defer preemptive scheduling, public factories/capabilities and SMP to their own
-milestones rather than treating this first ABI as a full kernel-object system.
+Recommended next milestone: **K4 / single-CPU timer-driven scheduling**, beginning
+with an explicit ADR for interrupt/context ownership, saved CPU state, safe
+native-entry interactions and scheduling policy. Establish timer delivery and
+controlled context switching with focused fault/cleanup tests before claiming
+preemption or CPU-time isolation. Keep public capabilities/factories, SMP and
+multithreaded Nodes as separate scoped decisions rather than extending this
+single-active-context mechanism without a new safety contract.
 
 ## Primary references
 

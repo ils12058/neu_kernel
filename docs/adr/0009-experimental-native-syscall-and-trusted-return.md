@@ -135,3 +135,16 @@ must never count as a successful syscall. Preserve all earlier tests.
 
 References: [Intel instruction reference, SYSCALL/SYSRET](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf),
 [system programming reference](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf).
+
+### 2026-10-25 — Phase 3A extension
+
+[ADR 0010](0010-independent-bootstrap-nodes-and-fault-containment.md) extends the
+singleton lifecycle to two independently owned bootstrap Nodes. The native
+session is reset and bound to a trusted Node/Thread/SpaceId/root per sequential
+execution. Valid `thread_exit` ends that Thread and ends its Node only when no
+live associated Thread remains. Supported user faults record a Node-local
+terminal outcome; the trusted kernel can then execute the healthy sibling.
+Operation numbers, scalar/register/status/version contract, guarded native entry
+and validated IRETQ stay unchanged. This ADR remains Accepted; its original
+Phase 2B rationale and fixture regressions are preserved. Capability governance
+and scheduling are not supplied by this extension.

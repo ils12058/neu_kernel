@@ -24,7 +24,8 @@ const CANARIES: [u64; 6] = [
     0x5566778899aabbcc,
     0x66778899aabbccdd,
 ];
-global_asm!(include_str!("native.S"),user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
+pub const PRIVATE_VALUE: u64 = 0x5152535461626364;
+global_asm!(include_str!("native.S"),private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
     kernel_ss=const abi::KERNEL_SS,star=const abi::STAR,fmask=const abi::ENTRY_MASK,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,unsupported=const abi::NOT_SUPPORTED,invalid=const abi::INVALID_ARGUMENT,
     canary_bx=const CANARIES[0],canary_bp=const CANARIES[1],canary_12=const CANARIES[2],
@@ -32,6 +33,8 @@ global_asm!(include_str!("native.S"),user_ss=const abi::USER_SS,user_cs=const ab
 unsafe extern "C" {
     fn neu_native_entry();
     static mut neu_native_busy: u64;
+    #[cfg(feature = "node-test")]
+    static mut neu_native_observed: u64;
     static neu_native_payload: u8;
     static neu_native_payload_end: u8;
     static neu_native_resume: u8;
@@ -69,6 +72,10 @@ struct Session {
     errors: u64,
     terminal: u64,
     valid: bool,
+    #[cfg(feature = "node-test")]
+    binding: Option<neu_kernel::node::ActiveContext>,
+    #[cfg(feature = "node-test")]
+    outcome: Option<neu_kernel::node::ExitReason>,
 }
 static SESSION: Cell<Session> = Cell(UnsafeCell::new(Session {
     kind: 0,
@@ -80,6 +87,10 @@ static SESSION: Cell<Session> = Cell(UnsafeCell::new(Session {
     errors: 0,
     terminal: 99,
     valid: false,
+    #[cfg(feature = "node-test")]
+    binding: None,
+    #[cfg(feature = "node-test")]
+    outcome: None,
 }));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 #[repr(C)]
@@ -193,6 +204,20 @@ fn fatal(reason: &str) -> ! {
 }
 fn finish(reason: u64, status: u64) -> ! {
     let mut s = session();
+    #[cfg(feature = "node-test")]
+    if let Some(binding) = s.binding {
+        use neu_kernel::node::ExitReason;
+        if s.outcome.is_none() && reason == 0 {
+            s.outcome = Some(ExitReason::Normal(status as u8));
+        }
+        s.terminal = reason;
+        s.valid = paging::current_root() == binding.context.root
+            && s.root == binding.context.root
+            && s.outcome.is_some();
+        save(s);
+        serial::write(format_args!("[NEU] Node terminal bound: node={} thread={} space={} root={:#x} reason={} status={}\n",binding.node.raw(),binding.thread.raw(),binding.context.space.raw(),s.root,reason,status)).unwrap_or_else(|_|super::halt());
+        terminal_exit(s, reason, status);
+    }
     let expected_reason = match s.kind {
         0..=2 => 0,
         3 => Rejection::Rip as u64,
@@ -215,6 +240,9 @@ fn finish(reason: u64, status: u64) -> ! {
         && s.queries == queries
         && s.errors == errors;
     save(s);
+    terminal_exit(s, reason, status)
+}
+fn terminal_exit(s: Session, reason: u64, status: u64) -> ! {
     ACTIVE.store(false, Ordering::Relaxed);
     // SAFETY: No native instruction can re-enter before the trusted continuation
     // disables SCE; no user execution is resumed by this terminal path.
@@ -267,6 +295,21 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     }
     s.entries += 1;
     save(s);
+    #[cfg(feature = "node-test")]
+    if let Some(binding) = s.binding {
+        if binding.context.root != root {
+            fatal("stale Node context");
+        }
+        serial::write(format_args!(
+            "[NEU] Node syscall bound: node={} thread={} space={} root={:#x} seq={}\n",
+            binding.node.raw(),
+            binding.thread.raw(),
+            binding.context.space.raw(),
+            root,
+            s.entries
+        ))
+        .unwrap_or_else(|_| super::halt());
+    }
     let before = frame.registers;
     // SAFETY: Diagnostic record is supervisor-only and outlives terminal halt.
     unsafe {
@@ -296,6 +339,22 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     let contract = return_contract(root);
     if let Err(reason) = abi::validate_return(frame.context, &contract, root) {
         serial::write(format_args!("[NEU] Native return rejected: reason={} RIP={:#x} RSP={:#x} CS={:#x} SS={:#x} RFLAGS={:#x}\n",reason as u64,frame.context.rip,frame.context.rsp,frame.context.cs,frame.context.ss,frame.context.flags)).unwrap_or_else(|_| super::halt());
+        #[cfg(feature = "node-test")]
+        if s.binding.is_some() {
+            use neu_kernel::node::{ExitReason, Fault, FaultSource};
+            s.outcome = Some(ExitReason::UserFault(Fault {
+                source: FaultSource::RejectedReturn,
+                vector: 0,
+                error: reason as u64,
+                rip: frame.context.rip,
+                rsp: frame.context.rsp,
+                cs: frame.context.cs,
+                ss: frame.context.ss,
+                flags: frame.context.flags,
+                cr2: 0,
+            }));
+            save(s);
+        }
         finish(reason as u64, 0);
     }
     match abi::dispatch(before.rax, before.arguments()) {
@@ -336,6 +395,34 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
 pub(super) fn user_fault(frame: exceptions::ExceptionFrame, cr2: u64, handler_rsp: u64) -> ! {
     let s = session();
     let (bottom, top) = userspace::kernel_stack();
+    #[cfg(feature = "node-test")]
+    if let Some(binding) = s.binding {
+        use neu_kernel::node::{ExitReason, Fault, FaultSource};
+        if frame.cs != abi::USER_CS
+            || frame.ss != abi::USER_SS
+            || !(bottom..top).contains(&handler_rsp)
+            || paging::current_root() != binding.context.root
+            || s.root != binding.context.root
+        {
+            fatal("Node fault context mismatch");
+        }
+        let fault = Fault {
+            source: FaultSource::Cpu,
+            vector: frame.vector,
+            error: frame.error,
+            rip: frame.rip,
+            rsp: frame.rsp,
+            cs: frame.cs,
+            ss: frame.ss,
+            flags: frame.flags,
+            cr2,
+        };
+        let mut s = s;
+        s.outcome = Some(ExitReason::UserFault(fault));
+        save(s);
+        serial::write(format_args!("[NEU] Node user fault: node={} thread={} space={} root={:#x} vector={} error={:#x} RIP={:#x} CR2={:#x} CS={:#x} SS={:#x} RSP={:#x} RFLAGS={:#x} handler_rsp={:#x}\n",binding.node.raw(),binding.thread.raw(),binding.context.space.raw(),s.root,frame.vector,frame.error,frame.rip,cr2,frame.cs,frame.ss,frame.rsp,frame.flags,handler_rsp)).unwrap_or_else(|_|super::halt());
+        finish(8, 0);
+    }
     let valid = s.kind == 7
         && s.entries == 0
         && frame.vector == 6
@@ -356,6 +443,7 @@ pub(super) fn user_fault(frame: exceptions::ExceptionFrame, cr2: u64, handler_rs
     }
 }
 
+#[cfg(not(feature = "node-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let kind = if cfg!(feature = "test-native-unknown") {
         1
@@ -425,6 +513,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     userspace::enter_native(paging.root());
     restore(old)?;
     exceptions::configure_native(false)?;
+    paging.deactivate_user(&space)?;
     let s = session();
     let data = paging.user_result(&space)?;
     paging.destroy_user(space)?;
@@ -441,4 +530,76 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     ))
     .map_err(|_| Error::Corrupt)?;
     Ok(())
+}
+
+#[cfg(feature = "node-test")]
+pub fn payload() -> &'static [u8] {
+    let length =
+        ptr::addr_of!(neu_native_payload_end) as usize - ptr::addr_of!(neu_native_payload) as usize;
+    if length == 0 || length > PAGE as usize {
+        fatal("Node fixture extent");
+    }
+    // SAFETY: Bounded immutable bytes in the kernel image, copied before user RX.
+    unsafe { core::slice::from_raw_parts(ptr::addr_of!(neu_native_payload), length) }
+}
+#[cfg(feature = "node-test")]
+pub fn execute_node(
+    paging: &mut Paging<'_, '_>,
+    space: &super::paging::UserSpace,
+    binding: neu_kernel::node::ActiveContext,
+    kind: u64,
+) -> Result<neu_kernel::node::ExitReason> {
+    if running()
+        || paging::current_root() != paging.root()
+        || binding.context.space != space.id()
+        || binding.context.root != space.root
+        || binding.context.entry != userspace::CODE
+        || binding.context.rsp != userspace::USER_RSP
+    {
+        return Err(Error::NotOwned);
+    }
+    // SAFETY: No active entry or user context; reset the per-run observation
+    // state only after requiring the previous non-reentrant guard to be clear.
+    unsafe {
+        if ptr::read_volatile(ptr::addr_of!(neu_native_busy)) != 0 {
+            return Err(Error::InUse);
+        }
+        ptr::write_volatile(ptr::addr_of_mut!(neu_native_observed), 0);
+    }
+    exceptions::configure_native(true)?;
+    let old = configure()?;
+    save(Session {
+        kind,
+        root: space.root,
+        previous_efer: old.efer,
+        terminal: 99,
+        binding: Some(binding),
+        outcome: None,
+        ..Session::default()
+    });
+    ACTIVE.store(true, Ordering::Relaxed);
+    serial::write(format_args!("[NEU] Node execution bound: node={} thread={} space={} root={:#x}\n[NEU] Native user space ready: kind={} root={:#x} kernel={:#x} entry={:#x} rsp={:#x}\n",binding.node.raw(),binding.thread.raw(),space.id().raw(),space.root,kind,space.root,paging.root(),userspace::CODE,userspace::USER_RSP)).map_err(|_|Error::Corrupt)?;
+    paging.activate_user(space)?;
+    userspace::enter_native(paging.root());
+    restore(old)?;
+    exceptions::configure_native(false)?;
+    paging.deactivate_user(space)?;
+    let ended = session();
+    if !ended.valid
+        || ended.binding != Some(binding)
+        || running()
+        || paging::current_root() != paging.root()
+        // SAFETY: Back on the original kernel stack/root with user entry ended.
+        || unsafe { ptr::read_volatile(ptr::addr_of!(neu_native_busy)) } != 0
+    {
+        return Err(Error::Corrupt);
+    }
+    serial::write(format_args!(
+        "[NEU] Node execution restored: node={} thread={} root={:#x} MSRs=restored guard=clear\n",
+        binding.node.raw(),
+        binding.thread.raw(),
+        paging.root()
+    ))
+    .map_err(|_| Error::Corrupt)?;
+    ended.outcome.ok_or(Error::Corrupt)
 }

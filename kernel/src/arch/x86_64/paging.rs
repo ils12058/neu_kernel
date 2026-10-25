@@ -9,7 +9,7 @@ use core::{
 };
 use neu_kernel::paging::{
     self as logic, ADDRESS_FIELD, Error, FrameId, PAGE, PageTree, Permissions, Registry, Result,
-    TEST_BASE, TableMemory, Translation,
+    SpaceId, TEST_BASE, TableMemory, Translation,
 };
 
 const WINDOW: u64 = 0xffff_9000_0000_0000;
@@ -191,6 +191,9 @@ impl Memory<'_, '_> {
     fn pointer(&self, physical: u64) -> Result<*mut u64> {
         let slot = self.slot(physical)?;
         if self.active {
+            if current_root() != self.root {
+                return Err(Error::InUse);
+            }
             Ok((WINDOW + slot as u64 * PAGE) as *mut u64)
         } else {
             Ok(self.boot.view_owned(physical)?.cast())
@@ -412,8 +415,6 @@ pub struct Paging<'a, 'm> {
     tree: PageTree,
     memory: Memory<'a, 'm>,
     registry: Registry,
-    #[cfg(feature = "user-test")]
-    user_root: Option<u64>,
 }
 impl<'a, 'm> Paging<'a, 'm> {
     pub fn initialize(
@@ -505,8 +506,6 @@ impl<'a, 'm> Paging<'a, 'm> {
             tree,
             memory,
             registry: Registry::new(),
-            #[cfg(feature = "user-test")]
-            user_root: None,
         };
         if let Err(error) = result.verify() {
             result.memory.abort_inactive()?;
@@ -590,9 +589,7 @@ impl<'a, 'm> Paging<'a, 'm> {
             if view.physical != table.physical || view.permissions != Permissions::RW || view.user {
                 return Err(Error::Flags);
             }
-            if self.memory.parent_references(table.physical)?
-                != usize::from(table.physical != self.tree.root)
-            {
+            if self.memory.parent_references(table.physical)? != usize::from(table.level != 4) {
                 return Err(Error::Corrupt);
             }
         }
@@ -602,6 +599,10 @@ impl<'a, 'm> Paging<'a, 'm> {
         Ok(())
     }
     pub fn allocate_frame(&mut self) -> Result<FrameId> {
+        self.allocate_frame_for(SpaceId::KERNEL)
+    }
+    fn allocate_frame_for(&mut self, owner: SpaceId) -> Result<FrameId> {
+        self.registry.can_allocate(owner)?;
         if current_root() != self.tree.root {
             return Err(Error::InUse);
         }
@@ -610,7 +611,7 @@ impl<'a, 'm> Paging<'a, 'm> {
             .frames
             .allocate()
             .map_err(|_| Error::Exhausted)?;
-        let id = match self.registry.insert(physical) {
+        let id = match self.registry.insert_for(owner, physical) {
             Ok(id) => id,
             // A duplicate would violate the allocator's ownership invariant.
             // Never free a physical page already held by a live identity.
@@ -823,15 +824,22 @@ impl<'a, 'm> Paging<'a, 'm> {
     }
 }
 
-// This bootstrap fixture owns every new table; no kernel child-table pointers
-// are shared. Its supervisor image backing remains permanently image-reserved.
+// Each root owns private table pages and only its OWN table workspace aliases.
+// All backend mutation/inspection uses the separate, pinned kernel workspace.
 #[cfg(feature = "user-test")]
 pub struct UserSpace {
     pub root: u64,
+    id: SpaceId,
     tables: [bool; TABLES],
     frames: [Option<FrameId>; 4],
-    before: FrameStats,
-    before_tables: usize,
+    private: Option<FrameId>,
+}
+#[cfg(feature = "user-test")]
+impl UserSpace {
+    #[cfg(feature = "node-test")]
+    pub fn id(&self) -> SpaceId {
+        self.id
+    }
 }
 
 #[cfg(feature = "user-test")]
@@ -842,41 +850,57 @@ impl Paging<'_, '_> {
         kind: u64,
         budget: Option<usize>,
     ) -> Result<UserSpace> {
-        use super::userspace::{CODE, CONSTANTS, DATA, STACK};
-        if self.user_root.is_some()
-            || current_root() != self.tree.root
-            || bytes.is_empty()
-            || bytes.len() > PAGE as usize
-        {
+        self.prepare_domain(bytes, kind, 35, None, budget)
+    }
+    pub fn prepare_domain(
+        &mut self,
+        bytes: &[u8],
+        kind: u64,
+        seed: u64,
+        private_value: Option<u64>,
+        budget: Option<usize>,
+    ) -> Result<UserSpace> {
+        use super::userspace::{CODE, CONSTANTS, DATA, STACK, UNMAPPED};
+        if current_root() != self.tree.root || bytes.is_empty() || bytes.len() > PAGE as usize {
             return Err(Error::InUse);
         }
+        let id = self.registry.create_space()?;
+        let before = self.stats();
+        let before_tables = self.table_count();
         let old_tables = self.memory.tables.map(|t| t.physical != 0);
         let mut space = UserSpace {
             root: 0,
+            id,
             tables: [false; TABLES],
             frames: [None; 4],
-            before: self.stats(),
-            before_tables: self.table_count(),
+            private: None,
         };
-        self.user_root = Some(0); // construction excludes a second root
         self.memory.budget = budget;
         let result = (|| {
             for slot in &mut space.frames {
-                *slot = Some(self.allocate_frame()?);
+                *slot = Some(self.allocate_frame_for(id)?);
             }
             let [Some(a), Some(b), Some(c), Some(d)] = space.frames else {
                 return Err(Error::Corrupt);
             };
             let ids = [a, b, c, d];
-            self.with_frame_mut(ids[0], |frame| frame[..bytes.len()].copy_from_slice(bytes))?;
-            self.with_frame_mut(ids[1], |frame| {
-                frame[..8].copy_from_slice(&35u64.to_le_bytes());
+            self.with_frame_mut(a, |frame| frame[..bytes.len()].copy_from_slice(bytes))?;
+            self.with_frame_mut(b, |frame| {
+                frame[..8].copy_from_slice(&seed.to_le_bytes());
                 frame[8..16].copy_from_slice(&kind.to_le_bytes());
             })?;
-            self.with_frame_mut(ids[2], |frame| frame[0x100] = 0xc3)?;
+            self.with_frame_mut(c, |frame| frame[0x100] = 0xc3)?;
+            if let Some(value) = private_value {
+                let frame = self.allocate_frame_for(id)?;
+                space.private = Some(frame);
+                self.with_frame_mut(frame, |bytes| {
+                    bytes[..8].copy_from_slice(&value.to_le_bytes())
+                })?;
+            }
             let tree = PageTree::new(&mut self.memory, self.tree.bits)?;
             space.root = tree.root;
-            let image_base = ptr::addr_of!(__requests_start) as u64;
+            self.registry.bind_root(id, tree.root)?;
+            let base = ptr::addr_of!(__requests_start) as u64;
             for (start, end, permissions) in image_regions() {
                 for va in (start..end).step_by(PAGE as usize) {
                     if !image_guard(va) {
@@ -886,40 +910,59 @@ impl Paging<'_, '_> {
                             .map
                             .kernel()
                             .start
-                            .checked_add(va - image_base)
+                            .checked_add(va - base)
                             .ok_or(Error::Physical)?;
                         tree.map(&mut self.memory, va, pa, permissions)?;
                     }
                 }
             }
-            // A private workspace branch, populated only after every allocation.
             tree.map(&mut self.memory, WINDOW, tree.root, Permissions::RW)?;
-            for (va, id, permission) in [
+            for (va, frame, permission) in [
                 (CODE, ids[0], Permissions::RX),
                 (CONSTANTS, ids[1], Permissions::R),
                 (DATA, ids[2], Permissions::RW),
                 (STACK, ids[3], Permissions::RW),
             ] {
-                logic::map_user_frames(
+                logic::map_user_frames_for(
                     &tree,
                     &mut self.memory,
                     &mut self.registry,
+                    id,
                     va,
-                    &[id],
+                    &[frame],
                     permission,
                 )?;
             }
+            if let Some(frame) = space.private {
+                logic::map_user_frames_for(
+                    &tree,
+                    &mut self.memory,
+                    &mut self.registry,
+                    id,
+                    UNMAPPED,
+                    &[frame],
+                    Permissions::R,
+                )?;
+            }
+            space.tables =
+                core::array::from_fn(|i| !old_tables[i] && self.memory.tables[i].physical != 0);
             let mut control = tree.root;
             for index in &logic::indices(WINDOW)?[..3] {
                 control = self.memory.read(control, *index)? & ADDRESS_FIELD;
             }
+            // Remove the temporary WINDOW->root leaf before publishing exactly
+            // this root's private aliases. No sibling table is borrowed/mapped.
+            self.memory.write(control, 0, 0)?;
             for slot in 0..TABLES {
-                let table = self.memory.tables[slot].physical;
-                if table != 0 {
+                if space.tables[slot] {
                     self.memory.write(
                         control,
                         slot,
-                        logic::leaf_entry(table, Permissions::RW, tree.bits)?,
+                        logic::leaf_entry(
+                            self.memory.tables[slot].physical,
+                            Permissions::RW,
+                            tree.bits,
+                        )?,
                     )?;
                 }
             }
@@ -929,16 +972,20 @@ impl Paging<'_, '_> {
         self.memory.budget = None;
         space.tables =
             core::array::from_fn(|i| !old_tables[i] && self.memory.tables[i].physical != 0);
-        self.user_root = Some(space.root);
         if let Err(error) = result {
             self.destroy_user(space)?;
+            if self.stats() != before || self.table_count() != before_tables {
+                return Err(Error::Corrupt);
+            }
             return Err(error);
         }
         Ok(space)
     }
-
-    fn verify_user(&self, space: &UserSpace) -> Result<()> {
+    pub fn verify_user(&self, space: &UserSpace) -> Result<()> {
         use super::userspace::{CODE, CONSTANTS, DATA, GUARD, STACK, UNMAPPED};
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
         let tree = PageTree {
             root: space.root,
             bits: self.tree.bits,
@@ -970,7 +1017,7 @@ impl Paging<'_, '_> {
                 }
             }
         }
-        for (index, (address, permission)) in [
+        for (index, (address, permissions)) in [
             (CODE, Permissions::RX),
             (CONSTANTS, Permissions::R),
             (DATA, Permissions::RW),
@@ -979,85 +1026,131 @@ impl Paging<'_, '_> {
         .into_iter()
         .enumerate()
         {
-            let id = space.frames[index].ok_or(Error::NotOwned)?;
+            let frame = space.frames[index].ok_or(Error::NotOwned)?;
+            let record = self.registry.mapping_for(space.id, address)?;
             let actual = tree
                 .translate(&self.memory, address)?
                 .ok_or(Error::NotMapped)?;
-            if actual.physical != self.registry.physical(id)?
-                || actual.permissions != permission
+            if record.frame != frame
+                || self.registry.owner(frame)? != space.id
+                || actual.physical != self.registry.physical(frame)?
+                || actual.permissions != permissions
                 || !actual.user
                 || actual.page_size != PAGE
             {
                 return Err(Error::Flags);
             }
         }
-        for (slot, owner) in self
-            .memory
-            .tables
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.physical != 0)
-        {
-            let view = tree
-                .translate(&self.memory, WINDOW + slot as u64 * PAGE)?
-                .ok_or(Error::NotMapped)?;
-            if view.physical != owner.physical || view.user || view.permissions != Permissions::RW {
+        for slot in 0..TABLES {
+            let actual = tree.translate(&self.memory, WINDOW + slot as u64 * PAGE)?;
+            if space.tables[slot] {
+                let table = self.memory.tables[slot];
+                if table.physical == 0
+                    || actual.is_none_or(|a| {
+                        a.physical != table.physical || a.user || a.permissions != Permissions::RW
+                    })
+                {
+                    return Err(Error::Flags);
+                }
+            } else if actual.is_some() {
                 return Err(Error::Flags);
             }
-            let parents = self.memory.parent_references(owner.physical)?;
-            if parents
-                != usize::from(owner.physical != space.root && owner.physical != self.tree.root)
-            {
+        }
+        for table in self.memory.tables.iter().filter(|t| t.physical != 0) {
+            if self.memory.parent_references(table.physical)? != usize::from(table.level != 4) {
                 return Err(Error::Corrupt);
             }
         }
-        for address in [0, GUARD, STACK + PAGE, UNMAPPED, SCRATCH] {
+        let private = tree.translate(&self.memory, UNMAPPED)?;
+        if let Some(frame) = space.private {
+            let record = self.registry.mapping_for(space.id, UNMAPPED)?;
+            if record.frame != frame
+                || private.is_none_or(|p| {
+                    p.physical != self.registry.physical(frame).unwrap_or(0)
+                        || !p.user
+                        || p.permissions != Permissions::R
+                })
+            {
+                return Err(Error::Flags);
+            }
+        } else if private.is_some() {
+            return Err(Error::Flags);
+        }
+        for address in [0, GUARD, STACK + PAGE, SCRATCH] {
             if tree.translate(&self.memory, address)?.is_some() {
                 return Err(Error::Flags);
             }
         }
         Ok(())
     }
-
-    pub fn activate_user(&self, space: &UserSpace) -> Result<()> {
-        if self.user_root != Some(space.root) || current_root() != self.tree.root {
+    pub fn activate_user(&mut self, space: &UserSpace) -> Result<()> {
+        if current_root() != self.tree.root {
             return Err(Error::InUse);
         }
         self.verify_user(space)?;
-        // SAFETY: Private, verified hierarchy maps every live kernel mechanism,
-        // including both stacks and both roots' supervisor-only table aliases.
+        self.registry.activate_space(space.id)?;
         load_root(space.root);
         if current_root() != space.root {
             return Err(Error::Corrupt);
         }
         Ok(())
     }
-
+    pub fn deactivate_user(&mut self, space: &UserSpace) -> Result<()> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.registry.deactivate_space(space.id)
+    }
     pub fn user_result(&mut self, space: &UserSpace) -> Result<u64> {
-        if current_root() != self.tree.root {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
         self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
             u64::from_le_bytes(bytes[..8].try_into().unwrap())
         })
     }
-
-    pub fn destroy_user(&mut self, space: UserSpace) -> Result<()> {
-        use super::userspace::{CODE, CONSTANTS, DATA, STACK};
-        if current_root() != self.tree.root || self.user_root != Some(space.root) {
+    #[cfg(feature = "node-test")]
+    pub fn private_value(&mut self, space: &UserSpace) -> Result<Option<u64>> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
-        // The user root is inactive. Remove ALL of its hierarchy and workspace
-        // references before freeing any table, including its own workspace PT.
+        space
+            .private
+            .map(|id| {
+                self.with_frame(id, |bytes| {
+                    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+                })
+            })
+            .transpose()
+    }
+    #[cfg(feature = "node-test")]
+    pub fn user_physical(&self, space: &UserSpace, address: u64) -> Result<u64> {
+        if self.registry.root(space.id)? != space.root {
+            return Err(Error::NotOwned);
+        }
+        let mapping = self.registry.mapping_for(space.id, address)?;
+        self.registry.physical(mapping.frame)
+    }
+    pub fn destroy_user(&mut self, space: UserSpace) -> Result<()> {
+        use super::userspace::{CODE, CONSTANTS, DATA, STACK, UNMAPPED};
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.registry.can_allocate(space.id)?; // also refuses an active root
+        let before = self.stats();
+        let old_tables = self.table_count();
+        let tables = space.tables.iter().filter(|v| **v).count();
+        let released =
+            tables + space.frames.iter().flatten().count() + usize::from(space.private.is_some());
         for slot in 0..TABLES {
             if space.tables[slot] {
                 self.memory.zero(self.memory.tables[slot].physical)?;
             }
         }
-        load_root(self.tree.root); // no global/PCID translations survive deactivation
-        for address in [CODE, CONSTANTS, DATA, STACK] {
-            if self.registry.mapping(address).is_ok() {
-                self.registry.remove(address)?;
+        load_root(self.tree.root);
+        for address in [CODE, CONSTANTS, DATA, STACK, UNMAPPED] {
+            if self.registry.mapping_for(space.id, address).is_ok() {
+                self.registry.remove_for(space.id, address)?;
             }
         }
         for slot in (0..TABLES).rev() {
@@ -1065,11 +1158,17 @@ impl Paging<'_, '_> {
                 self.memory.release(self.memory.tables[slot].physical)?;
             }
         }
-        for id in space.frames.into_iter().flatten() {
-            self.free_frame(id)?;
+        for frame in space.frames.into_iter().flatten().chain(space.private) {
+            self.free_frame(frame)?;
         }
-        self.user_root = None;
-        if self.stats() != space.before || self.table_count() != space.before_tables {
+        self.registry.clear_root(space.id, space.root)?;
+        self.registry.retire_space(space.id)?;
+        let after = self.stats();
+        if after.total != before.total
+            || after.allocated + released != before.allocated
+            || after.free != before.free + released
+            || self.table_count() + tables != old_tables
+        {
             return Err(Error::Corrupt);
         }
         self.verify()

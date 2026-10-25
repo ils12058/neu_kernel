@@ -35,9 +35,12 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "native": "test-native", "native-unknown": "test-native-unknown", "native-exit-invalid": "test-native-exit-invalid",
             "native-return-rip": "test-native-return-rip", "native-return-rsp": "test-native-return-rsp",
             "native-return-flags": "test-native-return-flags", "native-return-selectors": "test-native-return-selectors",
-            "native-disabled": "test-native-disabled"}
+            "native-disabled": "test-native-disabled",
+            "nodes": "test-nodes", "nodes-a-fault": "test-nodes-a-fault", "nodes-b-fault": "test-nodes-b-fault",
+            "nodes-cross": "test-nodes-cross", "nodes-reclaim": "test-nodes-reclaim", "nodes-rollback": "test-nodes-rollback"}
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
+NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -137,7 +140,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -397,6 +400,13 @@ def check_user(case, text, symbols, observed):
 
 
 
+for name, number in NODE_CASES.items():
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Node ready: label=1 ", "[NEU] Node ready: label=2 ",
+        "[NEU] Two Nodes live:", "[NEU] Node start:", "[NEU] Node outcome:", "[NEU] Node accounting restored:",
+        f"[NEU] Node isolation test passed: case={number}", "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+        EXPECT["boot"][1] + ["verified=false"])
+
+
 def native_register(registers, name):
     match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
     if not match:
@@ -408,15 +418,16 @@ def native_site(symbols, name):
     return USER_CODE + symbols[name] - symbols["neu_native_payload"]
 
 
-def observe_native(qmp, serial, case, symbols, deadline):
-    match = re.search(r"Native user space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", transcript(serial))
+def observe_native(qmp, serial, case, symbols, deadline, start=0, expected_kind=None, node=False):
+    view = lambda: transcript(serial)[start:]
+    match = re.search(r"Native user space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", view())
     if not match:
         raise Failure("Missing native execution contract.")
     kind, root, kernel, entry, rsp = [int(v, 0) for v in match.groups()]
-    if kind != NATIVE_CASES[case] or root == kernel or entry != USER_CODE or rsp != USER_RSP:
+    if kind != (NATIVE_CASES[case] if expected_kind is None else expected_kind) or root == kernel or entry != USER_CODE or rsp != USER_RSP:
         raise Failure("Invalid native root or entry contract.")
     observed = {"kind": kind, "root": root, "kernel_root": kernel, "observations": {}}
-    phases = ["before"] + (["kernel"] if kind != 7 else []) + (["after"] if kind <= 2 else [])
+    phases = ["before"] + (["kernel"] if kind != 7 else []) + (["after"] if kind <= 2 or node else [])
     canaries = [symbols["neu_native_canary_" + suffix] for suffix in ("bx", "bp", "12", "13", "14", "15")]
     for phase in phases:
         if phase == "kernel":
@@ -443,7 +454,7 @@ def observe_native(qmp, serial, case, symbols, deadline):
                     raise Failure("Ring 3 did not observe the expected native scalar result.")
                 observed["observations"][phase] = registers
                 break
-            if "Native terminal:" in transcript(serial):
+            if "Native terminal:" in view():
                 raise Failure("Native execution finished without the required QMP " + phase + " observation.")
             time.sleep(0.01)
         else:
@@ -528,6 +539,124 @@ def check_native(case, text, symbols, observed):
     return observed
 
 
+
+def check_nodes(case, text, symbols, observations):
+    number = NODE_CASES[case]
+    ready_pattern = r"Node ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) code_pa=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) stack_pa=(0x[0-9a-f]+) seed=(\d+) private=(true|false)"
+    ready = list(re.finditer(ready_pattern,text))
+    starts = list(re.finditer(r"Node start: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) kind=(\d+)",text))
+    if len(ready)!=2 or len(starts)!=2 or set(observations)!={1,2}:
+        raise Failure("Two independent live Node records and executions are required.")
+    records = {}
+    for match in ready:
+        label,node,thread,space,root,code,data,stack,seed = [int(v,0) for v in match.groups()[:9]]
+        if label in records or seed!={1:35,2:77}.get(label) or (match[10]=="true")!=(label==2):
+            raise Failure("Invalid Node identity or independent seed/private mapping.")
+        records[label] = {"node":node,"thread":thread,"space":space,"root":root,"code_pa":code,"data_pa":data,"stack_pa":stack}
+    if set(records)!={1,2} or any(records[1][key]==records[2][key] for key in ("node","thread","space","root")):
+        raise Failure("Node/Thread/space/root identities are not independent.")
+    if {records[1][k] for k in ("code_pa","data_pa","stack_pa")} & {records[2][k] for k in ("code_pa","data_pa","stack_pa")}:
+        raise Failure("User backing frames are accidentally shared between Nodes.")
+    pair = re.search(r"Two Nodes live: A=(\d+) B=(\d+) A_root=(0x[0-9a-f]+) B_root=(0x[0-9a-f]+) capacity=verified",text)
+    if not pair or tuple(int(v,0) for v in pair.groups()) != (records[1]["node"],records[2]["node"],records[1]["root"],records[2]["root"]) or not max(m.end() for m in ready)<pair.start()<starts[0].start():
+        raise Failure("Both ownership domains were not retained before either execution.")
+    expected_order = [2,1] if number==2 else [1,2]
+    if [int(m[1]) for m in starts]!=expected_order:
+        raise Failure("Incorrect sequential execution order.")
+    outcomes = {}
+    query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
+    for index, start in enumerate(starts):
+        label,node,thread,space,root,kind = [int(v,0) for v in start.groups()]
+        record = records[label]
+        if (node,thread,space,root) != tuple(record[k] for k in ("node","thread","space","root")):
+            raise Failure("Active Thread does not belong to its declared Node/root.")
+        faulted = (number==1 and label==1) or (number==2 and label==2) or (number==3 and label==1)
+        expected_kind = 10 if number==3 and label==1 else (11 if faulted else (8 if label==1 else 9))
+        observed = observations[label]
+        if kind!=expected_kind or observed["root"]!=root or observed["kind"]!=kind or set(observed["observations"])!={"before","kernel","after"}:
+            raise Failure("Missing per-Node actual CPL=3/0/3 and CR3 evidence.")
+        end = starts[index+1].start() if index+1<len(starts) else len(text)
+        segment = text[start.start():end]
+        binding = re.search(r"Node execution bound: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+)",segment)
+        msrs = re.search(r"Native MSRs verified: EFER=(0x[0-9a-f]+) STAR=(0x[0-9a-f]+) LSTAR=(0x[0-9a-f]+) FMASK=(0x[0-9a-f]+) SYSENTER=0",segment)
+        if not binding or tuple(int(v,0) for v in binding.groups())!=(node,thread,space,root) or not msrs:
+            raise Failure("Missing trusted native context binding/configuration.")
+        efer,star,lstar,fmask=[int(v,16) for v in msrs.groups()]
+        if efer & 0xd01!=0xd01 or star!=symbols["neu_abi_star"] or lstar!=symbols["neu_native_entry"] or fmask!=symbols["neu_abi_fmask"]:
+            raise Failure("Node native MSRs do not match the preserved ABI.")
+        entries = re.findall(r"Native entry: seq=(\d+) op=(0x[0-9a-f]+) arg1=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) R11=(0x[0-9a-f]+)",segment)
+        contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)",segment)
+        bound = re.findall(r"Node syscall bound: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) seq=(\d+)",segment)
+        expected_ops = [query] if faulted else [query,query,exit_op]
+        if len(entries)!=len(expected_ops) or len(contexts)!=len(entries) or len(bound)!=len(entries):
+            raise Failure("Incorrect per-Node syscall sequence/count.")
+        for seq,(entry,context,association) in enumerate(zip(entries,contexts,bound),1):
+            actual_seq,op,arg,rip,rsp,_=[int(v,0) for v in entry]
+            cs,ss,kernel_rsp,frame,flags,current_root=[int(v,0) for v in context]
+            if (actual_seq!=seq or op!=expected_ops[seq-1] or arg!=(0 if op==exit_op else 11)
+                    or rip!=native_site(symbols,"neu_native_resume") or rsp!=USER_RSP-8
+                    or cs!=8 or ss!=0x10 or current_root!=root or flags&fmask
+                    or frame!=symbols["__user_kernel_top"]-160 or not symbols["__user_kernel_bottom"]<=kernel_rsp<frame
+                    or tuple(int(v,0) for v in association)!=(node,thread,space,root,seq)):
+                raise Failure("Syscall used a stale/wrong Node, Thread, root or return contract.")
+        returned = re.findall(r"Native return prepared: seq=(\d+) RAX=(0x[0-9a-f]+) RDX=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) preserved=true",segment)
+        expected_returns = 1 if faulted else 2
+        if len(returned)!=expected_returns:
+            raise Failure("Node did not complete its expected native query returns.")
+        for seq,row in enumerate(returned,1):
+            if tuple(int(v,0) for v in row)!=(seq,0,symbols["neu_abi_info"],native_site(symbols,"neu_native_resume"),USER_RSP-8):
+                raise Failure("Node query status/scalar/return state mismatch.")
+        terminal = re.search(r"Native terminal: kind=(\d+) reason=(\d+) status=(\d+) entries=(\d+) returns=(\d+) queries=(\d+) errors=(\d+) verified=true",segment)
+        wanted = (kind,8,0,1,1,1,0) if faulted else (kind,0,0,3,2,2,0)
+        if not terminal or tuple(int(v) for v in terminal.groups())!=wanted:
+            raise Failure("Node terminal state was not independently recorded.")
+        outcome = re.search(r"Node outcome: label=(\d+) node=(\d+) thread=(\d+) reason=(normal|fault) status=(\d+) result=(\d+)",segment)
+        if not outcome or (int(outcome[1]),int(outcome[2]),int(outcome[3]),outcome[4],int(outcome[5]),int(outcome[6]))!=(label,node,thread,"fault" if faulted else "normal",0,42 if label==1 else 84):
+            raise Failure("Node outcome/result is mixed with another domain.")
+        restored = re.search(r"Node execution restored: node=(\d+) thread=(\d+) root=(0x[0-9a-f]+) MSRs=restored guard=clear",segment)
+        if not restored or tuple(int(v,0) for v in restored.groups())!=(node,thread,observed["kernel_root"]):
+            raise Failure("Kernel continuation or native session was not restored between Nodes.")
+        parsed_fault = None
+        if faulted:
+            fault = re.search(r"Node user fault: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+)",segment)
+            if not fault:
+                raise Failure("Missing actual Node-local exception frame.")
+            values=[int(v,0) for v in fault.groups()]
+            fn,ft,fs,fr,vector,error,rip,cr2,cs,ss,rsp,flags,handler=values
+            target="neu_node_cross_site" if kind==10 else "neu_node_ud_site"
+            if ((fn,ft,fs,fr)!=(node,thread,space,root) or (vector,error)!=((14,4) if kind==10 else (6,0))
+                    or rip!=native_site(symbols,target) or (kind==10 and cr2!=0x406000)
+                    or cs!=0x3b or ss!=0x33 or rsp!=USER_RSP or flags&((1<<9)|(3<<12))
+                    or not symbols["__user_kernel_bottom"]<=handler<symbols["__user_kernel_top"]):
+                raise Failure("Fault was not contained to the expected CPL=3 Node/context.")
+            parsed_fault=values
+        elif "Node user fault:" in segment or "Native thread_exit: status=0" not in segment:
+            raise Failure("Healthy Node faulted or failed to exit.")
+        outcomes[label]={"identity":record,"cpu":observed,"fault":parsed_fault,"terminal":wanted,"result":int(outcome[6])}
+    reclaimed=list(re.finditer(r"Node reclaimed: label=(\d+) node=(\d+) space=(\d+) outcome=retained",text))
+    if len(reclaimed)!=2 or {int(m[1]) for m in reclaimed}!={1,2}:
+        raise Failure("Nodes were not reclaimed independently.")
+    for match in reclaimed:
+        record=records[int(match[1])]
+        if (int(match[2]),int(match[3]))!=(record["node"],record["space"]):
+            raise Failure("Wrong Node address space was reclaimed.")
+    if number in (1,2,3,4):
+        first,second=expected_order
+        released=next(m for m in reclaimed if int(m[1])==first)
+        survivor=re.search(r"Node survivor verified: label="+str(second)+r" node=(\d+) space=(\d+) root=(0x[0-9a-f]+) data=0",text[released.end():starts[1].start()])
+        if not released.end()<starts[1].start() or not survivor or tuple(int(v,0) for v in survivor.groups())!=tuple(records[second][k] for k in ("node","space","root")):
+            raise Failure("Survivor did not retain valid mappings/resources after sibling reclamation.")
+    if number==5:
+        rollback=re.search(r"Node B rollback verified: failpoints=(\d+) A_retained=true",text)
+        if not rollback or int(rollback[1])<10 or rollback.end()>pair.start():
+            raise Failure("Missing second-Node allocation-failure rollback proof.")
+    baseline=re.search(r"Node accounting baseline: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    restored=re.search(r"Node accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    if not baseline or not restored or baseline.groups()!=restored.groups():
+        raise Failure("Node resources did not return to the original accounting baseline.")
+    return {"case":number,"order":expected_order,"nodes":outcomes,"accounting":[int(v) for v in restored.groups()]}
+
+
 def check_fault(case, text, symbols):
     if case not in FAULTS:
         return None
@@ -601,6 +730,7 @@ def run_case(case, esp, timeout):
                 symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
                 user_observation = None
                 native_observation = None
+                node_observations = {}
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -612,7 +742,14 @@ def run_case(case, esp, timeout):
                     if case in NATIVE_CASES and native_observation is None and "Native user space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         native_observation = observe_native(qmp, serial, case, symbols, started + timeout)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES else 0.05)
+                    if case in NODE_CASES:
+                        current = transcript(serial)
+                        for start in re.finditer(r"Node start: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) kind=(\d+)",current):
+                            label = int(start[1])
+                            if label not in node_observations and "Native user space ready:" in current[start.start():]:
+                                if qmp is None: qmp = QMP(endpoint, started + timeout)
+                                node_observations[label] = observe_native(qmp,serial,case,symbols,started+timeout,start.start(),int(start[6]),True)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -650,6 +787,9 @@ def run_case(case, esp, timeout):
                 fault = check_fault(case, text, symbols)
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
+                nodes = check_nodes(case,text,symbols,node_observations) if case in NODE_CASES else None
+                if nodes and (any(item["kernel_root"] != paging["root"] for item in node_observations.values()) or int(re.search(r"EFER=([0-9a-fA-F]+)",second)[1],16)&1):
+                    raise Failure("Node execution did not restore kernel CR3/MSRs.")
                 if native and native["kernel_root"] != paging["root"]:
                     raise Failure("Native teardown did not restore the kernel root.")
                 if native and int(re.search(r"EFER=([0-9a-fA-F]+)", second)[1], 16) & 1:
@@ -659,7 +799,7 @@ def run_case(case, esp, timeout):
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -720,7 +860,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case in ("memory", "paging", "user", "native"):
+            if not args.case or args.case in ("memory", "paging", "user", "native", "nodes"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}
