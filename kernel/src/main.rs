@@ -21,7 +21,15 @@ const _: () = assert!(
         + cfg!(feature = "test-guard-low") as u8
         + cfg!(feature = "test-guard-high") as u8
         + cfg!(feature = "test-df-guard-low") as u8
-        + cfg!(feature = "test-df-guard-high") as u8)
+        + cfg!(feature = "test-df-guard-high") as u8
+        + cfg!(feature = "test-user") as u8
+        + cfg!(feature = "test-user-kernel") as u8
+        + cfg!(feature = "test-user-readonly") as u8
+        + cfg!(feature = "test-user-nx") as u8
+        + cfg!(feature = "test-user-unmapped") as u8
+        + cfg!(feature = "test-user-privileged") as u8
+        + cfg!(feature = "test-user-gate") as u8
+        + cfg!(feature = "test-user-guard") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -172,6 +180,14 @@ extern "C" fn neu_main() -> ! {
         log!(
             "[NEU] Paging self-test passed: aliases, mapping, zero/reuse, rollback, TLB, accounting\n"
         );
+    }
+
+    #[cfg(feature = "user-test")]
+    if let Err(error) = arch::userspace::run(&mut paging) {
+        arch::serial::emergency(format_args!(
+            "[NEU] BOOT FAILURE: user execution {error:?}\n"
+        ));
+        arch::halt();
     }
 
     if cfg!(feature = "test-panic") {

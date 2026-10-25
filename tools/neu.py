@@ -28,7 +28,12 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "paging": "test-paging", "unmapped": "test-unmapped", "readonly": "test-readonly", "nx": "test-nx",
             "paging-bootstrap-failure": "test-paging-bootstrap-failure",
             "guard-low": "test-guard-low", "guard-high": "test-guard-high",
-            "df-guard-low": "test-df-guard-low", "df-guard-high": "test-df-guard-high"}
+            "df-guard-low": "test-df-guard-low", "df-guard-high": "test-df-guard-high",
+            "user": "test-user", "user-kernel": "test-user-kernel", "user-readonly": "test-user-readonly",
+            "user-nx": "test-user-nx", "user-unmapped": "test-user-unmapped",
+            "user-privileged": "test-user-privileged", "user-gate": "test-user-gate", "user-guard": "test-user-guard"}
+USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
+USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
 
@@ -127,7 +132,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith("neu_test_") or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -140,6 +145,11 @@ def elf_info(path):
     for name in ("__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
         if not symbols.get(name) or symbols[name] & 4095:
             raise Failure("Kernel ELF is missing a page-aligned stack guard.")
+    if "__user_kernel_top" in symbols:
+        if symbols["__user_kernel_top"] - symbols["__user_kernel_bottom"] != 32768 or any(symbols[n] & 4095 for n in ("__user_kernel_bottom", "__user_kernel_top", "__user_kernel_guard_low", "__user_kernel_guard_high")):
+            raise Failure("Invalid user-transition kernel stack/guards.")
+        if not 0 < symbols["neu_user_payload_end"] - symbols["neu_user_payload"] <= 4096:
+            raise Failure("Invalid embedded user fixture bounds.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -290,6 +300,78 @@ for name, (vector, _, _) in FAULTS.items():
         "[NEU] PANIC:", "[NEU] BOOT FAILURE:", "nested fatal fault"])
 
 
+
+for name, kind in USER_CASES.items():
+    trigger = ["[NEU] User construction rollback verified:"] if kind == 0 else []
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + trigger + [f"[NEU] User space ready: kind={kind} ",
+        "[NEU] User boundary:", "[NEU] User boundary verified: true", "[NEU] User teardown verified:",
+        f"[NEU] User execution test passed: kind={kind} result=42", "[NEU] Kernel bootstrap successful",
+        "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1] + ["User boundary verified: false"])
+
+
+def user_ready(text, case):
+    match = re.search(r"User space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", text)
+    if not match:
+        raise Failure("Missing user root/entry contract.")
+    kind, root, kernel, entry, rsp = [int(v, 0) for v in match.groups()]
+    if kind != USER_CASES[case] or root == kernel or entry != USER_CODE or rsp != USER_RSP:
+        raise Failure("Invalid user address-space identity or entry contract.")
+    return {"kind": kind, "root": root, "kernel_root": kernel, "entry": entry, "rsp": rsp}
+
+
+def observe_user(qmp, text_path, case, symbols, deadline):
+    ready = user_ready(transcript(text_path), case)
+    while time.monotonic() < deadline:
+        registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+        if "CPL=3" in registers:
+            def reg(name):
+                match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
+                if not match:
+                    raise Failure("Missing user CPU register: " + name)
+                return int(match[1], 16)
+            length = symbols["neu_user_payload_end"] - symbols["neu_user_payload"]
+            if (reg("CR3") != ready["root"] or reg("CS") != 0x3b or reg("SS") != 0x33
+                    or reg("RSP") != USER_RSP or not USER_CODE <= reg("RIP") < USER_CODE + length
+                    or reg("RFL") & ((1 << 8) | (1 << 9) | (1 << 10) | (3 << 12) | (1 << 14) | (1 << 18))
+                    or reg("CR0") & 10 != 10 or reg("EFER") & 1 or "HLT=0" not in registers
+                    or not re.search(r"FS =0000 0000000000000000", registers)
+                    or not re.search(r"GS =0000 0000000000000000", registers)):
+                raise Failure("Actual QMP user CPU state violates the entry contract.")
+            ready["qmp_user_observation"] = registers
+            return ready
+        if "User boundary:" in transcript(text_path):
+            raise Failure("Guest completed without a direct QMP CPL=3 observation.")
+        time.sleep(0.01)
+    raise Failure("Timed out observing actual CPL=3 execution.")
+
+
+def check_user(case, text, symbols, observed):
+    if not observed:
+        raise Failure("Missing hardware-observed Ring 3 evidence.")
+    boundary = re.search(r"User boundary: kind=(\d+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+)", text)
+    context = re.search(r"User context: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) RAX=(\d+) kernel_CS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
+    if not boundary or not context:
+        raise Failure("Missing complete user boundary CPU frame.")
+    kind, vector, error, rip, cr2 = [int(v, 0) for v in boundary.groups()]
+    cs, ss, rsp, flags, result, kernel_cs, handler_rsp, root = [int(v, 0) for v in context.groups()]
+    table = [(128, 0, "neu_user_done_resume", None), (14, 5, "neu_user_kernel_site", 0xffffffff80000000),
+             (14, 7, "neu_user_readonly_site", 0x401000), (14, 21, 0x402100, 0x402100),
+             (14, 4, "neu_user_unmapped_site", 0x406000), (13, 0, "neu_user_privileged_site", None),
+             (13, 0x40a, "neu_user_gate_site", None), (14, 4, "neu_user_guard_site", 0x403000)]
+    expected_vector, expected_error, target, fault_address = table[USER_CASES[case]]
+    target = USER_CODE + symbols[target] - symbols["neu_user_payload"] if isinstance(target, str) else target
+    if (kind != USER_CASES[case] or vector != expected_vector or error != expected_error or rip != target
+            or (fault_address is not None and cr2 != fault_address) or cs != 0x3b or ss != 0x33
+            or rsp != USER_RSP - (8 if case == "user-nx" else 0) or result != 42 or kernel_cs != 8
+            or flags & ((1 << 8) | (1 << 9) | (1 << 10) | (3 << 12) | (1 << 14) | (1 << 17) | (1 << 18))
+            or not flags & 2 or root != observed["root"]
+            or not symbols["__user_kernel_bottom"] <= handler_rsp < symbols["__user_kernel_top"]):
+        raise Failure("User boundary vector/error/RIP/CR2/privilege/stack/result does not match.")
+    observed["boundary"] = {"vector": vector, "error": error, "rip": rip, "cr2": cr2, "cs": cs, "ss": ss,
+        "rsp": rsp, "rflags": flags, "result": result, "kernel_cs": kernel_cs, "handler_rsp": handler_rsp}
+    return observed
+
+
 def check_fault(case, text, symbols):
     if case not in FAULTS:
         return None
@@ -360,14 +442,19 @@ def run_case(case, esp, timeout):
             process = subprocess.Popen(arguments, cwd=ROOT, stdout=error_log, stderr=error_log)
             try:
                 required, forbidden = EXPECT[case]
+                symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
+                user_observation = None
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
                     if time.monotonic() - started >= timeout:
                         raise Failure(f"{case}: timed out after {timeout:g}s waiting for the expected serial result.")
-                    time.sleep(0.05)
-                qmp = QMP(endpoint, started + timeout)
-                symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
+                    if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
+                        qmp = QMP(endpoint, started + timeout)
+                        user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
+                    time.sleep(0.01 if case in USER_CASES else 0.05)
+                if qmp is None:
+                    qmp = QMP(endpoint, started + timeout)
                 paging = None
                 if case == "paging-bootstrap-failure":
                     match = re.search(r"Paging bootstrap rollback verified: CR3=(0x[0-9a-f]+) accounting restored", transcript(serial))
@@ -401,10 +488,13 @@ def run_case(case, esp, timeout):
                 if any(marker in text for marker in forbidden):
                     raise Failure(f"Unexpected panic/failure/success marker in {case} transcript.")
                 fault = check_fault(case, text, symbols)
+                user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
+                if user and user["kernel_root"] != paging["root"]:
+                    raise Failure("User teardown did not restore the original kernel root.")
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -465,7 +555,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case in ("memory", "paging"):
+            if not args.case or args.case in ("memory", "paging", "user"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}

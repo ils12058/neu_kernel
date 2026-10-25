@@ -82,7 +82,8 @@ static TSS: Table<Tss> = Table(UnsafeCell::new(Tss {
     reserved3: 0,
     iomap: 104,
 }));
-static GDT: Table<[u64; 5]> = Table(UnsafeCell::new([0; 5]));
+const GDT_ENTRIES: usize = if cfg!(feature = "user-test") { 8 } else { 5 };
+static GDT: Table<[u64; GDT_ENTRIES]> = Table(UnsafeCell::new([0; GDT_ENTRIES]));
 static IDT: Table<[Gate; 256]> = Table(UnsafeCell::new([Gate::EMPTY; 256]));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static FAULTING: AtomicBool = AtomicBool::new(false);
@@ -131,8 +132,15 @@ pub fn initialize() -> Result<(), &'static str> {
             103 | ((base & 0xff_ffff) << 16) | (0x89 << 40) | (((base >> 24) & 0xff) << 56),
         );
         ptr::write(gdt.add(4), base >> 32);
+        #[cfg(feature = "user-test")]
+        {
+            // Preserve selector 0x28 as an invalid descriptor for the old #GP
+            // test. User data=0x33, long-mode code=0x3b (DPL/RPL=3).
+            ptr::write(gdt.add(6), 0x00cf_f300_0000_ffff);
+            ptr::write(gdt.add(7), 0x00af_fb00_0000_ffff);
+        }
         let descriptor = Descriptor {
-            limit: (mem::size_of::<[u64; 5]>() - 1) as u16,
+            limit: (mem::size_of::<[u64; GDT_ENTRIES]>() - 1) as u16,
             base: gdt as u64,
         };
         neu_load_gdt(&descriptor);
@@ -156,16 +164,16 @@ pub fn initialize() -> Result<(), &'static str> {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ExceptionFrame {
+pub(super) struct ExceptionFrame {
     // Assembly order: r15..r8, rdi,rsi,rbp,rdx,rcx,rbx,rax.
-    gpr: [u64; 15],
-    vector: u64,
-    error: u64,
-    rip: u64,
-    cs: u64,
-    flags: u64,
-    rsp: u64,
-    ss: u64,
+    pub(super) gpr: [u64; 15],
+    pub(super) vector: u64,
+    pub(super) error: u64,
+    pub(super) rip: u64,
+    pub(super) cs: u64,
+    pub(super) flags: u64,
+    pub(super) rsp: u64,
+    pub(super) ss: u64,
 }
 const _: () = assert!(mem::size_of::<ExceptionFrame>() == 176);
 const _: () = assert!(mem::offset_of!(ExceptionFrame, vector) == 120);
@@ -203,13 +211,19 @@ extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
         halt();
     }
     let handler_rsp: u64;
-    // SAFETY: Assembly passed a complete, aligned normalized frame on the
-    // current normal/IST stack. All handlers are fatal, so no return ABI or
-    // potentially invalid original stack is used. CR2 was captured in assembly.
+    // SAFETY: Only assembly entry passes this complete normalized kernel-stack
+    // frame. Original user RSP/RIP are copied as numbers, never dereferenced.
     let frame = unsafe {
         asm!("mov {}, rsp", out(reg) handler_rsp, options(nomem, nostack, preserves_flags));
         ptr::read(frame)
     };
+    #[cfg(feature = "user-test")]
+    if (frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18)) || frame.vector == 128 {
+        // The complete trusted frame is copied. User termination is a separate
+        // one-shot path; retain the early nested guard for privileged faults.
+        FAULTING.store(false, Ordering::Relaxed);
+        super::userspace::boundary(frame, cr2, handler_rsp);
+    }
     let ist = (ptr::addr_of!(__df_stack_bottom) as u64..ptr::addr_of!(__df_stack_top) as u64)
         .contains(&handler_rsp);
     // SAFETY: The fault guard permits one writer; this static survives halt.
@@ -299,4 +313,42 @@ pub fn test_paging_access(kind: usize, address: u64) {
             }
         }
     }
+}
+
+#[cfg(feature = "user-test")]
+pub fn configure_user_test(enabled: bool) -> neu_kernel::paging::Result<()> {
+    use neu_kernel::paging::Error;
+    unsafe extern "C" {
+        fn neu_user_trap();
+    }
+    let (bottom, top) = super::userspace::kernel_stack();
+    if !INITIALIZED.load(Ordering::Relaxed) || top - bottom != 32 * 1024 || top & 15 != 0 {
+        return Err(Error::Corrupt);
+    }
+    // SAFETY: One BSP, IF=0, no active user execution during configuration.
+    // RSP0 uses a separate stack so the suspended Rust continuation stays intact.
+    // I/O bitmap starts beyond the TSS limit, denying all CPL3 port access.
+    unsafe {
+        ptr::write_unaligned(
+            ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(),
+            if enabled {
+                top
+            } else {
+                ptr::addr_of!(__stack_top) as u64
+            },
+        );
+        let mut gate = Gate::new(
+            if enabled {
+                neu_user_trap as *const () as u64
+            } else {
+                neu_isr_255 as *const () as u64
+            },
+            0,
+        );
+        if enabled {
+            gate.attributes = 0xee;
+        }
+        ptr::write(IDT.0.get().cast::<Gate>().add(128), gate);
+    }
+    Ok(())
 }

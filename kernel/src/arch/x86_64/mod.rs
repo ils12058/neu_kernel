@@ -5,6 +5,8 @@ use core::arch::{asm, global_asm, x86_64::__cpuid};
 pub mod exceptions;
 pub mod paging;
 pub mod serial;
+#[cfg(feature = "user-test")]
+pub mod userspace;
 
 global_asm!(include_str!("entry.S"));
 

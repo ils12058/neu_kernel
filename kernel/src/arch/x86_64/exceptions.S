@@ -62,6 +62,25 @@ neu_exception_common:
     push r13
     push r14
     push r15
+    # GPRs already saved. No TLS/per-CPU GS contract exists: discard user
+    # segment/base state before invoking Rust; never use SWAPGS on this path.
+    test byte ptr [rsp + 144], 3
+    jz 2f
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
+    xor edx, edx
+    mov ecx, 0xc0000100
+    wrmsr
+    inc ecx
+    wrmsr
+    inc ecx
+    wrmsr
+2:
     mov rdi, rsp
     mov rsi, cr2
     and rsp, -16
@@ -153,3 +172,10 @@ neu_test_guard:
 neu_test_guard_site:
     mov rax, [rdi]
     ret
+
+.section .text.user_trap,"ax"
+.global neu_user_trap
+neu_user_trap:
+    push 0
+    push 128
+    jmp neu_exception_common

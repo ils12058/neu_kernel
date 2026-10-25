@@ -383,3 +383,164 @@ fn duplicate_physical_ownership_cannot_bypass_alias_permissions() {
     assert_ne!(next, frame);
     assert_eq!(registry.physical(frame), Err(Error::NotOwned));
 }
+
+#[test]
+fn user_mappings_require_lower_range_and_user_bits_at_every_level() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    for address in [
+        0,
+        USER_BASE - PAGE,
+        USER_BASE + USER_SIZE,
+        TEST_BASE,
+        0x8000_0000_0000,
+    ] {
+        assert!(
+            tree.map_user(&mut memory, address, 0x100000, Permissions::RX)
+                .is_err()
+        );
+        assert_eq!(memory.pages.len(), 1);
+    }
+    assert_eq!(user_range(USER_BASE, usize::MAX), Err(Error::Address));
+    tree.map_user(&mut memory, USER_BASE, 0x100000, Permissions::RX)
+        .unwrap();
+    let mut table = tree.root;
+    for (depth, index) in indices(USER_BASE).unwrap().into_iter().enumerate() {
+        let entry = memory.read(table, index).unwrap();
+        assert_ne!(entry & 4, 0);
+        if depth < 3 {
+            table = entry & ADDRESS_FIELD;
+        } else {
+            assert_eq!(entry & (2 | NX), 0);
+        }
+    }
+    let mapping = tree.translate(&memory, USER_BASE).unwrap().unwrap();
+    assert!(mapping.user);
+    assert_eq!(mapping.permissions, Permissions::RX);
+    let parent_index = indices(USER_BASE).unwrap()[0];
+    let parent = memory.read(tree.root, parent_index).unwrap();
+    memory.write(tree.root, parent_index, parent & !4).unwrap();
+    assert!(!tree.translate(&memory, USER_BASE).unwrap().unwrap().user);
+    assert_eq!(
+        tree.map_user(&mut memory, USER_BASE + PAGE, 0x101000, Permissions::RW),
+        Err(Error::Flags)
+    );
+    assert_eq!(memory.read(tree.root, parent_index), Ok(parent & !4));
+}
+
+#[test]
+fn supervisor_and_user_branches_cannot_escalate_each_other() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    tree.map(&mut memory, USER_BASE, 0x100000, Permissions::R)
+        .unwrap();
+    let count = memory.pages.len();
+    assert_eq!(
+        tree.map_user(&mut memory, USER_BASE + PAGE, 0x101000, Permissions::RW),
+        Err(Error::Flags)
+    );
+    assert_eq!(memory.pages.len(), count);
+    tree.unmap(&mut memory, USER_BASE).unwrap();
+    tree.map_user(&mut memory, USER_BASE, 0x100000, Permissions::R)
+        .unwrap();
+    assert_eq!(
+        tree.map(&mut memory, USER_BASE + PAGE, 0x101000, Permissions::RW),
+        Err(Error::Flags)
+    );
+    assert!(tree.translate(&memory, USER_BASE).unwrap().unwrap().user);
+}
+
+#[test]
+fn user_transactions_rollback_and_keep_alias_ownership_across_domains() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let mut registry = Registry::new();
+    let id = registry.insert(0x100000).unwrap();
+    registry.initialize(id).unwrap();
+    let base = USER_BASE + 511 * PAGE;
+    memory.budget = Some(3);
+    assert_eq!(
+        map_user_frames(
+            &tree,
+            &mut memory,
+            &mut registry,
+            base,
+            &[id, id],
+            Permissions::RX
+        ),
+        Err(Error::Exhausted)
+    );
+    assert_eq!(memory.pages.len(), 1);
+    assert!(registry.releasable(id).is_ok());
+    assert_eq!(registry.mapping(base).err(), Some(Error::NotMapped));
+    memory.budget = None;
+    map_user_frames(
+        &tree,
+        &mut memory,
+        &mut registry,
+        USER_BASE,
+        &[id],
+        Permissions::RX,
+    )
+    .unwrap();
+    assert_eq!(
+        registry.prepare(TEST_BASE, &[id], Permissions::RW),
+        Err(Error::Wx)
+    );
+    assert_eq!(registry.writable(id), Err(Error::Wx));
+    assert_eq!(registry.retire(id), Err(Error::InUse));
+    // An R/NX kernel alias is compatible, and still prevents backing reuse.
+    map_frames(
+        &tree,
+        &mut memory,
+        &mut registry,
+        TEST_BASE,
+        &[id],
+        Permissions::R,
+    )
+    .unwrap();
+    tree.unmap(&mut memory, USER_BASE).unwrap();
+    registry.remove(USER_BASE).unwrap();
+    assert_eq!(registry.retire(id), Err(Error::InUse));
+    tree.unmap(&mut memory, TEST_BASE).unwrap();
+    registry.remove(TEST_BASE).unwrap();
+    registry.retire(id).unwrap();
+    assert_eq!(memory.pages.len(), 1);
+}
+
+#[test]
+fn private_roots_share_backing_without_sharing_or_reclaiming_child_tables() {
+    let mut memory = Model::new();
+    let kernel = PageTree::new(&mut memory, 48).unwrap();
+    kernel
+        .map(&mut memory, TEST_BASE, 0x100000, Permissions::RX)
+        .unwrap();
+    let before = memory.pages.keys().copied().collect::<Vec<_>>();
+    let user = PageTree::new(&mut memory, 48).unwrap();
+    user.map(&mut memory, TEST_BASE, 0x100000, Permissions::RX)
+        .unwrap();
+    user.map_user(&mut memory, USER_BASE, 0x200000, Permissions::RX)
+        .unwrap();
+    assert_ne!(kernel.root, user.root);
+    let index = indices(TEST_BASE).unwrap()[0];
+    assert_ne!(
+        memory.read(kernel.root, index).unwrap() & ADDRESS_FIELD,
+        memory.read(user.root, index).unwrap() & ADDRESS_FIELD
+    );
+    assert!(kernel.translate(&memory, USER_BASE).unwrap().is_none());
+    assert!(!user.translate(&memory, TEST_BASE).unwrap().unwrap().user);
+    user.unmap(&mut memory, USER_BASE).unwrap();
+    user.unmap(&mut memory, TEST_BASE).unwrap();
+    memory.pages.get_mut(&user.root).unwrap().2 = false; // Inactive, no root owner remains.
+    memory.flush();
+    memory.release(user.root).unwrap();
+    assert_eq!(memory.pages.keys().copied().collect::<Vec<_>>(), before);
+    assert_eq!(
+        kernel
+            .translate(&memory, TEST_BASE)
+            .unwrap()
+            .unwrap()
+            .physical,
+        0x100000
+    );
+}

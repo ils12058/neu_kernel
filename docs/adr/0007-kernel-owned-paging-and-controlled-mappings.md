@@ -10,6 +10,9 @@
 - **Architecture:** [Section 15](../Neu_Kernel_Architecture_v0.2.md#15-detailed-physical-and-virtual-memory--neu-mem-001)
   and [Section 25](../Neu_Kernel_Architecture_v0.2.md#25-decision-register-seed-for-adrs).
 
+[ADR 0008](0008-isolated-ring-3-fixture-and-test-return.md) adds the scoped Phase 2A
+user-root and test-return contract; the original rationale below is retained.
+
 ## Context
 
 The Phase 1A allocator owns physical frames but provides no access mechanism.
@@ -115,6 +118,11 @@ while leaving the old CR3 intact. Post-switch failures use fatal diagnostics.
   0005 as an amendment to 0004 while retaining the prior dated history. Host
   transaction tests, QEMU transition/permission/guard tests, exact commands and
   remaining limits are recorded in [implementation status](../IMPLEMENTATION_STATUS.md).
+
+- **2026-10-25, Phase 2A:** ADR 0008 adds private user tables and a separate
+  guarded RSP0 stack, classifies user-origin faults, and restores the kernel
+  continuation before cleanup. Existing supervisor and #DF behavior remains.
+  No full Node or native syscall specification is accepted by that test path.
 
 Reference: [Intel SDM, Volume 3A](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf),
 paging structures and translation/walk-cache invalidation; the pinned Limine

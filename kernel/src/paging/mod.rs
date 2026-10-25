@@ -4,6 +4,8 @@
 pub const PAGE: u64 = 4096;
 pub const TEST_BASE: u64 = 0xffff_a000_0000_0000;
 pub const TEST_SIZE: u64 = 4 * 1024 * 1024;
+pub const USER_BASE: u64 = 0x0040_0000;
+pub const USER_SIZE: u64 = 4 * 1024 * 1024;
 pub const ADDRESS_FIELD: u64 = 0x000f_ffff_ffff_f000;
 pub const NX: u64 = 1 << 63;
 
@@ -82,6 +84,16 @@ pub fn test_range(base: u64, pages: usize) -> Result<()> {
     let length = (pages as u64).checked_mul(PAGE).ok_or(Error::Address)?;
     let end = base.checked_add(length).ok_or(Error::Address)?;
     if pages == 0 || base < TEST_BASE || end > TEST_BASE + TEST_SIZE {
+        return Err(Error::Address);
+    }
+    Ok(())
+}
+/// Only the bounded lower-half fixture range is available in Phase 2A.
+pub fn user_range(base: u64, pages: usize) -> Result<()> {
+    page_address(base)?;
+    let length = (pages as u64).checked_mul(PAGE).ok_or(Error::Address)?;
+    let end = base.checked_add(length).ok_or(Error::Address)?;
+    if pages == 0 || base < USER_BASE || end > USER_BASE + USER_SIZE {
         return Err(Error::Address);
     }
     Ok(())
@@ -210,8 +222,31 @@ impl PageTree {
         pa: u64,
         permissions: Permissions,
     ) -> Result<()> {
+        self.map_kind(memory, va, pa, permissions, false)
+    }
+
+    pub fn map_user(
+        &self,
+        memory: &mut impl TableMemory,
+        va: u64,
+        pa: u64,
+        permissions: Permissions,
+    ) -> Result<()> {
+        user_range(va, 1)?;
+        self.map_kind(memory, va, pa, permissions, true)
+    }
+
+    fn map_kind(
+        &self,
+        memory: &mut impl TableMemory,
+        va: u64,
+        pa: u64,
+        permissions: Permissions,
+        user: bool,
+    ) -> Result<()> {
         page_address(va)?;
-        let leaf = leaf_entry(pa, permissions, self.bits)?;
+        let user_bit = if user { 4 } else { 0 };
+        let leaf = leaf_entry(pa, permissions, self.bits)? | user_bit;
         let path = indices(va)?;
         let mut table = self.root;
         let mut created = [(0u64, 0usize, 0u64); 3];
@@ -227,7 +262,7 @@ impl PageTree {
                     if size != 0 {
                         return Err(Error::AlreadyMapped);
                     }
-                    if entry & 4 != 0
+                    if entry & 4 != user_bit
                         || (permissions.write && entry & 2 == 0)
                         || (permissions.execute && entry & NX != 0)
                     {
@@ -240,7 +275,7 @@ impl PageTree {
                 } else {
                     let child = memory.allocate(level - 1)?;
                     let encoded = match table_entry(child, self.bits) {
-                        Ok(value) => value,
+                        Ok(value) => value | user_bit,
                         Err(error) => {
                             memory.release(child)?;
                             return Err(error);
@@ -419,7 +454,28 @@ impl Registry {
         Ok(())
     }
     pub fn prepare(&self, base: u64, frames: &[FrameId], permissions: Permissions) -> Result<()> {
-        test_range(base, frames.len())?;
+        self.prepare_kind(base, frames, permissions, false)
+    }
+    pub fn prepare_user(
+        &self,
+        base: u64,
+        frames: &[FrameId],
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.prepare_kind(base, frames, permissions, true)
+    }
+    fn prepare_kind(
+        &self,
+        base: u64,
+        frames: &[FrameId],
+        permissions: Permissions,
+        user: bool,
+    ) -> Result<()> {
+        if user {
+            user_range(base, frames.len())?;
+        } else {
+            test_range(base, frames.len())?;
+        }
         permissions.validate()?;
         if self.mappings.iter().filter(|m| !m.live).count() < frames.len() {
             return Err(Error::Capacity);
@@ -450,7 +506,24 @@ impl Registry {
         frames: &[FrameId],
         permissions: Permissions,
     ) -> Result<()> {
-        self.prepare(base, frames, permissions)?;
+        self.commit_kind(base, frames, permissions, false)
+    }
+    pub fn commit_user(
+        &mut self,
+        base: u64,
+        frames: &[FrameId],
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.commit_kind(base, frames, permissions, true)
+    }
+    fn commit_kind(
+        &mut self,
+        base: u64,
+        frames: &[FrameId],
+        permissions: Permissions,
+        user: bool,
+    ) -> Result<()> {
+        self.prepare_kind(base, frames, permissions, user)?;
         for (index, frame) in frames.iter().copied().enumerate() {
             let slot = self
                 .mappings
@@ -494,21 +567,46 @@ pub fn map_frames(
     frames: &[FrameId],
     permissions: Permissions,
 ) -> Result<()> {
-    registry.prepare(base, frames, permissions)?;
+    map_frames_kind(tree, memory, registry, base, frames, permissions, false)
+}
+
+pub fn map_user_frames(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    base: u64,
+    frames: &[FrameId],
+    permissions: Permissions,
+) -> Result<()> {
+    map_frames_kind(tree, memory, registry, base, frames, permissions, true)
+}
+
+fn map_frames_kind(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    base: u64,
+    frames: &[FrameId],
+    permissions: Permissions,
+    user: bool,
+) -> Result<()> {
+    registry.prepare_kind(base, frames, permissions, user)?;
     for (index, frame) in frames.iter().copied().enumerate() {
-        if let Err(error) = tree.map(
-            memory,
-            base + index as u64 * PAGE,
-            registry.physical(frame)?,
-            permissions,
-        ) {
+        let va = base + index as u64 * PAGE;
+        let pa = registry.physical(frame)?;
+        let result = if user {
+            tree.map_user(memory, va, pa, permissions)
+        } else {
+            tree.map(memory, va, pa, permissions)
+        };
+        if let Err(error) = result {
             for previous in (0..index).rev() {
                 tree.unmap(memory, base + previous as u64 * PAGE)?;
             }
             return Err(error);
         }
     }
-    registry.commit(base, frames, permissions)
+    registry.commit_kind(base, frames, permissions, user)
 }
 
 #[cfg(test)]

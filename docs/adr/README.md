@@ -77,3 +77,14 @@ accepted by these scoped records.
 ADR 0007 amends the paging/access portions of 0005 and the guard/#PF inspection
 assumptions of 0006. Nodes, general userspace VMM, and bootloader reclamation remain
 outside these accepted implementation contracts.
+
+## Phase 2A record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0008: Isolated Ring 3 fixture and test return](0008-isolated-ring-3-fixture-and-test-return.md) | Accepted, test scope only | NEU-017 embedded execution; NEU-018 bounded user mappings; NEU-021 privilege boundary; NEU-023 origin; NEU-024 local tests |
+
+ADR 0008 extends 0006/0007 with private user tables, a separate RSP0 stack and
+hardware-observed execution. Its `int 0x80` gate is test-only. The Node lifecycle,
+startup descriptor, native syscall and full execution specifications remain
+proposals; Phase 2B requires a separate concrete ABI decision.

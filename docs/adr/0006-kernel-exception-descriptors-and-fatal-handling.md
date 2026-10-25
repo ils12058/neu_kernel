@@ -12,6 +12,9 @@ The Phase 1A rationale below is preserved. [ADR 0007](0007-kernel-owned-paging-a
 amends the paging/guard assumptions and moves current #PF inspection onto the
 owned hierarchy; the exception entry, private descriptors, and fatal policy remain.
 
+[ADR 0008](0008-isolated-ring-3-fixture-and-test-return.md) adds the scoped Phase 2A
+user-root and test-return contract; the original rationale below is retained.
+
 ## Context
 
 Phase 0 kept the loader GDT and had no kernel IDT or TSS. An exception could
@@ -93,6 +96,11 @@ halt. Unexpected reset, triple fault, shutdown, or emulator exit cannot pass.
   amendment, retaining their historical reasoning. ADR 0007 supplies guarded
   stack mappings and a kernel-owned root. The #PF test now validates that active
   hierarchy rather than dereferencing the retired loader HHDM after switching.
+
+- **2026-10-25, Phase 2A:** ADR 0008 adds private user tables and a separate
+  guarded RSP0 stack, classifies user-origin faults, and restores the kernel
+  continuation before cleanup. Existing supervisor and #DF behavior remains.
+  No full Node or native syscall specification is accepted by that test path.
 
 Reference: [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html),
 Volume 3A, interrupt/exception handling, error codes, TSS and Interrupt Stack Table.
