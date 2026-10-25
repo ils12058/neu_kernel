@@ -1,7 +1,7 @@
 # ADR 0004: Integrate Limine for Phase 0
 
 - **Date:** 2026-10-25
-- **Status:** Accepted — Phase 0 Limine integration contract only.
+- **Status:** Superseded — by [ADR 0005](0005-boot-memory-ownership-and-frame-allocation.md) for Phase 1A.
 - **Related NEU decisions:** `NEU-004` (the proposed Limine portion);
   `NEU-025 / BOOT` (the open integration plan; not resolved by this record).
 - **Architecture:** [Section 4.4: preferred loader and adapter](../Neu_Kernel_Architecture_v0.2.md#44-bootloader-boundary),
@@ -115,3 +115,7 @@ status. Later integration and subsystem proposals are not accepted by reference.
   under the explicit request to implement Limine bootstrap. All three QEMU smoke
   scenarios passed on the documented environment. The original proposal remains
   intact, and acceptance is distinct from that implementation evidence.
+- **2026-10-25, Phase 1A:** Superseded by ADR 0005, which retains Limine 12.9.4
+  and base revision 6, adds explicit physical-image reservation and owned memory
+  descriptors, and adopts private CPU descriptors through ADR 0006. The original
+  proposal and Phase 0 resolution above remain unchanged historical rationale.

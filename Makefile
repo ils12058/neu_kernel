@@ -13,10 +13,7 @@ test:
 	$(PYTHON) tools/neu.py test --timeout $(TEST_TIMEOUT)
 
 check:
-	cargo fmt --all -- --check
-	cargo clippy --locked --target x86_64-unknown-none -- -D warnings
-	cargo clippy --locked --target x86_64-unknown-none --features test-panic -- -D warnings
-	cargo clippy --locked --target x86_64-unknown-none --features test-missing-memory-map -- -D warnings
+	$(PYTHON) tools/neu.py check
 
 doctor:
 	$(PYTHON) tools/neu.py doctor

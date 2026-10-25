@@ -51,7 +51,18 @@ to evidence when available. Acceptance does not assert Phase 0 completion.
 | [0001: Kernel-only project scope](0001-kernel-only-project-scope.md) | Accepted | NEU-001; NEU-016 boundary |
 | [0002: Rust and x86-64 foundation](0002-rust-and-x86-64-foundation.md) | Accepted | NEU-002 language; NEU-003 |
 | [0003: External bootloader boundary](0003-external-bootloader-boundary.md) | Accepted | NEU-004 external-loader direction |
-| [0004: Limine integration for Phase 0](0004-limine-phase-0-integration.md) | Accepted for Phase 0 | NEU-004 Limine details; NEU-025 / BOOT remains open |
+| [0004: Limine integration for Phase 0](0004-limine-phase-0-integration.md) | Superseded by 0005 | NEU-004 Limine details; NEU-025 / BOOT remains open |
 
 The external-loader direction and the Limine integration contract have separate
 records so their scope, status, and future replacements can evolve independently.
+
+## Phase 1A records
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0005: Boot ownership and physical frames](0005-boot-memory-ownership-and-frame-allocation.md) | Accepted | NEU-004; NEU-018 PMM only; NEU-025 remains open |
+| [0006: Private descriptors and fatal exceptions](0006-kernel-exception-descriptors-and-fatal-handling.md) | Accepted | NEU-003; NEU-023 privileged faults; NEU-024 local tests only |
+
+ADR 0005 explicitly succeeds the Phase 0 boot contract; loader version/base
+revision remain unchanged. No acceptance of future VMM, Node, or CI proposals is
+implied by these scoped records.

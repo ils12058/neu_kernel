@@ -1,10 +1,16 @@
 //! Minimal Limine base-revision-6 adapter; no third-party Rust dependencies.
 //! Layouts/IDs: limine-protocol commit 3a0526b700e356f0eac1b71a77697b3fd1c707a3,
-//! include/limine.h and PROTOCOL.md. Only firmware type and memory map are used.
+//! include/limine.h and PROTOCOL.md. Phase 1A additionally requests the actual
+//! executable address for reservations; HHDM is requested only by the #PF test.
 
-use core::{cell::UnsafeCell, mem, ptr};
+use core::{
+    cell::UnsafeCell,
+    mem, ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::arch;
+use crate::memory::{MAX_REGIONS, MemoryMap, Region as MemoryRegion, Reservation};
 
 #[repr(transparent)]
 struct LoaderCell<T>(UnsafeCell<T>);
@@ -47,10 +53,37 @@ struct MemoryMapResponse {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct MemoryRegion {
-    base: u64,
-    length: u64,
-    kind: u64,
+struct ExecutableAddress {
+    revision: u64,
+    physical_base: u64,
+    virtual_base: u64,
+}
+
+#[cfg(feature = "test-page-fault")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HhdmResponse {
+    revision: u64,
+    offset: u64,
+}
+
+struct KernelRegions(UnsafeCell<[MemoryRegion; MAX_REGIONS]>);
+// SAFETY: A once-only BSP initialization publishes immutable descriptors. No
+// loader or kernel writer retains access once initialize() returns.
+unsafe impl Sync for KernelRegions {}
+static REGIONS: KernelRegions = KernelRegions(UnsafeCell::new([MemoryRegion::EMPTY; MAX_REGIONS]));
+static COPIED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
+pub fn kernel_virtual_range() -> (usize, usize) {
+    (
+        ptr::addr_of!(__kernel_start) as usize,
+        ptr::addr_of!(__kernel_end) as usize,
+    )
 }
 
 // Compile-time checks for the exact C-layout prefixes consumed by this adapter.
@@ -87,6 +120,22 @@ static FIRMWARE: LoaderCell<Request<FirmwareResponse>> =
     ])));
 
 #[used]
+#[unsafe(link_section = ".limine_requests")]
+static EXECUTABLE: LoaderCell<Request<ExecutableAddress>> =
+    LoaderCell(UnsafeCell::new(Request::new([
+        0x71ba_7686_3cc5_5f63,
+        0xb264_4a48_c516_a487,
+    ])));
+
+#[cfg(feature = "test-page-fault")]
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static HHDM: LoaderCell<Request<HhdmResponse>> = LoaderCell(UnsafeCell::new(Request::new([
+    0x48dc_f1cb_8ad2_b852,
+    0x6398_4e95_9a98_244b,
+])));
+
+#[used]
 // The negative-test image deliberately leaves this request outside the markers.
 // Its null response must then be rejected before any response dereference.
 #[cfg_attr(
@@ -106,6 +155,19 @@ static END: [u64; 2] = [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62];
 pub struct BootInfo {
     pub memory_regions: u64,
     pub usable_bytes: u64,
+    pub memory_map: MemoryMap<'static>,
+}
+
+#[cfg(feature = "test-page-fault")]
+pub fn test_hhdm_offset() -> Result<u64, &'static str> {
+    // SAFETY: Called after successful base negotiation; the response follows
+    // the same trusted immutable loader mapping contract as other responses.
+    let response =
+        unsafe { read_boot_value(ptr::read_volatile(ptr::addr_of!((*HHDM.0.get()).response)))? };
+    if !arch::valid_boot_range(response.offset as usize, 4096, 4096) {
+        return Err("invalid test HHDM offset");
+    }
+    Ok(response.offset)
 }
 
 /// The loader must supply mapped, initialized, correctly sized objects that
@@ -148,44 +210,45 @@ pub fn initialize() -> Result<BootInfo, &'static str> {
             return Err("invalid memory-map pointer array");
         }
 
-        let (mut previous_base, mut all_end, mut reusable_end, mut usable_bytes) = (0, 0, 0, 0u64);
+        let executable = read_boot_value(ptr::read_volatile(ptr::addr_of!(
+            (*EXECUTABLE.0.get()).response
+        )))?;
+        let (kernel_start, kernel_end) = kernel_virtual_range();
+        if executable.virtual_base != kernel_start as u64 {
+            return Err("unexpected executable virtual base");
+        }
+        let reservation =
+            Reservation::new(executable.physical_base, (kernel_end - kernel_start) as u64)?;
+        if COPIED.swap(true, Ordering::Relaxed) {
+            return Err("boot map initialized twice");
+        }
+        let destination = REGIONS.0.get().cast::<MemoryRegion>();
+        if (destination as usize) < kernel_start
+            || (destination as usize)
+                .checked_add(mem::size_of::<MemoryRegion>() * MAX_REGIONS)
+                .is_none_or(|end| end > kernel_end)
+        {
+            return Err("boot map storage is outside the reserved kernel image");
+        }
         for index in 0..count {
             let region = read_boot_value(ptr::read_volatile(map.entries.add(index)))?;
-            let end = region
-                .base
-                .checked_add(region.length)
-                .ok_or("memory-map range overflow")?;
-            if region.length == 0 || region.base < previous_base {
-                return Err("empty or unsorted memory-map region");
-            }
-            let reusable = region.kind == 0 || region.kind == 5;
-            if reusable && (region.base | region.length) & 4095 != 0 {
-                return Err("usable/reclaimable memory is not page aligned");
-            }
-            // Limine permits overlap between reserved/non-usable entries, but
-            // usable and bootloader-reclaimable regions cannot overlap any entry.
-            if region.base < reusable_end || (reusable && region.base < all_end) {
-                return Err("usable/reclaimable memory overlaps another region");
-            }
-            if reusable {
-                reusable_end = end;
-            }
-            if region.kind == 0 {
-                usable_bytes = usable_bytes
-                    .checked_add(region.length)
-                    .ok_or("usable RAM total overflow")?;
-            }
-            previous_base = region.base;
-            all_end = all_end.max(end);
+            ptr::write(destination.add(index), region);
         }
-        if usable_bytes == 0 {
-            return Err("no usable RAM reported");
+        // The fixed array is initialized, within the kernel reservation, and
+        // never mutated after publication. The constructor validates every copy.
+        let copied = core::slice::from_raw_parts(destination, count);
+        let memory_map = MemoryMap::new(copied, reservation)?;
+        // Audit preservation against the still-live loader data before retiring
+        // all raw descriptor pointers. Retaining boot memory makes this safe.
+        for (index, region) in copied.iter().enumerate() {
+            if *region != read_boot_value(ptr::read_volatile(map.entries.add(index)))? {
+                return Err("kernel-owned memory-map copy differs from loader data");
+            }
         }
-        // Only copy the validated summary. No boot memory, GDT, or page table is
-        // reclaimed, and no raw loader pointer escapes into generic kernel code.
         Ok(BootInfo {
             memory_regions: map.count,
-            usable_bytes,
+            usable_bytes: memory_map.usable_bytes(),
+            memory_map,
         })
     }
 }

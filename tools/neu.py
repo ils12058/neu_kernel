@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small stdlib-only build/run/boot-test runner for Neu Phase 0."""
+"""Small stdlib-only build/run/test runner for Neu bootstrap and Phase 1A."""
 
 import argparse
 import hashlib
@@ -21,7 +21,15 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
 TARGET = "x86_64-unknown-none"
-FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-memory-map"}
+FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-memory-map",
+            "memory": "test-memory", "invalid-opcode": "test-invalid-opcode",
+            "general-protection": "test-general-protection", "page-fault": "test-page-fault",
+            "double-fault": "test-double-fault", "breakpoint": "test-breakpoint"}
+
+
+def host_target():
+    details = subprocess.check_output([str(require("rustc")), "-vV"], text=True, cwd=ROOT)
+    return next(line.removeprefix("host: ") for line in details.splitlines() if line.startswith("host: "))
 
 
 class Failure(Exception):
@@ -114,12 +122,15 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top"):
+            if label.startswith("neu_test_") or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+                    "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE"):
                 symbols[label] = value
     if symbols.get("__stack_top", 0) - symbols.get("__stack_bottom", 0) != 65536:
         raise Failure("Kernel ELF is missing its 64 KiB stack.")
     if not symbols.get("neu_halt_begin", 0) < symbols.get("neu_halt_end", 0):
         raise Failure("Kernel ELF is missing halt-loop symbols.")
+    if symbols.get("__df_stack_top", 0) - symbols.get("__df_stack_bottom", 0) != 32768:
+        raise Failure("Kernel ELF is missing its 32 KiB double-fault stack.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -234,16 +245,51 @@ class QMP:
 
 
 COMMON = ["[NEU] Neu Kernel", "[NEU] Architecture: x86_64", "[NEU] Early serial initialized",
-          "[NEU] CPU and kernel stack validated"]
+          "[NEU] CPU and kernel stack validated", "[NEU] Kernel GDT/TSS/IDT initialized; double-fault IST ready"]
 PROTOCOL = ["[NEU] Boot protocol initialized: Limine base 6, UEFI64", "[NEU] Memory map validated:"]
+OWNED = ["[NEU] Boot memory map copied:", "[NEU] Physical frame allocator initialized:"]
 EXPECT = {
-    "boot": (COMMON + PROTOCOL + ["[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
-             ["[NEU] PANIC:", "[NEU] BOOT FAILURE:"]),
-    "panic": (COMMON + PROTOCOL + ["[NEU] PANIC:", "controlled Phase 0 test panic"],
-              ["[NEU] Kernel bootstrap successful", "[NEU] BOOT FAILURE:"]),
+    "boot": (COMMON + PROTOCOL + OWNED + ["[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+             ["[NEU] PANIC:", "[NEU] BOOT FAILURE:", "[NEU] EXCEPTION:"]),
+    "panic": (COMMON + PROTOCOL + OWNED + ["[NEU] PANIC:", "controlled Phase 0 test panic"],
+              ["[NEU] Kernel bootstrap successful", "[NEU] BOOT FAILURE:", "[NEU] EXCEPTION:"]),
     "missing-map": (COMMON + ["[NEU] BOOT FAILURE: required Limine memory-map response is missing"],
                     ["[NEU] Kernel bootstrap successful", "[NEU] Boot protocol initialized", "[NEU] PANIC:"]),
 }
+EXPECT["memory"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Memory self-test passed:",
+    "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+FAULTS = {"invalid-opcode": (6, 0, "neu_test_ud_site"), "general-protection": (13, 0x28, "neu_test_gp_site"),
+          "page-fault": (14, 3, "neu_test_pf_site"), "double-fault": (8, 0, None), "breakpoint": (3, 0, "neu_test_bp_resume")}
+for name, (vector, _, _) in FAULTS.items():
+    trigger = ["[NEU] Test: read-only mapping verified for #PF"] if name == "page-fault" else (
+        ["[NEU] Test: forcing #DF via #GP delivery failure"] if name == "double-fault" else [])
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + trigger + [f"[NEU] EXCEPTION: vector={vector} ",
+        "[NEU] EXCEPTION: fatal privileged fault; halting"], ["[NEU] Kernel bootstrap successful",
+        "[NEU] PANIC:", "[NEU] BOOT FAILURE:", "nested fatal fault"])
+
+
+def check_fault(case, text, symbols):
+    if case not in FAULTS:
+        return None
+    match = re.search(r"EXCEPTION: vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+)", text)
+    context = re.search(r"EXCEPTION: CS=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+) IST=(\d+)", text)
+    if not match or not context:
+        raise Failure("Missing complete exception frame diagnostics.")
+    vector, error, rip, cr2 = [int(value, 0) for value in match.groups()]
+    cs, flags, original_rsp, handler_rsp, ist = [int(value, 0) for value in context.groups()]
+    expected_vector, expected_error, site = FAULTS[case]
+    if vector != expected_vector or error != expected_error or cs != 8 or flags & 512:
+        raise Failure("Exception vector, hardware error code, CS, or saved IF does not match the test.")
+    if site and rip != symbols[site]:
+        raise Failure("Saved exception RIP does not match the intended fault/trap instruction.")
+    if case == "page-fault" and cr2 != symbols["NEU_PF_PROBE"]:
+        raise Failure("Page-fault CR2 does not match the verified read-only target.")
+    expected_ist = int(case == "double-fault")
+    bottom, top = ("__df_stack_bottom", "__df_stack_top") if expected_ist else ("__stack_bottom", "__stack_top")
+    if ist != expected_ist or not symbols[bottom] <= handler_rsp < symbols[top]:
+        raise Failure("Exception handler is not executing on its expected normal/IST stack.")
+    return {"vector": vector, "error": error, "rip": rip, "cr2": cr2, "original_rsp": original_rsp,
+            "handler_rsp": handler_rsp, "ist": ist}
 
 
 def transcript(path):
@@ -312,10 +358,11 @@ def run_case(case, esp, timeout):
                     cursor = position + len(marker)
                 if any(marker in text for marker in forbidden):
                     raise Failure(f"Unexpected panic/failure/success marker in {case} transcript.")
+                fault = check_fault(case, text, symbols)
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(passed=True, halt_observations=[first, second])
+                result.update(passed=True, halt_observations=[first, second], exception=fault)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -339,7 +386,7 @@ def run_case(case, esp, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("build", "run", "test", "doctor"))
+    parser.add_argument("action", choices=("build", "run", "test", "doctor", "check"))
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--case", choices=FEATURES, help="Run only one smoke scenario (default: all).")
     args = parser.parse_args()
@@ -355,6 +402,14 @@ def main():
         command([require("rustup"), "target", "list", "--installed"])
     elif args.action == "build":
         build()
+    elif args.action == "check":
+        command([require("cargo"), "fmt", "--all", "--", "--check"])
+        for feature in FEATURES.values():
+            arguments = [require("cargo"), "clippy", "--locked", "--target", TARGET]
+            if feature:
+                arguments += ["--features", feature]
+            command(arguments + ["--", "-D", "warnings"])
+        command([require("cargo"), "clippy", "--locked", "--lib", "--target", host_target(), "--", "-D", "warnings"])
     elif args.action == "run":
         esp = build()
         with tempfile.TemporaryDirectory(prefix="neu-", dir="/tmp") as directory:
@@ -368,6 +423,10 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
+            if not args.case or args.case == "memory":
+                target = host_target()
+                command([require("cargo"), "test", "--locked", "--lib", "--target", target])
+                report["host_tests"] = {"passed": True, "target": target}
             for case in ([args.case] if args.case else FEATURES):
                 report["results"].append(run_case(case, build(case), args.timeout))
             report["passed"] = True

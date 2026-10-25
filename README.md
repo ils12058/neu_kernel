@@ -5,11 +5,16 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-Phase 0 has a bootable, freestanding Rust x86-64 kernel, loaded by Limine 12.9.4
-under QEMU + UEFI/OVMF. Serial diagnostics, boot-information validation, a bounded
-panic handler, and controlled halt behavior are implemented. Normal boot,
-intentional panic, and missing-boot-information smoke tests passed on the
-documented 1-vCPU, 512 MiB TCG configuration on Apple Silicon.
+K1 / Phase 1A extends the bootable Rust x86-64 foundation with a kernel-owned
+memory map, bounded 4 KiB physical-frame allocator, and private GDT/TSS/IDT with a
+double-fault IST stack. Frame allocation tracks ownership only; it does not map
+or initialize frame contents. Limine 12.9.4 and protocol base revision 6 remain
+pinned under QEMU + UEFI/OVMF.
+
+Seven host memory tests and nine QEMU smoke scenarios cover the original Phase 0
+behavior, allocation, and controlled exceptions on the documented 1-vCPU,
+512 MiB TCG configuration on Apple Silicon. Bootloader-reclaimable RAM remains
+reserved. Page-table ownership and controlled mappings belong to Phase 1B.
 
 Nodes, userspace, capabilities, scheduling, and the other architecture dossiers
 remain future work. The architecture document describes design directions and
@@ -34,7 +39,9 @@ The first build downloads the pinned Limine binary and checks its SHA-256. The
 boot artifact is `build/boot/esp/`; QEMU serves a private copy as a read-only FAT
 disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
-QEMU. `make test` observes the halt through QMP, then shuts QEMU down itself.
+QEMU. `make test` runs host memory tests, observes each guest's expected result
+and halt through QMP, then shuts QEMU down itself. See the implementation status
+for individual memory and exception test commands.
 
 ## Documentation
 

@@ -13,6 +13,7 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+    __kernel_start = .;
     .limine_requests : ALIGN(8)
     {
         KEEP(*(.limine_requests_start))
@@ -35,6 +36,12 @@ SECTIONS
         __stack_bottom = .;
         . += 64K;
         __stack_top = .;
+        . = ALIGN(16);
+        __df_stack_bottom = .;
+        . += 32K;
+        __df_stack_top = .;
+        . = ALIGN(4096);
+        __kernel_end = .;
     } :data
 
     /DISCARD/ : { *(.eh_frame*) *(.note .note.*) }

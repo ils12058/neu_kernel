@@ -5,7 +5,8 @@ _start:
     cli
     cld
     # Limine has mapped the ELF's writable, zero-filled stack segment.
-    # Switch before Rust runs; retain the loader's page tables and GDT.
+    # Switch before Rust runs; retain the loader's page tables. Rust installs
+    # private CPU descriptor tables before continuing bootstrap.
     lea rsp, [rip + __stack_top]
     and rsp, -16
     xor ebp, ebp
