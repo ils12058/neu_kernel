@@ -3,6 +3,7 @@
 use core::arch::{asm, global_asm, x86_64::__cpuid};
 
 pub mod exceptions;
+pub mod paging;
 pub mod serial;
 
 global_asm!(include_str!("entry.S"));

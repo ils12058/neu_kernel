@@ -2,8 +2,9 @@
 
 - **Date:** 2026-10-25
 - **Status:** Accepted — K1 / Phase 1A only.
-- **Supersedes:** [ADR 0004](0004-limine-phase-0-integration.md), the Phase 0
-  integration contract. Its loader pin and rationale are retained here.
+- **Extends/amends:** [ADR 0004](0004-limine-phase-0-integration.md), whose Limine
+  selection and pin remain Accepted. The Phase 1A ownership policy is extended by
+  [ADR 0007](0007-kernel-owned-paging-and-controlled-mappings.md) for paging.
 - **Related NEU decisions:** `NEU-004` (boot integration), `NEU-018 / MEM`
   (initial PMM only), `NEU-025 / BOOT` (full first-Node plan remains open).
 - **Architecture:** [Section 15](../Neu_Kernel_Architecture_v0.2.md#15-detailed-physical-and-virtual-memory--neu-mem-001)
@@ -92,3 +93,7 @@ install a general physical-memory access mechanism.
   Supersedes the Phase 0 contract in ADR 0004 with the extensions above; preserves
   its original rationale and loader choice. Validation and implementation limits
   are recorded in [implementation status](../IMPLEMENTATION_STATUS.md).
+- **2026-10-25, Phase 1B relationship correction:** Reclassified as an amendment
+  to ADR 0004, rather than wholesale supersession. The earlier history above is
+  preserved. Frame ownership and conservative reservation remain applicable;
+  ADR 0007 adds an explicit access/initialization and page-table ownership layer.

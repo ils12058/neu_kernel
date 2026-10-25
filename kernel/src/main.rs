@@ -12,7 +12,16 @@ const _: () = assert!(
         + cfg!(feature = "test-general-protection") as u8
         + cfg!(feature = "test-page-fault") as u8
         + cfg!(feature = "test-double-fault") as u8
-        + cfg!(feature = "test-breakpoint") as u8)
+        + cfg!(feature = "test-breakpoint") as u8
+        + cfg!(feature = "test-paging") as u8
+        + cfg!(feature = "test-paging-bootstrap-failure") as u8
+        + cfg!(feature = "test-unmapped") as u8
+        + cfg!(feature = "test-readonly") as u8
+        + cfg!(feature = "test-nx") as u8
+        + cfg!(feature = "test-guard-low") as u8
+        + cfg!(feature = "test-guard-high") as u8
+        + cfg!(feature = "test-df-guard-low") as u8
+        + cfg!(feature = "test-df-guard-high") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -117,8 +126,53 @@ extern "C" fn neu_main() -> ! {
             "[NEU] Memory self-test passed: ownership, unique allocation, reuse, invalid frees, sparse exhaustion, accounting\n"
         );
     }
-    // Keep the real allocator exclusively owned and alive through bootstrap.
-    let _ = &mut allocator;
+    let hhdm = info.hhdm_offset;
+    if cfg!(feature = "test-paging-bootstrap-failure") {
+        let before = allocator.stats();
+        let old_root = arch::paging::current_root();
+        {
+            let attempt = arch::paging::Paging::initialize(&mut allocator, &info.memory_map, hhdm);
+            if !matches!(attempt, Err(neu_kernel::paging::Error::Exhausted)) {
+                fail("bootstrap allocation failure was not observed");
+            }
+        }
+        if allocator.stats() != before || arch::paging::current_root() != old_root {
+            fail("bootstrap rollback changed the active root or accounting");
+        }
+        log!(
+            "[NEU] Paging bootstrap rollback verified: CR3={:#x} accounting restored\n",
+            old_root
+        );
+        arch::halt();
+    }
+    let mut paging = match arch::paging::Paging::initialize(&mut allocator, &info.memory_map, hhdm)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            arch::serial::emergency(format_args!(
+                "[NEU] BOOT FAILURE: paging initialization {error:?}\n"
+            ));
+            arch::halt();
+        }
+    };
+    log!(
+        "[NEU] Kernel paging activated: CR3={:#x} old={:#x} tables={}\n",
+        paging.root(),
+        paging.old_root(),
+        paging.table_count()
+    );
+    log!("[NEU] Kernel mappings verified: RX text, R rodata, RW/NX data, 4 guards\n");
+    if cfg!(feature = "test-paging") {
+        if let Err(error) = paging.self_test() {
+            arch::serial::emergency(format_args!(
+                "[NEU] BOOT FAILURE: paging self-test {error:?}\n"
+            ));
+            arch::halt();
+        }
+        log!(
+            "[NEU] Paging self-test passed: aliases, mapping, zero/reuse, rollback, TLB, accounting\n"
+        );
+    }
 
     if cfg!(feature = "test-panic") {
         panic!("controlled Phase 0 test panic");
@@ -137,13 +191,40 @@ extern "C" fn neu_main() -> ! {
         arch::exceptions::test_double_fault();
     }
     #[cfg(feature = "test-page-fault")]
-    {
-        let hhdm = match boot::test_hhdm_offset() {
-            Ok(value) => value,
-            Err(reason) => fail(reason),
-        };
-        if let Err(reason) = arch::exceptions::test_page_fault(&info.memory_map, hhdm) {
-            fail(reason);
+    if cfg!(feature = "test-page-fault") {
+        match paging.translate(arch::exceptions::page_fault_target()) {
+            Ok(Some(mapping)) if !mapping.permissions.write && !mapping.user => {
+                arch::exceptions::test_page_fault()
+            }
+            _ => fail("PF test target is not verified read-only"),
+        }
+    }
+    for (enabled, kind) in [
+        (cfg!(feature = "test-unmapped"), 0),
+        (cfg!(feature = "test-readonly"), 1),
+        (cfg!(feature = "test-nx"), 2),
+        (cfg!(feature = "test-guard-low"), 3),
+        (cfg!(feature = "test-guard-high"), 4),
+        (cfg!(feature = "test-df-guard-low"), 5),
+        (cfg!(feature = "test-df-guard-high"), 6),
+    ] {
+        if enabled {
+            let address = match paging.prepare_fault(kind) {
+                Ok(address) => address,
+                Err(error) => {
+                    arch::serial::emergency(format_args!(
+                        "[NEU] BOOT FAILURE: fault setup {error:?}\n"
+                    ));
+                    arch::halt();
+                }
+            };
+            log!(
+                "[NEU] Paging fault prepared: kind={} address={:#x}\n",
+                kind,
+                address
+            );
+            arch::exceptions::test_paging_access(kind, address);
+            fail("injected paging access unexpectedly succeeded");
         }
     }
 

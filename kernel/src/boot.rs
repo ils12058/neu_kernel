@@ -1,7 +1,8 @@
 //! Minimal Limine base-revision-6 adapter; no third-party Rust dependencies.
 //! Layouts/IDs: limine-protocol commit 3a0526b700e356f0eac1b71a77697b3fd1c707a3,
 //! include/limine.h and PROTOCOL.md. Phase 1A additionally requests the actual
-//! executable address for reservations; HHDM is requested only by the #PF test.
+//! executable address for reservations; Phase 1B copies HHDM metadata for
+//! temporary bootstrap access before the owned-root transition.
 
 use core::{
     cell::UnsafeCell,
@@ -59,7 +60,6 @@ struct ExecutableAddress {
     virtual_base: u64,
 }
 
-#[cfg(feature = "test-page-fault")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct HhdmResponse {
@@ -127,7 +127,6 @@ static EXECUTABLE: LoaderCell<Request<ExecutableAddress>> =
         0xb264_4a48_c516_a487,
     ])));
 
-#[cfg(feature = "test-page-fault")]
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static HHDM: LoaderCell<Request<HhdmResponse>> = LoaderCell(UnsafeCell::new(Request::new([
@@ -156,10 +155,10 @@ pub struct BootInfo {
     pub memory_regions: u64,
     pub usable_bytes: u64,
     pub memory_map: MemoryMap<'static>,
+    pub hhdm_offset: u64,
 }
 
-#[cfg(feature = "test-page-fault")]
-pub fn test_hhdm_offset() -> Result<u64, &'static str> {
+fn hhdm_offset() -> Result<u64, &'static str> {
     // SAFETY: Called after successful base negotiation; the response follows
     // the same trusted immutable loader mapping contract as other responses.
     let response =
@@ -183,6 +182,11 @@ unsafe fn read_boot_value<T: Copy>(address: *const T) -> Result<T, &'static str>
 }
 
 pub fn initialize() -> Result<BootInfo, &'static str> {
+    // A completed adapter must never re-read loader response pointers after
+    // their HHDM mappings have been removed from the active address space.
+    if COPIED.load(Ordering::Relaxed) {
+        return Err("boot adapter already initialized");
+    }
     // SAFETY: The request cells are mapped in the ELF and loading has finished.
     // Validate base semantics before interpreting any response pointer.
     unsafe {
@@ -249,6 +253,7 @@ pub fn initialize() -> Result<BootInfo, &'static str> {
             memory_regions: map.count,
             usable_bytes: memory_map.usable_bytes(),
             memory_map,
+            hhdm_offset: hhdm_offset()?,
         })
     }
 }

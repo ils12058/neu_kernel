@@ -51,7 +51,7 @@ to evidence when available. Acceptance does not assert Phase 0 completion.
 | [0001: Kernel-only project scope](0001-kernel-only-project-scope.md) | Accepted | NEU-001; NEU-016 boundary |
 | [0002: Rust and x86-64 foundation](0002-rust-and-x86-64-foundation.md) | Accepted | NEU-002 language; NEU-003 |
 | [0003: External bootloader boundary](0003-external-bootloader-boundary.md) | Accepted | NEU-004 external-loader direction |
-| [0004: Limine integration for Phase 0](0004-limine-phase-0-integration.md) | Superseded by 0005 | NEU-004 Limine details; NEU-025 / BOOT remains open |
+| [0004: Limine integration for Phase 0](0004-limine-phase-0-integration.md) | Accepted; amended by 0005/0007 | NEU-004 Limine details; NEU-025 / BOOT remains open |
 
 The external-loader direction and the Limine integration contract have separate
 records so their scope, status, and future replacements can evolve independently.
@@ -63,6 +63,17 @@ records so their scope, status, and future replacements can evolve independently
 | [0005: Boot ownership and physical frames](0005-boot-memory-ownership-and-frame-allocation.md) | Accepted | NEU-004; NEU-018 PMM only; NEU-025 remains open |
 | [0006: Private descriptors and fatal exceptions](0006-kernel-exception-descriptors-and-fatal-handling.md) | Accepted | NEU-003; NEU-023 privileged faults; NEU-024 local tests only |
 
-ADR 0005 explicitly succeeds the Phase 0 boot contract; loader version/base
-revision remain unchanged. No acceptance of future VMM, Node, or CI proposals is
-implied by these scoped records.
+ADR 0005 extends the Phase 0 boot contract; loader version/base revision remain
+unchanged. A dated Phase 1B correction preserves the earlier supersession notation
+as history while keeping ADR 0004 Accepted. No future Node or CI proposal is
+accepted by these scoped records.
+
+## Phase 1B record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0007: Owned paging and controlled mappings](0007-kernel-owned-paging-and-controlled-mappings.md) | Accepted | NEU-004 bootstrap access; NEU-018 kernel paging only; NEU-023 guards; NEU-024 local tests |
+
+ADR 0007 amends the paging/access portions of 0005 and the guard/#PF inspection
+assumptions of 0006. Nodes, general userspace VMM, and bootloader reclamation remain
+outside these accepted implementation contracts.

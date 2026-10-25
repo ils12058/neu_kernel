@@ -8,6 +8,10 @@
   and [Section 25](../Neu_Kernel_Architecture_v0.2.md#25-decision-register-seed-for-adrs).
 - **Related ADR:** [0005: current boot and memory contract](0005-boot-memory-ownership-and-frame-allocation.md).
 
+The Phase 1A rationale below is preserved. [ADR 0007](0007-kernel-owned-paging-and-controlled-mappings.md)
+amends the paging/guard assumptions and moves current #PF inspection onto the
+owned hierarchy; the exception entry, private descriptors, and fatal policy remain.
+
 ## Context
 
 Phase 0 kept the loader GDT and had no kernel IDT or TSS. An exception could
@@ -85,6 +89,10 @@ halt. Unexpected reset, triple fault, shutdown, or emulator exit cannot pass.
   ADR 0005 replaces ADR 0004's loader-GDT retention with this private descriptor
   foundation while keeping all bootloader-reclaimable RAM reserved. Results are
   recorded in [implementation status](../IMPLEMENTATION_STATUS.md).
+- **2026-10-25, Phase 1B:** The ADR 0004/0005 relationship is clarified as an
+  amendment, retaining their historical reasoning. ADR 0007 supplies guarded
+  stack mappings and a kernel-owned root. The #PF test now validates that active
+  hierarchy rather than dereferencing the retired loader HHDM after switching.
 
 Reference: [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html),
 Volume 3A, interrupt/exception handling, error codes, TSS and Interrupt Stack Table.

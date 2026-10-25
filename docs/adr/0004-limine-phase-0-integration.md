@@ -1,7 +1,9 @@
 # ADR 0004: Integrate Limine for Phase 0
 
 - **Date:** 2026-10-25
-- **Status:** Superseded — by [ADR 0005](0005-boot-memory-ownership-and-frame-allocation.md) for Phase 1A.
+- **Status:** Accepted — original Limine integration, amended by
+  [ADR 0005](0005-boot-memory-ownership-and-frame-allocation.md) and
+  [ADR 0007](0007-kernel-owned-paging-and-controlled-mappings.md).
 - **Related NEU decisions:** `NEU-004` (the proposed Limine portion);
   `NEU-025 / BOOT` (the open integration plan; not resolved by this record).
 - **Architecture:** [Section 4.4: preferred loader and adapter](../Neu_Kernel_Architecture_v0.2.md#44-bootloader-boundary),
@@ -119,3 +121,8 @@ status. Later integration and subsystem proposals are not accepted by reference.
   and base revision 6, adds explicit physical-image reservation and owned memory
   descriptors, and adopts private CPU descriptors through ADR 0006. The original
   proposal and Phase 0 resolution above remain unchanged historical rationale.
+- **2026-10-25, Phase 1B relationship correction:** Restored Accepted status.
+  ADR 0005 extends/amends this decision; it does not replace the still-applicable
+  Limine selection, version, or protocol. The earlier supersession notation is
+  retained above as history. Phase 0's staged descriptor/page-table retention is
+  amended by ADRs 0006 and 0007, with all loader-reclaimable RAM still reserved.

@@ -124,3 +124,32 @@ neu_test_pf:
 neu_test_pf_site:
     mov byte ptr [rdi], 0
     jmp neu_halt_begin
+
+.section .text.test_unmapped,"ax"
+.global neu_test_unmapped, neu_test_unmapped_site
+neu_test_unmapped:
+neu_test_unmapped_site:
+    mov rax, [rdi]
+    ret
+
+.section .text.test_readonly,"ax"
+.global neu_test_readonly, neu_test_readonly_site
+neu_test_readonly:
+neu_test_readonly_site:
+    mov byte ptr [rdi], 0
+    ret
+
+.section .text.test_nx,"ax"
+.global neu_test_nx
+neu_test_nx:
+    sub rsp, 8
+    call rdi
+    add rsp, 8
+    ret
+
+.section .text.test_guard,"ax"
+.global neu_test_guard, neu_test_guard_site
+neu_test_guard:
+neu_test_guard_site:
+    mov rax, [rdi]
+    ret

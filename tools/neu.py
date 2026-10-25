@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small stdlib-only build/run/test runner for Neu bootstrap and Phase 1A."""
+"""Small stdlib-only build/run/test runner for Neu bootstrap and owned paging."""
 
 import argparse
 import hashlib
@@ -24,7 +24,12 @@ TARGET = "x86_64-unknown-none"
 FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-memory-map",
             "memory": "test-memory", "invalid-opcode": "test-invalid-opcode",
             "general-protection": "test-general-protection", "page-fault": "test-page-fault",
-            "double-fault": "test-double-fault", "breakpoint": "test-breakpoint"}
+            "double-fault": "test-double-fault", "breakpoint": "test-breakpoint",
+            "paging": "test-paging", "unmapped": "test-unmapped", "readonly": "test-readonly", "nx": "test-nx",
+            "paging-bootstrap-failure": "test-paging-bootstrap-failure",
+            "guard-low": "test-guard-low", "guard-high": "test-guard-high",
+            "df-guard-low": "test-df-guard-low", "df-guard-high": "test-df-guard-high"}
+TEST_ADDRESS = 0xffffa00000000000
 
 
 def host_target():
@@ -123,7 +128,8 @@ def elf_info(path):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
             if label.startswith("neu_test_") or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
-                    "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE"):
+                    "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
+                    "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
     if symbols.get("__stack_top", 0) - symbols.get("__stack_bottom", 0) != 65536:
         raise Failure("Kernel ELF is missing its 64 KiB stack.")
@@ -131,6 +137,9 @@ def elf_info(path):
         raise Failure("Kernel ELF is missing halt-loop symbols.")
     if symbols.get("__df_stack_top", 0) - symbols.get("__df_stack_bottom", 0) != 32768:
         raise Failure("Kernel ELF is missing its 32 KiB double-fault stack.")
+    for name in ("__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
+        if not symbols.get(name) or symbols[name] & 4095:
+            raise Failure("Kernel ELF is missing a page-aligned stack guard.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -248,22 +257,35 @@ COMMON = ["[NEU] Neu Kernel", "[NEU] Architecture: x86_64", "[NEU] Early serial 
           "[NEU] CPU and kernel stack validated", "[NEU] Kernel GDT/TSS/IDT initialized; double-fault IST ready"]
 PROTOCOL = ["[NEU] Boot protocol initialized: Limine base 6, UEFI64", "[NEU] Memory map validated:"]
 OWNED = ["[NEU] Boot memory map copied:", "[NEU] Physical frame allocator initialized:"]
+PAGING = ["[NEU] Kernel paging activated:", "[NEU] Kernel mappings verified: RX text, R rodata, RW/NX data, 4 guards"]
 EXPECT = {
-    "boot": (COMMON + PROTOCOL + OWNED + ["[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+    "boot": (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
              ["[NEU] PANIC:", "[NEU] BOOT FAILURE:", "[NEU] EXCEPTION:"]),
-    "panic": (COMMON + PROTOCOL + OWNED + ["[NEU] PANIC:", "controlled Phase 0 test panic"],
+    "panic": (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] PANIC:", "controlled Phase 0 test panic"],
               ["[NEU] Kernel bootstrap successful", "[NEU] BOOT FAILURE:", "[NEU] EXCEPTION:"]),
     "missing-map": (COMMON + ["[NEU] BOOT FAILURE: required Limine memory-map response is missing"],
                     ["[NEU] Kernel bootstrap successful", "[NEU] Boot protocol initialized", "[NEU] PANIC:"]),
 }
 EXPECT["memory"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Memory self-test passed:",
+    *PAGING, "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+EXPECT["paging"] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Paging self-test passed:",
     "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+EXPECT["paging-bootstrap-failure"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Paging bootstrap rollback verified:"],
+    ["[NEU] Kernel paging activated:", "[NEU] Kernel bootstrap successful", "[NEU] BOOT FAILURE:", "[NEU] PANIC:", "[NEU] EXCEPTION:"])
 FAULTS = {"invalid-opcode": (6, 0, "neu_test_ud_site"), "general-protection": (13, 0x28, "neu_test_gp_site"),
-          "page-fault": (14, 3, "neu_test_pf_site"), "double-fault": (8, 0, None), "breakpoint": (3, 0, "neu_test_bp_resume")}
+          "page-fault": (14, 3, "neu_test_pf_site"), "double-fault": (8, 0, None), "breakpoint": (3, 0, "neu_test_bp_resume"),
+          "unmapped": (14, 0, "neu_test_unmapped_site"), "readonly": (14, 3, "neu_test_readonly_site"), "nx": (14, 17, TEST_ADDRESS),
+          "guard-low": (14, 0, "neu_test_guard_site"), "guard-high": (14, 0, "neu_test_guard_site"),
+          "df-guard-low": (14, 0, "neu_test_guard_site"), "df-guard-high": (14, 0, "neu_test_guard_site")}
+PAGING_FAULTS = {"unmapped": (0, TEST_ADDRESS), "readonly": (1, TEST_ADDRESS), "nx": (2, TEST_ADDRESS),
+    "guard-low": (3, "__stack_guard_low"), "guard-high": (4, "__stack_guard_high"),
+    "df-guard-low": (5, "__df_guard_low"), "df-guard-high": (6, "__df_guard_high")}
 for name, (vector, _, _) in FAULTS.items():
     trigger = ["[NEU] Test: read-only mapping verified for #PF"] if name == "page-fault" else (
         ["[NEU] Test: forcing #DF via #GP delivery failure"] if name == "double-fault" else [])
-    EXPECT[name] = (COMMON + PROTOCOL + OWNED + trigger + [f"[NEU] EXCEPTION: vector={vector} ",
+    if name in PAGING_FAULTS:
+        trigger = [f"[NEU] Paging fault prepared: kind={PAGING_FAULTS[name][0]} "]
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + trigger + [f"[NEU] EXCEPTION: vector={vector} ",
         "[NEU] EXCEPTION: fatal privileged fault; halting"], ["[NEU] Kernel bootstrap successful",
         "[NEU] PANIC:", "[NEU] BOOT FAILURE:", "nested fatal fault"])
 
@@ -280,10 +302,15 @@ def check_fault(case, text, symbols):
     expected_vector, expected_error, site = FAULTS[case]
     if vector != expected_vector or error != expected_error or cs != 8 or flags & 512:
         raise Failure("Exception vector, hardware error code, CS, or saved IF does not match the test.")
-    if site and rip != symbols[site]:
+    if site and rip != (site if isinstance(site, int) else symbols[site]):
         raise Failure("Saved exception RIP does not match the intended fault/trap instruction.")
     if case == "page-fault" and cr2 != symbols["NEU_PF_PROBE"]:
         raise Failure("Page-fault CR2 does not match the verified read-only target.")
+    if case in PAGING_FAULTS:
+        kind, target = PAGING_FAULTS[case]
+        target = symbols[target] if isinstance(target, str) else target
+        if cr2 != target or f"Paging fault prepared: kind={kind} address={target:#x}" not in text:
+            raise Failure("Paging fault CR2 or verified setup does not match the intended target.")
     expected_ist = int(case == "double-fault")
     bottom, top = ("__df_stack_bottom", "__df_stack_top") if expected_ist else ("__stack_bottom", "__stack_top")
     if ist != expected_ist or not symbols[bottom] <= handler_rsp < symbols[top]:
@@ -296,7 +323,7 @@ def transcript(path):
     return path.read_text(errors="replace") if path.exists() else ""
 
 
-def check_halt(qmp, symbols):
+def check_halt(qmp, symbols, expected_root=None):
     if qmp.call("query-status")["status"] != "running":
         raise Failure("VM reset, shut down, or stopped before the controlled halt.")
     registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
@@ -306,6 +333,10 @@ def check_halt(qmp, symbols):
         raise Failure("CPU is not halted at Ring 0 (QMP register inspection):\n" + registers)
     if not symbols["neu_halt_begin"] <= int(rip[1], 16) < symbols["neu_halt_end"] or int(flags[1], 16) & (1 << 9):
         raise Failure("CPU is outside Neu's halt loop or interrupts are enabled.")
+    if expected_root is not None:
+        cr3 = re.search(r"\bCR3=([0-9a-fA-F]+)", registers)
+        if not cr3 or int(cr3[1], 16) != expected_root:
+            raise Failure("QMP CR3 does not match the activated owned root.")
     return registers
 
 
@@ -337,18 +368,29 @@ def run_case(case, esp, timeout):
                     time.sleep(0.05)
                 qmp = QMP(endpoint, started + timeout)
                 symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
+                paging = None
+                if case == "paging-bootstrap-failure":
+                    match = re.search(r"Paging bootstrap rollback verified: CR3=(0x[0-9a-f]+) accounting restored", transcript(serial))
+                    if not match:
+                        raise Failure("Missing loader-root rollback proof.")
+                    paging = {"root": int(match[1], 16), "mode": "loader root retained after rollback"}
+                elif case != "missing-map":
+                    match = re.search(r"Kernel paging activated: CR3=(0x[0-9a-f]+) old=(0x[0-9a-f]+) tables=(\d+)", transcript(serial))
+                    if not match or int(match[1], 16) == int(match[2], 16) or int(match[3]) < 4:
+                        raise Failure("Missing a distinct, owned CR3 transition.")
+                    paging = {"root": int(match[1], 16), "loader_root": int(match[2], 16), "tables": int(match[3])}
                 # UART output precedes HLT. Allow only the remaining test budget
                 # for the CPU to arrive at the halt loop, then verify it twice.
                 while True:
                     try:
-                        first = check_halt(qmp, symbols)
+                        first = check_halt(qmp, symbols, paging["root"] if paging else None)
                         break
                     except Failure:
                         if time.monotonic() - started >= timeout:
                             raise
                         time.sleep(0.05)
                 time.sleep(0.1)
-                second = check_halt(qmp, symbols)
+                second = check_halt(qmp, symbols, paging["root"] if paging else None)
                 text = transcript(serial)
                 cursor = 0
                 for marker in required:
@@ -362,7 +404,7 @@ def run_case(case, esp, timeout):
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(passed=True, halt_observations=[first, second], exception=fault)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -423,7 +465,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case == "memory":
+            if not args.case or args.case in ("memory", "paging"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}

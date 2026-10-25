@@ -1,38 +1,59 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-25. **Milestone:** K1 / Phase 1A, memory ownership, physical
-frames, and exception foundation. **Result:** complete against the supplied
-Phase 1A acceptance criteria on the documented QEMU environment. Phase 0's three
-smoke cases remain passing. This does not complete K1's later VMM work, the full
-boot-to-first-Node integration plan, or physical hardware validation.
+**Verified:** 2026-10-25. **Milestone:** K1 / Phase 1B, kernel-owned paging and
+controlled virtual memory. **Result:** complete against the supplied Phase 1B
+acceptance criteria in the documented QEMU environment. The original seven host
+tests and nine QEMU scenarios remain passing. This does not establish physical
+hardware, SMP, userspace, or full boot-to-first-Node readiness.
 
 The inspected starting tree was clean on `main` at
-[`3549b56`](https://github.com/ils12058/neu_kernel/commit/3549b56931c6becd8e6e4b3a04bf927984018ffb).
-That commit retains the historical Phase 0 implementation/status. Baseline tests
-were rerun successfully before Phase 1A changes.
+[`34ae7d6`](https://github.com/ils12058/neu_kernel/commit/34ae7d6bb66182105197269efe52ca39c15b53c3),
+the pushed Phase 1A milestone. Its status and test evidence remain historical at
+that commit. The baseline tests were rerun before implementation. Architecture
+v0.2, the Rust target/toolchain, and the selected loader version are unchanged.
 
 ## Implemented foundation
 
 | Area | Current implementation |
 | --- | --- |
-| Rust project | One dependency-free Cargo package with a freestanding binary and architecture-neutral `no_std` memory library for host tests. Abort-style kernel panic behavior. |
-| Executable | Static ELF64/x86-64 at `0xffffffff80000000`, separate RW requests, RX text, R data, RW data/stack LOAD segments. |
-| Entry | Small x86-64 assembly entry, IF/DF cleared, switch to a 16-byte-aligned 64 KiB kernel-owned stack before calling Rust. Never returns to the loader. |
-| CPU checks | NX support, CR0 protection/paging/write-protect, CR3 presence, CR4 PAE with LA57 disabled, EFER long mode/NX, IF/DF clear, current stack within kernel bounds. |
-| Boot adapter | Limine base revision 6; revision-0 firmware-type, memory-map, and executable-address requests. HHDM is requested only by the page-fault test. |
-| Memory ownership | Full descriptor copy in fixed kernel storage, independent physical-image reservation, no bootloader-memory reclamation. |
-| Physical frames | 4 KiB frame ownership, bitmap over usable candidate ordinals, sparse physical ranges, explicit allocate/free/errors/accounting. No frame-content access. |
-| Exceptions | Private GDT/TSS/IDT, normalized assembly frames with all GPRs, static fault record, fatal diagnostics, dedicated 32 KiB #DF IST1 stack. |
-| Serial | COM1 at 115200, 8N1, loopback initialization check, bounded polling, no heap or logger locks. |
-| Panic/failure | Bounded emergency serial output followed by `cli`/`hlt`; recursive-panic guard; no unwinding, scheduler dependency, or interactive monitor. |
-| Host tooling | Python standard library plus Cargo/curl/QEMU; build/run/test/doctor through Make. SHA-256 checks for external loader artifacts. |
-| Tests | Seven host memory tests and nine QEMU cases: Phase 0 regressions, real-pool/synthetic allocation, #UD, #GP, #PF, genuine #DF, and #BP. CPU halt, expected fault context, and stack selection are checked. |
+| Rust project | One dependency-free Cargo package; freestanding binary and `no_std` memory/paging library with host tests; no heap or nightly features. |
+| Executable | Static ELF64/x86-64 at `0xffffffff80000000`; four page-aligned LOAD regions: RW requests, RX text, R/NX constants, RW/NX data/BSS/stacks. |
+| Entry and CPU | Assembly switches to the 64 KiB normal stack, clears IF/DF, and validates long mode, NX, CR0.WP, PAE and four-level paging. Paging activation also requires PGE/PCIDE disabled. |
+| Boot adapter | Limine base 6, revision-0 firmware/map/executable-address/HHDM requests; copied descriptors and HHDM scalar survive the CR3 switch without loader-response dereferences. |
+| Physical ownership | Validated kernel-owned map; independent physical-image reservation; bounded sparse 4 KiB frame allocator. All loader-reclaimable RAM remains reserved. |
+| Paging ownership | Fresh allocator-backed root and children; no copied loader parent pointers. Each table tracks physical owner, level, pinned state and hierarchy references. |
+| Transition | Construct and verify required mappings under the loader root, then activate a distinct root and verify again. Pre-switch failure rolls back allocations; post-switch failures use fatal diagnostics. |
+| Mapping and access | Internal 4 MiB test region; single/batch map, unmap, ownership references, generation identities, alias-aware W^X, scoped non-executable frame access and full-page zeroing. |
+| Stacks and exceptions | Private GDT/TSS/IDT, 32 KiB double-fault IST1 stack, one genuinely absent guard page below/above each stack; fatal normalized exception record and bounded output. |
+| Serial and panic | COM1 115200/8N1, bounded polling/output, no heap or locks; controlled `cli`/`hlt`, no unwinding or interactive monitor. |
+| Tooling | Python standard library, Cargo/curl/QEMU/Make, pinned external-loader checksums, QMP halt/CR3/context verification. |
+| Tests | 19 host tests (7 memory + 12 paging) and 18 QEMU scenarios (the prior 9 + 9 paging cases). |
 
-Architecture-specific mechanisms are under `kernel/src/arch/x86_64/`. The Limine
-adapter is `kernel/src/boot.rs`; generic bootstrap sequencing is in `main.rs`.
-`kernel/src/memory/` holds pure ownership bookkeeping and focused tests;
-`lib.rs` exposes it to host tests without compiling kernel entry code for macOS.
-No empty future-subsystem modules have been created.
+Pure page-table entry/walk/transaction logic and ownership policy live in
+`kernel/src/paging/`; physical pointers, scratch/table views, CPU operations and
+integration self-tests live in `kernel/src/arch/x86_64/paging.rs`. The existing
+`kernel/src/memory/` allocator still provides ownership only. The paging layer
+adds mapping and initialization, rather than treating allocated addresses as
+implicitly accessible. No empty future-subsystem modules have been created.
+
+Created files:
+
+- `kernel/src/paging/mod.rs` and `kernel/src/paging/tests.rs`: shared logic,
+  mapping/data-owner transactions, and host tests.
+- `kernel/src/arch/x86_64/paging.rs`: hardware access, table ownership, transition,
+  initialization, and guest self-tests.
+- `docs/adr/0007-kernel-owned-paging-and-controlled-mappings.md`: scoped decision.
+
+Modified files:
+
+- `kernel/src/boot.rs`, `kernel/src/main.rs`, `kernel/src/lib.rs`, and
+  `kernel/src/arch/x86_64/mod.rs`: bootstrap metadata, sequencing and module wiring.
+- `kernel/linker.ld`, `kernel/src/arch/x86_64/exceptions.rs`, and
+  `kernel/src/arch/x86_64/exceptions.S`: page bounds, guards and bounded probes.
+- `kernel/Cargo.toml` and `tools/neu.py`: isolated test features, ELF validation,
+  additional scenarios and QMP CR3/context checks.
+- `README.md`, this status, `docs/adr/README.md`, and ADRs 0004/0005/0006:
+  current behavior, evidence and dated relationship corrections.
 
 ## Tested environment and compatibility
 
@@ -52,7 +73,7 @@ During Phase 0 the named Rust toolchain initially lacked the freestanding target
 added using `rustup target add --toolchain 1.95.0 x86_64-unknown-none`. No Homebrew
 packages or system-wide firmware were installed for this milestone. Installed
 QEMU supplied compatible firmware. ISO utilities and mtools were absent and are
-not required by the selected boot workflow. Phase 1A adds no host packages,
+not required by the selected boot workflow. Phase 1B adds no host packages,
 nightly features, or third-party Rust dependencies.
 
 The firmware pair selected from the installed QEMU distribution was:
@@ -85,7 +106,8 @@ make run
 
 `make build` downloads the pinned official Limine archive on its first invocation,
 verifies its SHA-256 and the extracted `BOOTX64.EFI`, builds with Cargo `--locked`,
-and validates the kernel's ELF format, LOAD permissions, entry, and stack symbols.
+and validates the kernel's ELF format, LOAD permissions, entry, stack sizes,
+and page-aligned guard symbols.
 Subsequent builds use the checked project-local cache. The kernel has no crates.io
 dependencies. A first Rust toolchain/target installation and loader download need
 network access; the populated cache permits subsequent local builds.
@@ -131,179 +153,217 @@ make doctor
 make check
 make build
 make test
-```
-
-`make check` checks Rust formatting and runs Clippy with warnings denied for all
-nine kernel configurations and the host memory library. `make test` runs the host
-unit tests before all nine QEMU cases. Fault-injection features are mutually
-exclusive and off in ordinary builds.
-
-| Scenario | Actual result |
-| --- | --- |
-| Build | Passed: x86-64 ET_EXEC ELF, entry `0xffffffff80001000`, four LOAD segments with no writable/executable segment, 64 KiB normal stack and 32 KiB #DF stack. |
-| Fresh-directory build | Passed from a source copy with no loader cache or Cargo target directory: pinned download, checksum verification, compilation, and EFI artifact creation. |
-| Static checks | Passed: formatting and Clippy with warnings denied for all nine configurations and the host memory library. |
-| Normal boot | Passed: Limine handoff, serial banner, CPU/stack and memory-map validation, bootstrap-success and idle messages. |
-| `test-panic` | Passed: controlled panic after boot validation, bounded panic output, no bootstrap-success message. |
-| `test-missing-memory-map` | Passed: the test image omits the request from Limine's delimited request area; the null response is rejected and a boot failure is reported before dereference. |
-| Host ownership/allocator tests | Passed: seven tests cover exact descriptors, all non-usable types, malformed count/order/overflow/alignment/overlap, page zero/kernel exclusion, sparse high addresses, metadata capacity, 65-frame exhaustion across bitmap words, reuse/invalid/double frees, empty pools, and 5000 mixed operations against an independent reference set. |
-| QEMU memory self-test | Passed: 64 unique real frames allocated/freed with exact accounting restoration, reserved and retained-loader frees rejected, reuse/double/unaligned-free checks, sparse synthetic exhaustion, and malformed-descriptor rejection. |
-| #UD | Passed: hardware vector 6, normalized error 0, saved RIP at the `ud2` site, normal-stack fatal halt. |
-| #GP | Passed: hardware vector 13, error `0x28`, saved RIP at the invalid selector load, normal-stack fatal halt. |
-| #PF | Passed: actual tables inspected read-only through a test-only HHDM response; a present read-only static is written with WP enabled; vector 14/error 3, exact faulting RIP, CR2 equals the target static. |
-| #DF | Passed: a genuine #GP whose gate has an invalid selector causes #DF delivery, vector 8/error 0, handler RSP inside the dedicated IST1 stack. No software interrupt 8 is used. |
-| #BP | Passed: `int3` gives vector 3/error 0, saved RIP after the trap, normal-stack fatal halt. No resumption is attempted. |
-| Halt proof for all nine | Passed: QMP observes the VM still running with its CPU halted twice, CPL=0, IF=0, and RIP inside the ELF's `neu_halt_begin`/`neu_halt_end` range. QEMU exits with status 0 only after the host requests `quit`. Unexpected reset/shutdown/triple fault cannot pass. |
-
-The Phase 0 timeout-failure and interactive-run observations remain historical
-evidence at the baseline commit. Phase 1A retains the same deadline/cleanup and
-interactive-launch mechanisms; the current automated results are listed above.
-
-Observed normal kernel output, excluding firmware/loader console output:
-
-```text
-[NEU] Neu Kernel
-[NEU] Architecture: x86_64
-[NEU] Early serial initialized
-[NEU] CPU and kernel stack validated
-[NEU] Kernel GDT/TSS/IDT initialized; double-fault IST ready
-[NEU] Boot protocol initialized: Limine base 6, UEFI64
-[NEU] Memory map validated: 31 regions, 485859328 usable bytes
-[NEU] Boot memory map copied: 31 descriptors in kernel storage
-[NEU] Physical frame allocator initialized: 118617 free, 0 allocated; loader RAM retained
-[NEU] Kernel bootstrap successful
-[NEU] Idle: interrupts disabled; halting
-```
-
-Memory-map totals are observations for that launch, not a minimum RAM claim or
-an allocator capacity guarantee. `readelf -hW -lW` was also used to independently
-inspect the ELF. It is not a required build dependency.
-
-The default deadline is 30 seconds per guest, followed by bounded process cleanup.
-An absent expected result, early exit, shutdown/reset, incorrect halt location,
-unexpected success/failure marker, or QMP failure is a test failure. Serial text
-alone cannot pass. The tests exercise the normal halt mechanism rather than
-substituting an `isa-debug-exit` path. For slower hosts or a single scenario:
-
-```sh
-make test TEST_TIMEOUT=60
-python3 tools/neu.py test --case panic --timeout 30
-python3 tools/neu.py test --case memory
-python3 tools/neu.py test --case invalid-opcode
-python3 tools/neu.py test --case general-protection
-python3 tools/neu.py test --case page-fault
-python3 tools/neu.py test --case double-fault
-python3 tools/neu.py test --case breakpoint
 cargo test --locked --lib --target aarch64-apple-darwin
 ```
 
-Evidence is written to `build/test-results.json` and
-`build/test-logs/<case>.{serial.log,qemu.log,json}`. It includes
-kernel/firmware identity, actual QEMU arguments, CPU-register observations, and
-exit status, expected exception context, and handler stack identity. The host
-target is detected automatically; the explicit host command above is the one
-executed on this Mac. Build, cache, and runtime evidence are ignored by Git. These are
-local tests; no hosted CI or physical-machine tests have been run.
-`build/phase1a-repro-build.log` preserves the current fresh-directory build check
-with an empty loader cache and Cargo target directory. The original Phase 0
-`build/repro-build.log` and `build/timeout-check.json` are historical local evidence.
+The final full run used the first three commands above followed by
+`make test > build/phase1b-test-run.log 2>&1`. `make check` verifies formatting
+and Clippy with warnings denied for all 18 kernel configurations and the host
+library. `make test` runs all 19 host tests before all 18 QEMU cases. Test features
+are mutually exclusive and disabled in ordinary builds.
 
-## Memory ownership and allocator invariants
+| Verification | Actual result |
+| --- | --- |
+| Doctor | Passed: unchanged pinned Rust/target, installed QEMU and matching hashed firmware found. |
+| Static checks | Passed: formatting and Clippy, all 18 configurations and host library. |
+| Normal build | Passed: ET_EXEC x86-64 ELF, entry `0xffffffff80001000`, four LOAD segments, no writable/executable segment, 64 KiB/32 KiB stacks, four page-aligned guards. |
+| Clean-directory build | Passed from a source copy excluding `.git`, `.cache`, `target`, `build`, and Python caches: pinned download/checksums, compilation, ELF/guard validation and EFI artifact creation. |
+| Host memory | All 7 original tests pass, including sparse pools, malformed descriptors, exclusion/capacity, exhaustion/reuse/invalid frees and 5000 operations against an independent reference set. |
+| Host paging | All 12 tests pass: canonicality/indices/overflow; width/alignment/flags; boot large pages and effective permissions; conflicts/restricted parents; every child-allocation failure; side-effect-free rejection; detached-table flush/reuse and pinning; initialization/aliases/stale IDs/duplicate physical ownership; multi-page rollback across a PT boundary; metadata capacity. |
+| Normal boot | Pass: distinct owned CR3, complete image/workspace permission verification, continued serial output, bootstrap success and controlled halt. |
+| Existing panic/missing-map/memory cases | All pass. Panic runs after activation. Missing-map rejects the absent response before paging. Memory self-test still exercises real/synthetic frame accounting before activation. |
+| Existing #UD/#GP/#PF/#DF/#BP | All pass after activation, with the original exact vector/error/RIP/stack checks. The old #PF now inspects the owned active hierarchy before writing the read-only static. Genuine #DF still escalates failed #GP delivery onto IST1. |
+| `paging` | Pass: full-page dirty/free/reallocate/zero, stale-owner rejection, actual CPU writes/reads through aliases, single/batch mappings, invalid-request rejection, free-in-use rejection, W^X aliases, rollback and restored frame/table counts. |
+| `paging-bootstrap-failure` | Pass: injected exhaustion during root construction returns all new frames; unchanged loader CR3 and accounting, continued serial, controlled halt. |
+| New permission/guard faults | All seven pass with the exact vector, error, CR2, RIP, CS/flags and handler stack checks below. |
+| Halt proof | All 18 pass: two QMP observations of HLT at CPL=0/IF=0 inside the ELF halt loop, followed by host-requested `quit` and exit 0. The 16 activated images also compare actual CR3 to the distinct reported owned root; rollback verifies the retained old root. |
 
-- The adapter checks the negotiated base revision **before** response use,
-  requires UEFI64, and bounds entry counts at 4096. It checks higher-half pointer
-  shape/alignment/range arithmetic, sorted nonempty memory regions, overflow,
-  page alignment of usable/reclaimable RAM, and their non-overlap. Reserved
-  regions may overlap as permitted by the protocol. Unknown types are never
-  treated as allocatable.
-- Pointer shape checks cannot prove mapping validity. Mapped, initialized
-  response objects remain part of the trusted Limine contract. This is not a
-  fault-recovering parser for malicious loader pointers or userspace memory.
-- Every descriptor is copied exactly into a kernel-owned array (maximum 4096,
-  96 KiB). The copy is audited against still-live loader data before immutable
-  publication. Loader descriptor pointers do not escape the adapter.
-- The added Executable Address request supplies the authoritative physical base.
-  Its virtual base must match linker bounds. The complete physical image extent
-  independently reserves code/data, both stacks, map copy, bitmap, GDT/TSS/IDT,
-  and the static fault record. Uncertain ownership remains reserved.
-- A candidate frame must be fully inside a validated type-0 usable span,
-  4 KiB aligned, outside page zero, and outside that image reservation. All other
-  types and holes remain unavailable, even after a free attempt. Raw usable-byte
-  totals are not promises of generally accessible memory.
-- **No bootloader-reclaimable memory is released.** The current CR3 and its
-  loader-owned page tables remain live. Response storage, firmware/ACPI/runtime
-  regions, modules, and all unknown/reserved types also remain unavailable.
-- A 128 KiB kernel-owned bitmap tracks candidate ordinals rather than physical
-  address space. Capacity is 1,048,576 candidate frames (4 GiB of candidate RAM),
-  not a 4 GiB physical-address ceiling. Oversized pools fail initialization;
-  sparse high physical addresses need no metadata for holes.
-- Allocate/free have exclusive mutable access on one BSP with IF=0. Free rejects
-  unaligned, noncandidate, or unallocated frames before changing accounting.
-  `allocated + free = total` holds; exhaustion is an explicit error. Scans are
-  bounded and simple; no constant-time or performance guarantee is made.
-- Allocation returns physical addresses only. No frame contents are accessed,
-  mapped, initialized, or zeroed. There is no heap. Callers must own the frame
-  they free; the allocator has no generation token to detect a stale address
-  after that same frame has subsequently been allocated again.
+Each new protection test uses its own image. It prepares and checks the actual
+mapping before executing one bounded faulting instruction on the normal stack:
 
-## Exception behavior and remaining limitations
+| QEMU case | Hardware result | Expected fault address and execution context |
+| --- | --- | --- |
+| `unmapped` | #PF 14, error 0 (supervisor read, absent) | `0xffffa00000000000`, exact read-site RIP; a CPU-populated translation was unmapped/invalidated and its owner released first. |
+| `readonly` | #PF 14, error 3 (supervisor write, protection) | Same test VA, exact write-site RIP. |
+| `nx` | #PF 14, error 17 (supervisor instruction fetch, protection) | Same test VA and RIP; NX payload contains `ret` so a silent permission failure returns and is explicitly rejected. |
+| `guard-low` / `guard-high` | #PF 14, error 0 | Exact low/high normal-stack guard symbols, exact bounded-read RIP. |
+| `df-guard-low` / `df-guard-high` | #PF 14, error 0 | Exact low/high IST-stack guard symbols, exact bounded-read RIP. No recursive overflow is induced. |
 
-- CPU descriptors are kernel-owned: GDT code/data selectors `0x08`/`0x10`, TSS
-  selector `0x18`, a 256-entry IDT, and IST1 for #DF. Normal exceptions use the
-  64 KiB kernel stack; #DF uses a separate 32 KiB stack inside the reservation.
-- Assembly normalizes error/no-error-code frames and saves 15 GPRs plus the
-  hardware RIP/CS/RFLAGS/RSP/SS. CR2 is captured before Rust runs. A 192-byte
-  static `NEU_LAST_FAULT` record preserves the context before bounded output.
-  All current exceptions are fatal; #BP is diagnostic, not a resumable debugger.
-- The tested vectors are 3, 6, 8, 13, and 14. Other CPU vectors have correctly
-  categorized entry stubs but have not been separately injected. External vectors
-  share a fatal fallback reporting vector 255. No device interrupt framework is
-  enabled. IF remains clear; synchronous CPU exceptions still work.
-- The #PF image alone requests HHDM and reads only table pages verified to lie
-  completely in retained loader memory. It confirms the actual target mapping
-  is present/read-only before the write. It changes no mapping. This is neither
-  a general VMM nor permission to dereference arbitrary physical frames.
-- The genuine #DF test verifies exception-delivery escalation and IST execution.
-  Its saved RIP is not treated as a recoverable instruction location. Arbitrary
-  stack corruption/overflow recovery, NMI/machine-check hardening, SIMD context,
-  and the NMI window during descriptor replacement remain unverified. There are
-  no guard pages or general recovery paths yet.
-- ELF segment permissions are checked, but this is not a complete VMM or an
-  alias-aware W^X guarantee; loader-provided direct mappings remain in place.
-- Emergency output permits at most 512 bytes and 4096 status polls per byte;
-  ordinary writes permit 1024 bytes per call. It uses no heap, locks, or waits.
-  Serial-device loss, recursive panic, NMI, and machine-check events have not been
-  separately fault-injected. The handler makes a best-effort diagnostic attempt.
-- Single CPU, QEMU q35/TCG/COM1 only. SMP, Nodes, Ring 3, syscalls, capabilities,
-  MemoryObjects, scheduling, IPC, userspace drivers, full NeuKMon, compatibility
-  layers, and OS services remain unimplemented.
+The original faults retain #UD 6/0, #GP 13/`0x28`, static-write #PF 14/3,
+genuine #DF 8/0, and #BP 3/0. #BP records RIP after `int3`; #DF requires IST1
+rather than a recoverable RIP. The static-write #PF checks CR2 against the ELF
+target. All other tested handlers run on the normal stack.
+
+The default guest deadline remains 30 seconds with bounded cleanup. An absent
+expected result, reset/shutdown, early emulator exit, unexpected success, wrong
+CR3/fault context/halt address, or QMP failure fails the test. Serial text alone
+cannot pass; no `isa-debug-exit` shortcut is used. The original Phase 0 timeout
+and interactive-run experiments remain historical at that milestone; these
+mechanisms have been retained, not newly claimed as independently exercised.
+
+For selected cases or a slower host:
+
+```sh
+make test TEST_TIMEOUT=60
+python3 tools/neu.py test --case paging
+python3 tools/neu.py test --case paging-bootstrap-failure
+python3 tools/neu.py test --case unmapped
+python3 tools/neu.py test --case readonly
+python3 tools/neu.py test --case nx
+python3 tools/neu.py test --case guard-low
+python3 tools/neu.py test --case df-guard-high
+python3 tools/neu.py test --case double-fault
+```
+
+Evidence is local and Git-ignored: `build/test-results.json`,
+`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase1b-test-run.log`,
+and `build/phase1b-repro-build.log`. Per-case records include ELF/firmware identity,
+QEMU arguments, registers, CR3, exception context, stack selection, halt proof and
+exit status. No hosted CI or physical-machine validation has been performed.
+
+## Page-table construction and transition
+
+The image's physical extent comes from the validated Executable Address response
+and linker bounds. Every image page has a matching reserved physical page at the
+same offset. The new hierarchy maps requests, code, constants, data/BSS, both
+stacks, descriptors, map copy, allocator bitmap and fault record. The four guard
+PTEs are absent; their physical pages remain image-reserved. Port-I/O serial needs
+no extra MMIO mapping. Image and table physical pages cannot be data-frame owners.
+
+Before CR3 activation, the HHDM is a temporary, non-owning bootstrap view. Loader
+table reads require whole pages in retained loader-reclaimable regions and valid
+physical width. The walker understands 1 GiB/2 MiB leaves and accumulated parent
+permissions. Before zeroing/accessing a newly owned frame, it verifies that the
+HHDM VA actually translates to that physical frame, supervisor and writable.
+Mapping of the loader's own retained table pages remains a trusted Limine
+prerequisite; numeric pointer checks alone cannot prove arbitrary mappings safe.
+
+All new tables are exclusively allocator-owned and zeroed before publication.
+The complete image, workspace aliases, table levels and parent counts are checked
+before switching. The root has zero hierarchy parents; every child has exactly
+one. The normal image initially owns seven tables. Failed inactive construction
+clears every new parent/leaf reference and returns new frames, ending temporary
+borrows first. It neither edits nor frees loader tables. The old HHDM still
+covers RAM during this rollback, but is not an owning reference to those frames.
+
+Activation requires NX/write-protect, four-level mode, IF=0, and PGE/PCIDE clear.
+The new root is distinct from the loader root. CR3 loading flushes the relevant
+translations and paging-structure caches under those requirements. Actual CR3 and
+all required mappings are verified again before success. The new hierarchy has
+no broad HHDM; scalar boot information was copied before the switch and loader
+response pointers are not dereferenced afterwards. Failure after the switch is
+fatal and does not attempt to free the active hierarchy.
+
+## Mapping, initialization and release lifetimes
+
+| Resource | Bound and lifetime |
+| --- | --- |
+| Table owners | At most 64 allocator-backed frames. Root plus image/workspace tables are pinned for kernel life; dynamic empty children can be retired. |
+| Table workspace | `0xffff900000000000`, one RW/NX 4 KiB alias per table slot. New alias is installed before a parent publishes its table; removed before physical reuse. |
+| Scratch view | Workspace index 511, `0xffff9000001ff000`. One exclusive R/NX or RW/NX frame borrow, removed and invalidated before return. References cannot escape the safe closure API. |
+| Data owners | At most 16 live opaque slot/generation identities. Duplicate physical owners and stale identities are rejected. Allocation zeroes all 4096 bytes before returning an initialized ID. |
+| Controlled mappings | At most 64 records in the 4 MiB region at `0xffffa00000000000`. Each refers to a live initialized owner and records R, RW/NX or RX permissions. |
+
+Physical allocation, temporary access, initialization, persistent mapping and
+release are separate operations. The underlying allocator does not access or
+zero contents. The paging wrapper owns each allocated data frame, zeroes it via
+a validated view, then publishes the initialized generation identity. The QEMU
+reuse test dirties the whole frame, frees it, obtains that same physical frame,
+and checks every byte is zero before mapping it again. This supplies a tested
+mechanism for future userspace initialization without exposing userspace now.
+
+Map transactions validate range/alignment/canonicality, frame initialization,
+physical width, conflicts, W^X aliases, and metadata capacity. Ownership policy
+and capacity are checked before leaf installation; each encoded entry also
+checks physical width. A failure rolls back any earlier leaves and new children
+before committing mapping references.
+Parent permissions are never weakened to satisfy a child request. Internal new
+entries are 4 KiB, supervisor, nonglobal WB RAM mappings. Large pages are decoded
+only for bootstrap inspection, not created by the controlled manager.
+
+Unmapping removes the leaf, executes `invlpg`, then drops its ownership record.
+The backing owner is retained until explicitly freed; any remaining mapping
+prevents free. Empty unpinned children are detached from their parents, then CR3
+is reloaded to flush walk caches before the workspace alias is cleared and
+invalidated and the table is freed. Release also refuses live parent references,
+nonempty tables, pinned tables and the active root. No active-root destructor
+reclaims these tables; the manager and allocator ledger remain live until halt.
+
+Text has no writable alias in the new active hierarchy. An executable data alias
+rejects writable aliases and mutable scratch access; a writable alias rejects RX.
+Read-only NX aliases can coexist. Image physical pages remain reserved and cannot
+enter the data registry. This W^X claim covers the supported active hierarchy;
+retained inactive loader tables and arbitrary privileged writes are outside that
+boundary. Raw addresses are not public ownership tokens or userspace APIs.
+
+## Retained physical allocator and boot contract
+
+- Descriptor count is bounded at 4096 (96 KiB kernel storage). The adapter checks
+  base revision, UEFI64, pointer shape/alignment/arithmetic, ordered nonempty
+  spans, overflow, page alignment of usable/reclaimable RAM, and their overlap.
+  The copy is audited before immutable publication; loader descriptor pointers
+  do not escape the adapter. HHDM is copied as a scalar, not a response borrow.
+- Only full type-0 usable frames outside page zero and the complete physical
+  image reservation are candidates. Unknown/reserved, firmware/ACPI/runtime,
+  modules, holes and loader allocations remain unavailable. The old inactive
+  tables remain reserved too. **No bootloader-reclaimable memory is released.**
+- The 128 KiB bitmap represents candidate ordinals, supporting at most 1,048,576
+  frames (4 GiB of eligible bytes), not a 4 GiB physical-address ceiling. Larger
+  eligible pools fail initialization; holes consume no bitmap entries.
+- Allocate/free require exclusive mutable access on one CPU with IF=0; invalid,
+  unaligned and duplicate frees are rejected and `allocated + free = total`
+  holds. The raw allocator cannot detect stale addresses after reallocation;
+  generation checks belong to the added paging data-owner layer.
+- Inactive loader CR3 is not sufficient proof for general reclamation. Other
+  loader/firmware allocations and dependencies have not had a complete audit;
+  reclaiming them remains a separate decision and implementation task.
+
+## Exceptions and remaining limits
+
+Private GDT code/data selectors remain `0x08`/`0x10`, TSS `0x18`, IDT 256 entries,
+and #DF uses IST1. Assembly saves 15 GPRs and normalized hardware context, captures
+CR2 before Rust, and publishes the 192-byte `NEU_LAST_FAULT` before bounded serial
+output. All current exceptions are fatal, including #BP. Guard tests access fixed
+absent pages from the healthy normal stack; they prove the mapping boundary, not
+recovery from arbitrary stack corruption or overflow.
+
+Verified vectors are 3, 6, 8, 13 and 14. Other categorized stubs, NMI/machine-check
+hardening, the NMI window during descriptor replacement, recursive panic,
+serial-device loss, and SIMD context have not been independently injected. IF
+remains clear; no device interrupt framework is enabled. Emergency output remains
+bounded at 512 bytes and 4096 polls per byte; ordinary output at 1024 bytes/call.
+
+The supported configuration is one CPU on QEMU q35/TCG/COM1. Physical hardware,
+other firmware versions, performance, and larger pool/capacity behavior in an
+actual guest remain unverified. Mapping metadata and scans are intentionally
+bounded. There are no locks/shootdowns or SMP safety claims, device cache-policy
+API, recoverable faults, demand paging, copy-on-write, general VMM/heap,
+MemoryObjects, Nodes, Threads, Ring 3, syscalls, capabilities, Channels, scheduler,
+device drivers, full NeuKMon, compatibility layers, or OS services.
 
 ## Architecture relationship and next milestone
 
-[ADR 0005](adr/0005-boot-memory-ownership-and-frame-allocation.md) accepts the
-scoped ownership/PMM contract and succeeds the historical Phase 0 contract in
-[ADR 0004](adr/0004-limine-phase-0-integration.md), retaining the loader/base pin.
-[ADR 0006](adr/0006-kernel-exception-descriptors-and-fatal-handling.md) records
-private CPU descriptors, fatal exceptions, and controlled fault testing. Original
-rationale is preserved through the explicit supersession chain. Architecture
-revision 0.2 remains unchanged. Only the PMM portion of `NEU-018` and privileged
-exception portion of `NEU-023` are accepted here; later VMM/MemoryObject, Node,
-and full CI designs are still proposals. `NEU-025` remains open.
+[ADR 0007](adr/0007-kernel-owned-paging-and-controlled-mappings.md) accepts this
+bounded paging/access/guard contract, amending
+[0005](adr/0005-boot-memory-ownership-and-frame-allocation.md) and
+[0006](adr/0006-kernel-exception-descriptors-and-fatal-handling.md).
+ADR 0005 now correctly **extends/amends** the still-Accepted
+[0004 Limine integration](adr/0004-limine-phase-0-integration.md). Dated corrections
+preserve the earlier Phase 1A supersession notation as history. The loader/base
+pin and original rationale are retained; the ADR index is consistent.
 
-The draft's Section 22 K0 outline includes basic NeuKMon, while the supplied
-Phase 0 brief limits diagnostics to early serial/panic support and excludes an
-interactive monitor. This implementation follows the narrower brief and does
-not claim completion of that K0 monitor item. Keep optional NeuKMon as later
-work with its own concrete decision rather than silently changing the baseline.
+Architecture v0.2 is unchanged. The PMM and scoped kernel-paging portions of
+`NEU-018`, privileged diagnostics/guards in `NEU-023`, and current local tests in
+`NEU-024` do not accept the broader Node/VMM/CI proposals. `NEU-025` remains open.
+The Section 22 K0 outline also lists basic NeuKMon; the narrower supplied Phase 0
+brief excluded an interactive monitor, so that outline item is not claimed here.
 
-Recommended next milestone: **K1 / Phase 1B, page-table ownership and controlled
-kernel mappings**. Define and test page-table lifetimes, own the relevant
-translation structures, establish narrow mapping/unmapping and frame-content
-initialization mechanisms, add guard pages, and test permissions/invalidation.
-Reclamation requires an explicit audit showing every affected loader structure
-and reference has been transferred or retired. Do not release loader memory
-merely because the map copy or descriptor tables are now kernel-owned. Nodes,
-Ring 3, syscalls, and scheduling remain outside that next foundation milestone.
+Recommended next milestone: **K2 / minimal Ring 3 and ABI**, starting with a
+separate decision on user address-space ownership, zeroed user-page exposure,
+entry/return and fault containment, then a bounded static-image fixture and
+`abi_query`/`thread_exit` proof. This is a recommendation, not an accepted or
+implemented userspace contract. Any reclamation work first needs its own complete
+loader dependency audit; it is not a prerequisite to retain the current RAM safely.
 
 ## Primary implementation references
 
@@ -311,4 +371,4 @@ Ring 3, syscalls, and scheduling remain outside that next foundation milestone.
 - [Limine 12.9.4 release](https://github.com/Limine-Bootloader/Limine/releases/tag/v12.9.4), [configuration](https://github.com/Limine-Bootloader/Limine/blob/v12.9.4/CONFIG.md), and [UEFI usage](https://github.com/Limine-Bootloader/Limine/blob/v12.9.4/USAGE.md)
 - [Rust freestanding x86-64 target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html)
 - [QEMU virtual FAT](https://www.qemu.org/docs/master/system/images.html#virtual-fat-disk-images)
-- [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), Volume 3A: interrupt/exception frames, error codes, TSS and IST.
+- [Intel SDM](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf), Volume 3A: four-level entries, CR3/INVLPG translation and walk-cache invalidation, exception frames, TSS and IST.

@@ -97,6 +97,10 @@ unsafe extern "C" {
     fn neu_test_ud() -> !;
     fn neu_test_gp() -> !;
     fn neu_test_bp() -> !;
+    fn neu_test_unmapped(address: u64) -> u64;
+    fn neu_test_readonly(address: u64);
+    fn neu_test_nx(address: u64);
+    fn neu_test_guard(address: u64) -> u64;
     #[cfg(feature = "test-page-fault")]
     fn neu_test_pf(address: *const u64) -> !;
 }
@@ -261,48 +265,38 @@ pub fn test_double_fault() -> ! {
 static NEU_PF_PROBE: u64 = 0x4e45_5550_4654_4553;
 
 #[cfg(feature = "test-page-fault")]
-pub fn test_page_fault(map: &crate::memory::MemoryMap<'_>, hhdm: u64) -> Result<(), &'static str> {
-    let address = ptr::addr_of!(NEU_PF_PROBE) as u64;
-    let mut table: u64;
-    // SAFETY: Read-only inspection at Ring 0 with unchanged loader page tables.
-    unsafe {
-        asm!("mov {}, cr3", out(reg) table, options(nomem, nostack, preserves_flags));
-    }
-    table &= 0x000f_ffff_ffff_f000;
-    let mut writable = true;
-    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-        // Limine base 6 guarantees its page tables are reclaimable and mapped
-        // through the requested HHDM. Only those complete pages may be read.
-        if !map.contains_region(table, 4096, 5) {
-            return Err("page table is not in retained loader RAM");
-        }
-        let pointer = hhdm
-            .checked_add(table)
-            .and_then(|base| base.checked_add(((address >> shift) & 511) * 8))
-            .ok_or("test page-table address overflow")?;
-        if !super::valid_boot_range(pointer as usize, 8, 8) {
-            return Err("invalid table mapping");
-        }
-        // SAFETY: The complete table page is retained and HHDM-mapped, its
-        // aligned index is bounded, and no CPU or kernel code mutates tables.
-        let entry = unsafe { ptr::read_volatile(pointer as *const u64) };
-        if entry & 1 == 0 {
-            return Err("PF test target is not present");
-        }
-        writable &= entry & 2 != 0;
-        if level == 3 || ((level == 1 || level == 2) && entry & 128 != 0) {
-            break;
-        }
-        table = entry & 0x000f_ffff_ffff_f000;
-    }
-    if writable {
-        return Err("PF test target unexpectedly writable");
-    }
-    serial::write(format_args!(
+pub fn page_fault_target() -> u64 {
+    ptr::addr_of!(NEU_PF_PROBE) as u64
+}
+
+#[cfg(feature = "test-page-fault")]
+pub fn test_page_fault() -> ! {
+    if serial::write(format_args!(
         "[NEU] Test: read-only mapping verified for #PF\n"
     ))
-    .map_err(|_| "serial output failed")?;
-    // SAFETY: Actual tables prove the static's mapping is present and read-only;
-    // CR0.WP was validated. The write faults without modifying the Rust static.
+    .is_err()
+    {
+        halt();
+    }
+    // SAFETY: Caller inspected the current owned hierarchy and proved this
+    // static is present/read-only; CR0.WP was validated before the transition.
     unsafe { neu_test_pf(ptr::addr_of!(NEU_PF_PROBE)) }
+}
+
+pub fn test_paging_access(kind: usize, address: u64) {
+    // SAFETY: Called only after the manager verifies a deliberately absent,
+    // read-only, or NX mapping in a separate test image. If protection silently
+    // fails, these bounded probes return and the caller reports a test failure.
+    unsafe {
+        match kind {
+            0 => {
+                let _ = neu_test_unmapped(address);
+            }
+            1 => neu_test_readonly(address),
+            2 => neu_test_nx(address),
+            _ => {
+                let _ = neu_test_guard(address);
+            }
+        }
+    }
 }
