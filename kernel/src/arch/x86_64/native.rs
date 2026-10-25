@@ -28,7 +28,7 @@ const CANARIES: [u64; 6] = [
 ];
 pub const PRIVATE_VALUE: u64 = 0x5152535461626364;
 global_asm!(include_str!("native.S"),cooperative=const cfg!(feature="switch-test") as u8,
-    kernel_wait=const if cfg!(feature="switch-test") { 0x02000000u64 } else { 0x10000000u64 },private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
+    kernel_wait=const if cfg!(feature="preempt-test") { 16u64 } else if cfg!(feature="switch-test") { 0x02000000u64 } else { 0x10000000u64 },private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
     kernel_ss=const abi::KERNEL_SS,star=const abi::STAR,fmask=const abi::ENTRY_MASK,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,unsupported=const abi::NOT_SUPPORTED,invalid=const abi::INVALID_ARGUMENT,
     canary_bx=const CANARIES[0],canary_bp=const CANARIES[1],canary_12=const CANARIES[2],
@@ -217,9 +217,27 @@ fn return_contract(root: u64) -> ReturnContract {
         ],
     }
 }
-#[cfg(feature = "switch-test")]
+#[cfg(all(feature = "switch-test", not(feature = "preempt-test")))]
 fn return_contract(root: u64) -> ReturnContract {
     super::cooperative::return_contract(root)
+}
+#[cfg(feature = "preempt-test")]
+fn return_contract(root: u64) -> ReturnContract {
+    super::preemptive::return_contract(root)
+}
+fn validate_native_return(
+    context: abi::ReturnContext,
+    contract: &ReturnContract,
+    root: u64,
+) -> core::result::Result<(), Rejection> {
+    #[cfg(feature = "preempt-test")]
+    {
+        abi::validate_preemptible_return(context, contract, root)
+    }
+    #[cfg(not(feature = "preempt-test"))]
+    {
+        abi::validate_return(context, contract, root)
+    }
 }
 fn entry_stack() -> (u64, u64) {
     #[cfg(feature = "switch-test")]
@@ -375,7 +393,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
         }
     }
     let contract = return_contract(root);
-    if let Err(reason) = abi::validate_return(frame.context, &contract, root) {
+    if let Err(reason) = validate_native_return(frame.context, &contract, root) {
         serial::write(format_args!("[NEU] Native return rejected: reason={} RIP={:#x} RSP={:#x} CS={:#x} SS={:#x} RFLAGS={:#x}\n",reason as u64,frame.context.rip,frame.context.rsp,frame.context.cs,frame.context.ss,frame.context.flags)).unwrap_or_else(|_| super::halt());
         #[cfg(feature = "node-test")]
         if s.binding.is_some() {
@@ -403,7 +421,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
         frame.registers.rax = 0;
         frame.registers.rdx = 0;
         if !before.preserved(frame.registers)
-            || abi::validate_return(frame.context, &contract, root).is_err()
+            || validate_native_return(frame.context, &contract, root).is_err()
         {
             fatal("invalid yield context");
         }
@@ -436,7 +454,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
         }
     }
     if !before.preserved(frame.registers)
-        || abi::validate_return(frame.context, &contract, paging::current_root()).is_err()
+        || validate_native_return(frame.context, &contract, paging::current_root()).is_err()
     {
         fatal("return contract changed during dispatch");
     }
@@ -678,7 +696,8 @@ pub fn execute_slice(
         || binding.context.rsp != userspace::USER_RSP
         || !saved.valid(binding, saved.stack)
         || (!saved.fresh
-            && abi::validate_return(
+            && !saved.interrupted
+            && validate_native_return(
                 saved.frame.context,
                 &return_contract(space.root),
                 space.root,
@@ -687,7 +706,14 @@ pub fn execute_slice(
     {
         return Err(Error::Flags);
     }
+    #[cfg(feature = "preempt-test")]
+    let initial = SavedContext::initial_preemptible(binding, saved.stack);
+    #[cfg(not(feature = "preempt-test"))]
     let initial = SavedContext::initial(binding, saved.stack);
+    #[cfg(feature = "preempt-test")]
+    if !saved.preemptible || !super::preemptive::valid_user_frame(saved.frame, space.root) {
+        return Err(Error::Flags);
+    }
     if saved.fresh && saved != initial {
         return Err(Error::Flags);
     }
@@ -718,6 +744,10 @@ pub fn execute_slice(
     serial::write(format_args!("[NEU] Switch native ready: node={} thread={} space={} root={:#x} stack_bottom={:#x} stack_top={:#x} TSS_RSP0={:#x} RIP={:#x} RSP={:#x} fresh={}\n",binding.node.raw(),binding.thread.raw(),space.id().raw(),space.root,saved.stack.bottom,saved.stack.top,exceptions::rsp0(),saved.frame.context.rip,saved.frame.context.rsp,saved.fresh)).map_err(|_|Error::Corrupt)?;
     paging.activate_user(space)?;
     userspace::enter_context(&saved.frame, paging.root(), saved.stack.top);
+    #[cfg(feature = "preempt-test")]
+    super::interrupts::stop_user();
+    #[cfg(feature = "preempt-test")]
+    super::preemptive::complete_boundary(paging.root())?;
     restore(old)?;
     exceptions::configure_native(false)?;
     paging.deactivate_user(space)?;
@@ -743,4 +773,34 @@ pub fn execute_slice(
     save(Session::default());
     serial::write(format_args!("[NEU] Switch common restored: thread={} root={:#x} MSRs=restored guard=clear entry=clear stack_margin=512\n",binding.thread.raw(),paging.root())).map_err(|_|Error::Corrupt)?;
     ended.event.ok_or(Error::Corrupt)
+}
+
+#[cfg(feature = "preempt-test")]
+pub(super) fn preempt_binding_valid(
+    active: neu_kernel::node::ActiveContext,
+    stack: neu_kernel::context::StackBinding,
+) -> bool {
+    let s = session();
+    running()
+        && s.binding == Some(active)
+        && s.stack == Some(stack)
+        && s.root == active.context.root
+        && unsafe {
+            ptr::read_volatile(ptr::addr_of!(neu_native_selected_top)) == stack.top
+                && ptr::read_volatile(ptr::addr_of!(neu_native_busy)) == 0
+        }
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn preempt(frame: Frame) -> ! {
+    let mut s = session();
+    if !running()
+        || s.binding
+            .is_none_or(|b| b.context.root != paging::current_root())
+    {
+        fatal("unbound IRQ handoff");
+    }
+    s.event = Some(neu_kernel::context::SliceEvent::Preempted(frame));
+    s.valid = true;
+    save(s);
+    terminal_exit(s, 101, 0)
 }

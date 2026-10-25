@@ -71,6 +71,21 @@ impl Queue {
         model.suspend(active, frame)?;
         self.enqueue(model, active.thread)
     }
+    pub fn preempted(
+        &mut self,
+        model: &mut Nodes,
+        saved: crate::context::SavedContext,
+    ) -> node::Result<()> {
+        if !saved.interrupted
+            || !saved.preemptible
+            || self.len == MAX_THREADS
+            || self.contains(saved.active.thread)
+        {
+            return Err(node::Error::InUse);
+        }
+        model.suspend_context(saved.active, saved)?;
+        self.enqueue(model, saved.active.thread)
+    }
     pub fn finish(
         &mut self,
         model: &mut Nodes,

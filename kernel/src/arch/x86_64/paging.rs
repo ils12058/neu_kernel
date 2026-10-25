@@ -921,6 +921,10 @@ impl Paging<'_, '_> {
                     }
                 }
             }
+            #[cfg(feature = "preempt-test")]
+            if let Some((physical, pat)) = super::interrupts::user_device() {
+                tree.map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
+            }
             tree.map(&mut self.memory, WINDOW, tree.root, Permissions::RW)?;
             for (va, frame, permission) in [
                 (CODE, ids[0], Permissions::RX),
@@ -1042,6 +1046,18 @@ impl Paging<'_, '_> {
                 || actual.permissions != permissions
                 || !actual.user
                 || actual.page_size != PAGE
+            {
+                return Err(Error::Flags);
+            }
+        }
+        #[cfg(feature = "preempt-test")]
+        if let Some((physical, _)) = super::interrupts::user_device() {
+            let mapping = tree
+                .translate(&self.memory, LAPIC_VIEW)?
+                .ok_or(Error::NotMapped)?;
+            if mapping.physical != physical
+                || mapping.user
+                || mapping.permissions != Permissions::RW
             {
                 return Err(Error::Flags);
             }
@@ -1189,9 +1205,9 @@ impl Paging<'_, '_> {
     }
 }
 
-#[cfg(feature = "timer-test")]
+#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub const LAPIC_VIEW: u64 = 0xffff_b000_0000_0000;
-#[cfg(feature = "timer-test")]
+#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 impl Paging<'_, '_> {
     pub fn map_lapic_uc(&mut self, physical: u64, pat: u64) -> Result<u64> {
         if current_root() != self.tree.root || super::interrupts::flags() & 0x200 != 0 {
@@ -1438,6 +1454,18 @@ impl Paging<'_, '_> {
             core::array::from_fn(|i| {
                 u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
             })
+        })
+    }
+}
+
+#[cfg(feature = "preempt-test")]
+impl Paging<'_, '_> {
+    pub fn user_limit(&mut self, space: &UserSpace, limit: u64) -> Result<()> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            bytes[24..32].copy_from_slice(&limit.to_le_bytes())
         })
     }
 }

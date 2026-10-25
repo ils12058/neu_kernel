@@ -1,17 +1,20 @@
-//! Early x86-64 mechanisms. Only isolated timer tests admit external interrupts.
+//! Early x86-64 mechanisms. External interrupts require an explicit bounded
+//! kernel timer window or the published user-only preemption contract.
 
 use core::arch::{asm, global_asm, x86_64::__cpuid};
 
 #[cfg(feature = "switch-test")]
 pub mod cooperative;
 pub mod exceptions;
-#[cfg(feature = "timer-test")]
+#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub mod interrupts;
 #[cfg(feature = "native-test")]
 pub mod native;
 #[cfg(all(feature = "node-test", not(feature = "switch-test")))]
 pub mod nodes;
 pub mod paging;
+#[cfg(feature = "preempt-test")]
+pub mod preemptive;
 pub mod serial;
 #[cfg(feature = "user-test")]
 pub mod userspace;

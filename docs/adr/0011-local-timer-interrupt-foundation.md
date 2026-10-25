@@ -165,3 +165,12 @@ kernel slice before FIFO selection; it does not schedule from this timer or
 enable interrupts in native/user execution. These timer tests retain their
 original enable/drain/stop policy. Deferred interrupt-driven switching belongs
 to Phase 4C and still requires an explicit safe-entry/rescheduling contract.
+
+### 2026-10-26 — Phase 4C extension
+
+[ADR 0013](0013-single-cpu-user-preemption.md) admits IF=1 only for explicitly
+preemptible user contexts and captures real timer-origin frames through the
+common-stack boundary. Native kernel execution and resource/scheduler mutation
+remain IF=0. Earlier fixtures retain their original behavior; the accepted ABI,
+protection-domain and ownership directions remain unchanged. This extension does
+not add general kernel preemption, SMP or public object/scheduler interfaces.

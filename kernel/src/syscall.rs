@@ -152,6 +152,19 @@ pub fn validate_return(
     }
     Ok(())
 }
+/// Only an explicitly preemptible native session may restore IF. All other
+/// legacy return checks, including sealed syscall sites, remain mandatory.
+pub fn validate_preemptible_return(
+    mut context: ReturnContext,
+    contract: &ReturnContract,
+    root: u64,
+) -> Result<(), Rejection> {
+    if context.flags & 0x200 == 0 {
+        return Err(Rejection::Flags);
+    }
+    context.flags &= !0x200;
+    validate_return(context, contract, root)
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Msrs {
     pub efer: u64,

@@ -5,18 +5,21 @@ use super::{
     paging::{Paging, UserSpace},
     serial, userspace,
 };
-use core::{
-    arch::{asm, global_asm},
-    ptr,
+use core::arch::global_asm;
+#[cfg(not(feature = "preempt-test"))]
+use core::{arch::asm, ptr};
+#[cfg(not(feature = "preempt-test"))]
+use neu_kernel::{
+    context::SliceEvent,
+    node::{Fault, FaultSource},
+    syscall::ReturnContract,
 };
 use neu_kernel::{
-    context::{SavedContext, SliceEvent, StackBinding},
-    node::{
-        self, ActiveContext, ExitReason, Fault, FaultSource, NodeId, Nodes, ThreadContext, ThreadId,
-    },
+    context::{SavedContext, StackBinding},
+    node::{self, ActiveContext, ExitReason, NodeId, Nodes, ThreadContext, ThreadId},
     paging::{self as logic, Error, PAGE, Result},
     scheduler::{Queue, TEST_YIELD},
-    syscall::{self as abi, Frame, ReturnContract},
+    syscall::{self as abi, Frame},
 };
 const CANARIES: [u64; 6] = [
     0x1122334455667788,
@@ -27,12 +30,13 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 const MARKERS: [u64; 3] = [0x11225566778899aa, 0xaabbccddeeff1234, 0x1234567887654321];
-global_asm!(include_str!("cooperative.S"),query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
+global_asm!(include_str!("cooperative.S"),preemptive=const cfg!(feature="preempt-test") as u8,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,yield_op=const TEST_YIELD,private_value=const native::PRIVATE_VALUE,
     stack_bottom=const logic::KSTACK_BASE+PAGE,stack_guard=const logic::KSTACK_BASE,
     canary_bx=const CANARIES[0],canary_bp=const CANARIES[1],canary_12=const CANARIES[2],
     canary_13=const CANARIES[3],canary_14=const CANARIES[4],canary_15=const CANARIES[5],
     marker_0=const MARKERS[0],marker_1=const MARKERS[1],marker_2=const MARKERS[2]);
+#[cfg(not(feature = "preempt-test"))]
 unsafe extern "C" {
     static neu_switch_payload: u8;
     static neu_switch_payload_end: u8;
@@ -42,9 +46,11 @@ unsafe extern "C" {
     static neu_switch_stack_user_site: u8;
     static neu_switch_stack_guard_site: u8;
 }
+#[cfg(not(feature = "preempt-test"))]
 fn site(symbol: *const u8) -> u64 {
     userspace::CODE + symbol as u64 - ptr::addr_of!(neu_switch_payload) as u64
 }
+#[cfg(not(feature = "preempt-test"))]
 fn payload() -> &'static [u8] {
     let length =
         ptr::addr_of!(neu_switch_payload_end) as usize - ptr::addr_of!(neu_switch_payload) as usize;
@@ -52,6 +58,7 @@ fn payload() -> &'static [u8] {
     // SAFETY: Bounded immutable image bytes, copied into new private user RX frames.
     unsafe { core::slice::from_raw_parts(ptr::addr_of!(neu_switch_payload), length) }
 }
+#[cfg(not(feature = "preempt-test"))]
 pub fn return_contract(root: u64) -> ReturnContract {
     ReturnContract {
         root,
@@ -62,25 +69,46 @@ pub fn return_contract(root: u64) -> ReturnContract {
         resumes: [site(ptr::addr_of!(neu_switch_resume)); 2],
     }
 }
+fn execution_payload() -> &'static [u8] {
+    #[cfg(feature = "preempt-test")]
+    {
+        super::preemptive::payload()
+    }
+    #[cfg(not(feature = "preempt-test"))]
+    {
+        payload()
+    }
+}
+fn initial_context(active: ActiveContext, stack: StackBinding) -> SavedContext {
+    #[cfg(feature = "preempt-test")]
+    {
+        SavedContext::initial_preemptible(active, stack)
+    }
+    #[cfg(not(feature = "preempt-test"))]
+    {
+        SavedContext::initial(active, stack)
+    }
+}
 fn policy<T>(result: node::Result<T>) -> Result<T> {
     result.map_err(|_| Error::Corrupt)
 }
-struct Domain {
-    label: u64,
-    node: NodeId,
-    thread: ThreadId,
-    active: ActiveContext,
-    space: Option<UserSpace>,
-    stack: Option<StackBinding>,
-    last: Option<Frame>,
-    slices: u64,
-    outcome: Option<ExitReason>,
-    seed: u64,
+pub(super) struct Domain {
+    pub label: u64,
+    pub node: NodeId,
+    pub thread: ThreadId,
+    pub active: ActiveContext,
+    pub space: Option<UserSpace>,
+    pub stack: Option<StackBinding>,
+    pub last: Option<Frame>,
+    #[cfg(not(feature = "preempt-test"))]
+    pub slices: u64,
+    pub outcome: Option<ExitReason>,
+    pub seed: u64,
 }
-fn space(domain: &Domain) -> Result<&UserSpace> {
+pub(super) fn space(domain: &Domain) -> Result<&UserSpace> {
     domain.space.as_ref().ok_or(Error::NotOwned)
 }
-fn build(
+pub(super) fn build(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
     label: u64,
@@ -90,7 +118,7 @@ fn build(
     policy(model.configure(node))?;
     let seed = if label == 1 { 35 } else { 77 };
     let root = match paging.prepare_domain(
-        payload(),
+        execution_payload(),
         action,
         seed,
         if label == 2 {
@@ -128,12 +156,13 @@ fn build(
         space: Some(root),
         stack: None,
         last: None,
+        #[cfg(not(feature = "preempt-test"))]
         slices: 0,
         outcome: None,
         seed,
     })
 }
-fn install(
+pub(super) fn install(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
     queue: &mut Queue,
@@ -142,13 +171,13 @@ fn install(
     let active = domain.active;
     let stack =
         paging.prepare_thread_stack(domain.space.as_mut().ok_or(Error::NotOwned)?, active, None)?;
-    policy(model.install_execution(domain.thread, SavedContext::initial(active, stack)))?;
+    policy(model.install_execution(domain.thread, initial_context(active, stack)))?;
     paging.pin_context(space(domain)?)?;
     policy(queue.enqueue(model, domain.thread))?;
     domain.stack = Some(stack);
     serial::write(format_args!("[NEU] Switch Thread ready: label={} node={} thread={} space={} root={:#x} bottom={:#x} top={:#x} pa0={:#x} pa1={:#x} code_pa={:#x} data_pa={:#x} user_stack_pa={:#x} seed={}\n",domain.label,domain.node.raw(),domain.thread.raw(),active.context.space.raw(),active.context.root,stack.bottom,stack.top,paging.user_physical(space(domain)?,stack.bottom)?,paging.user_physical(space(domain)?,stack.bottom+PAGE)?,paging.user_physical(space(domain)?,userspace::CODE)?,paging.user_physical(space(domain)?,userspace::DATA)?,paging.user_physical(space(domain)?,userspace::STACK)?,domain.seed)).map_err(|_|Error::Corrupt)
 }
-fn frame_log(event: &str, thread: ThreadId, frame: Frame) -> Result<()> {
+pub(super) fn frame_log(event: &str, thread: ThreadId, frame: Frame) -> Result<()> {
     let r = frame.registers;
     serial::write(format_args!(
         "[NEU] Switch frame: event={} thread={} RIP={:#x} RSP={:#x} flags={:#x} regs=",
@@ -175,7 +204,7 @@ fn frame_log(event: &str, thread: ThreadId, frame: Frame) -> Result<()> {
     }
     serial::write(format_args!("\n")).map_err(|_| Error::Corrupt)
 }
-fn survivor(
+pub(super) fn survivor(
     paging: &mut Paging<'_, '_>,
     model: &Nodes,
     queue: &Queue,
@@ -203,7 +232,11 @@ fn survivor(
     ))
     .map_err(|_| Error::Corrupt)
 }
-fn reclaim(paging: &mut Paging<'_, '_>, model: &mut Nodes, domain: &mut Domain) -> Result<()> {
+pub(super) fn reclaim(
+    paging: &mut Paging<'_, '_>,
+    model: &mut Nodes,
+    domain: &mut Domain,
+) -> Result<()> {
     let stack = domain.stack.take().ok_or(Error::NotOwned)?;
     if policy(model.thread(domain.thread))?.saved.is_some()
         || policy(model.thread(domain.thread))?.queued
@@ -223,7 +256,7 @@ fn reclaim(paging: &mut Paging<'_, '_>, model: &mut Nodes, domain: &mut Domain) 
     }
     serial::write(format_args!("[NEU] Switch reclaimed: label={} thread={} space={} saved=false queued=false outcome=retained\n",domain.label,domain.thread.raw(),id.raw())).map_err(|_|Error::Corrupt)
 }
-fn stale_audit(
+pub(super) fn stale_audit(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
     queue: &mut Queue,
@@ -231,7 +264,7 @@ fn stale_audit(
 ) -> Result<()> {
     let node = policy(model.create())?;
     policy(model.configure(node))?;
-    let s = paging.prepare_domain(payload(), 0, 35, None, None)?;
+    let s = paging.prepare_domain(execution_payload(), 0, 35, None, None)?;
     policy(model.bind_space(node, s.id()))?;
     let thread = policy(model.initial_thread(
         node,
@@ -257,6 +290,7 @@ fn stale_audit(
     ))
     .map_err(|_| Error::Corrupt)
 }
+#[cfg(not(feature = "preempt-test"))]
 fn verify_outcome(domain: &Domain, case: u64, reason: ExitReason, words: [u64; 3]) -> Result<()> {
     let faulted = (domain.label == 1 && matches!(case, 1 | 3 | 4 | 5 | 6))
         || (domain.label == 2 && case == 2);
@@ -325,6 +359,7 @@ fn verify_outcome(domain: &Domain, case: u64, reason: ExitReason, words: [u64; 3
     }
     Ok(())
 }
+#[cfg(not(feature = "preempt-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let flags: u64;
     unsafe {
@@ -466,6 +501,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
             _ => return Err(Error::Corrupt),
         };
         match event {
+            SliceEvent::Preempted(_) => return Err(Error::Corrupt),
             SliceEvent::Yield(frame) => {
                 frame_log("saved", domain.thread, frame)?;
                 domain.last = Some(frame);

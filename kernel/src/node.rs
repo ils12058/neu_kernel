@@ -408,13 +408,16 @@ impl Nodes {
         Ok(Dispatch { active, saved })
     }
     pub fn suspend(&mut self, active: ActiveContext, frame: crate::syscall::Frame) -> Result<()> {
+        let stack = self.thread(active.thread)?.stack.ok_or(Error::State)?;
+        self.suspend_context(active, SavedContext::yielded(active, stack, frame))
+    }
+    pub fn suspend_context(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
         if self.active != Some(active) {
             return Err(Error::Association);
         }
         let mut t = self.thread(active.thread)?;
         let mut n = self.node(active.node)?;
         let stack = t.stack.ok_or(Error::State)?;
-        let saved = SavedContext::yielded(active, stack, frame);
         if t.state != ThreadState::Running
             || t.queued
             || t.saved.is_some()

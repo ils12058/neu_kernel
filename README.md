@@ -5,27 +5,31 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K4 / Phase 4B adds cooperative FIFO switching between two independently owned
-Ring 3 Threads, one per Node. Yield saves a complete user context; the kernel
-finishes that slice on its common stack before resuming another Thread. Each
-Thread has a private guarded 8 KiB kernel-entry stack and a pinned address space.
-Eight A/B dispatches preserve registers and user-stack witnesses, producing 63
-and 105 after four computation stages per Thread.
+K4 / Phase 4C adds single-CPU timer-driven **userspace preemption**. Two CPU-bound
+Ring 3 Threads run without yielding or making syscalls during the demonstrated
+alternations. The LAPIC captures their actual interrupted registers/RIP/stack;
+an acknowledged, uniquely owned handoff reaches the common kernel stack before
+FIFO selection. Each Thread retains a private guarded 8 KiB entry stack and a
+pinned, independently owned Node address space.
 
-The suite contains **64 host tests and 56 QEMU scenarios**, retaining all previous
-52/47 tests. It covers actual suspended-context resumption, private stack/TSS/CR3
-selection, fault containment in both directions, cross-Node isolation, guard and
-supervisor permissions, invalid saved state, rollback and stale identities.
-The environment remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple
-Silicon, Rust 1.95.0 and Limine 12.9.4/base 6.
+The suite now contains **72 host tests and 71 QEMU scenarios**, including all
+previous 64/56 regressions. New cases cover x2APIC and UC-mapped xAPIC, exact
+context restoration, independent computation, syscall compatibility, faults in
+both directions, isolation, invalid publications, handoff misuse, stale IDs and
+controlled negative IRQ delivery. See [implementation status](docs/IMPLEMENTATION_STATUS.md)
+for actual verification results, CPU observations and limits.
 
-Switching and userspace retain IF=0; Phase 4A timer tests stay independent.
-`abi_query=1`, `thread_exit=2` and ABI 0.1 results/features are unchanged. Yield
-uses a private test-only operation without allocating a public ABI number.
-Timer-driven preemption, SMP, multiple Threads per Node and capability/factory
-interfaces remain unimplemented. See [ADR 0012](docs/adr/0012-cooperative-thread-context-switching.md)
-for the decision and Phase 4C boundary. Architecture v0.2 remains the historical
-design baseline.
+The provisional calibrated clockevent is 10 ms; QEMU evidence establishes
+progress and context preservation, not exact timing or hard real time. Selected
+userspace runs with IF=1; native entry, scheduler/resource updates and switching
+retain IF=0. General kernel preemption, SMP, multiple Threads per Node and public
+capability/factory interfaces remain unimplemented. ABI 0.1 query/exit and the
+original cooperative test-only yield remain unchanged.
+
+[ADR 0013](docs/adr/0013-single-cpu-user-preemption.md) records the scoped decision.
+Architecture v0.2 and previous ADR rationale remain historical baselines. The
+validated environment remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF,
+Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon.
 
 ## Build and run
 
@@ -48,7 +52,10 @@ disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
 QEMU. `make test` runs host memory/paging/lifecycle/ABI/timer tests, observes each
 guest's expected result, active CR3 and halt through QMP, then shuts QEMU down
-itself. Run `python3 tools/neu.py test --case switch` for cooperative switching,
+itself. Run `python3 tools/neu.py test --case preempt` for hardware scheduling,
+`--case preempt-xapic` for its controller fallback, `--case preempt-native` for
+IF-enabled native entry, or `--case preempt-a-fault` for fault containment.
+Run `python3 tools/neu.py test --case switch` for cooperative switching,
 `--case switch-a-fault` for suspended-sibling containment, or
 `--case switch-rollback` for construction failure. Earlier `timer`, `timer-xapic`,
 `nodes`, `native` and `user` cases remain available with the same command.

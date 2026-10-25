@@ -158,3 +158,12 @@ stack before another Thread runs. The entry guard stays held until that handoff.
 Earlier configurations keep their original stack and ABI behavior. Query/exit
 numbers, results, register conventions and advertised 0.1 features remain
 accepted and unchanged; no public yield number is allocated by this extension.
+
+### 2026-10-26 — Phase 4C extension
+
+[ADR 0013](0013-single-cpu-user-preemption.md) admits IF=1 only for explicitly
+preemptible user contexts and captures real timer-origin frames through the
+common-stack boundary. Native kernel execution and resource/scheduler mutation
+remain IF=0. Earlier fixtures retain their original behavior; the accepted ABI,
+protection-domain and ownership directions remain unchanged. This extension does
+not add general kernel preemption, SMP or public object/scheduler interfaces.

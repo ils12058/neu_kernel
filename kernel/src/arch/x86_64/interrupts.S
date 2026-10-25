@@ -248,6 +248,23 @@ neu_irq_common:
     push r14
     push r15
     mov r12, rsp
+.if {preemptive}
+    test qword ptr [rsp + 144], 3
+    jz 8f
+    # One QMP hold per published dispatch. No-peer IRQ returns need not repeat
+    # an already recorded observation delay on every subsequent clockevent.
+    cmp qword ptr [rip + neu_preempt_irq_observed], 0
+    jne 8f
+    mov qword ptr [rip + neu_preempt_irq_observed], 1
+    # Observe real hardware frame and ISR before EOI; never change saved GPRs.
+    mov ecx, 0x04000000
+.global neu_preempt_irq_wait, neu_preempt_irq_wait_end
+neu_preempt_irq_wait:
+    dec ecx
+    jne neu_preempt_irq_wait
+neu_preempt_irq_wait_end:
+8:
+.endif
     mov rdi, rsp
     and rsp, -16
     call neu_interrupt
@@ -270,7 +287,7 @@ neu_irq_common:
     add rsp, 16
     iretq
 
-# Only this assembly region may execute with maskable interrupts enabled.
+# This is the only supported IF=1 Ring 0 region; Phase 4C also admits Ring 3.
 # The PIT reference plus an independent instruction budget bounds missing IRQs.
 .global neu_timer_wait, neu_timer_wait_begin, neu_timer_wait_end
 neu_timer_wait:

@@ -385,7 +385,7 @@ pub fn configure_native(enabled: bool) -> neu_kernel::paging::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "timer-test")]
+#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub fn configure_interrupts() -> Result<(), &'static str> {
     unsafe extern "C" {
         static neu_irq_table: [u64; 224];

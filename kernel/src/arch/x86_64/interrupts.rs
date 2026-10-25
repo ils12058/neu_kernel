@@ -1,18 +1,22 @@
-//! BSP-only local clockevent. IF=1 is confined to interrupts.S; no Node, paging,
-//! allocator, syscall or ordinary logger is accessed asynchronously.
+//! BSP-only local clockevent. IF=1 is confined to bounded kernel timer windows
+//! and explicitly preemptible userspace. No handler accesses the Node/paging/
+//! allocator/controller borrows suspended on the common stack.
 use super::{
     exceptions, halt,
     paging::{self, LAPIC_VIEW, Paging},
     serial,
 };
+#[cfg(feature = "timer-test")]
+use core::cell::UnsafeCell;
 use core::{
     arch::{asm, global_asm, x86_64::__cpuid},
-    cell::UnsafeCell,
     ptr,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use neu_kernel::timer::{self as policy, Capabilities, Configuration, MAX_EVENTS, Mode, Session};
-global_asm!(include_str!("interrupts.S"));
+#[cfg(feature = "timer-test")]
+use neu_kernel::timer::Session;
+use neu_kernel::timer::{self as policy, Capabilities, Configuration, MAX_EVENTS, Mode};
+global_asm!(include_str!("interrupts.S"),preemptive=const cfg!(feature="preempt-test") as u8);
 const APIC_BASE: u32 = 0x1b;
 const LVT: u32 = 0x320;
 const INITIAL: u32 = 0x380;
@@ -29,19 +33,27 @@ static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 static BUSY: AtomicBool = AtomicBool::new(false);
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Frame {
-    gpr: [u64; 15],
-    vector: u64,
-    error: u64,
-    rip: u64,
-    cs: u64,
-    flags: u64,
-    rsp: u64,
-    ss: u64,
+pub(super) struct Frame {
+    pub gpr: [u64; 15],
+    pub vector: u64,
+    pub error: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub flags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 const _: () = assert!(core::mem::size_of::<Frame>() == 176);
+const _: () = assert!(core::mem::offset_of!(Frame, gpr) == 0);
+const _: () = assert!(core::mem::offset_of!(Frame, vector) == 120);
+const _: () = assert!(core::mem::offset_of!(Frame, error) == 128);
 const _: () = assert!(core::mem::offset_of!(Frame, rip) == 136);
+const _: () = assert!(core::mem::offset_of!(Frame, cs) == 144);
+const _: () = assert!(core::mem::offset_of!(Frame, flags) == 152);
+const _: () = assert!(core::mem::offset_of!(Frame, rsp) == 160);
+const _: () = assert!(core::mem::offset_of!(Frame, ss) == 168);
 #[derive(Clone, Copy)]
+#[cfg(feature = "timer-test")]
 struct Trace {
     tick: u64,
     rip: u64,
@@ -54,6 +66,7 @@ struct Trace {
     root: u64,
     phase: u8,
 }
+#[cfg(feature = "timer-test")]
 impl Trace {
     const EMPTY: Self = Self {
         tick: 0,
@@ -68,10 +81,13 @@ impl Trace {
         phase: 0,
     };
 }
+#[cfg(feature = "timer-test")]
 struct Records(UnsafeCell<[Trace; MAX_EVENTS]>);
 // SAFETY: One CPU, one non-nested handler writes through raw pointers. No Rust
 // trace reference exists during IF=1. The controller reads copies only with IF=0.
+#[cfg(feature = "timer-test")]
 unsafe impl Sync for Records {}
+#[cfg(feature = "timer-test")]
 static RECORDS: Records = Records(UnsafeCell::new([Trace::EMPTY; MAX_EVENTS]));
 unsafe extern "C" {
     fn neu_timer_wait() -> u64;
@@ -159,6 +175,12 @@ fn fatal(vector: u64, reason: &str) -> ! {
 }
 #[unsafe(no_mangle)]
 extern "C" fn neu_interrupt(pointer: *const Frame) {
+    #[cfg(feature = "preempt-test")]
+    if super::preemptive::enabled() {
+        super::preemptive::interrupt(pointer);
+        return;
+    }
+
     if BUSY.swap(true, Ordering::Relaxed) {
         fatal(0, "reentry");
     }
@@ -229,6 +251,7 @@ extern "C" fn neu_interrupt(pointer: *const Frame) {
         Ordering::Relaxed,
     );
     // SAFETY: Bounds checked above, single non-nested writer, no live trace borrow.
+    #[cfg(feature = "timer-test")]
     unsafe {
         ptr::write(
             RECORDS.0.get().cast::<Trace>().add(before as usize),
@@ -273,7 +296,7 @@ fn pit_wait() -> Result<(), &'static str> {
     }
     Err("PIT calibration timeout")
 }
-fn calibrate() -> Result<policy::Calibration, &'static str> {
+fn calibrate(period_us: u64) -> Result<policy::Calibration, &'static str> {
     let mut samples = [0u32; 3];
     write(LVT, MASK | VECTOR);
     write(DIVIDE, 3); // Divide by 16, not a host CPU frequency assumption.
@@ -286,10 +309,10 @@ fn calibrate() -> Result<policy::Calibration, &'static str> {
         pit_stop();
         result?;
     }
-    let calibrated = Configuration::new(1000, policy::TIMER_VECTOR)
+    let calibrated = Configuration::new(period_us, policy::TIMER_VECTOR)
         .and_then(|c| c.calibrate(samples, policy::REFERENCE_TICKS))
         .map_err(|_| "APIC calibration invalid or inconsistent")?;
-    serial::write(format_args!("[NEU] Timer calibrated: PIT_Hz={} reference={} samples={},{},{} divided_Hz={} initial={} divide=16 period_us=1000\n", policy::PIT_HZ, policy::REFERENCE_TICKS, samples[0],samples[1],samples[2],calibrated.divided_hz,calibrated.initial)).map_err(|_|"timer serial failure")?;
+    serial::write(format_args!("[NEU] Timer calibrated: PIT_Hz={} reference={} samples={},{},{} divided_Hz={} initial={} divide=16 period_us={}\n", policy::PIT_HZ, policy::REFERENCE_TICKS, samples[0],samples[1],samples[2],calibrated.divided_hz,calibrated.initial,period_us)).map_err(|_|"timer serial failure")?;
     Ok(calibrated)
 }
 fn window(count: u16) -> Result<(), &'static str> {
@@ -304,18 +327,12 @@ fn window(count: u16) -> Result<(), &'static str> {
     }
     Ok(())
 }
-pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+fn initialize_controller(paging: &mut Paging<'_, '_>) -> Result<Option<Mode>, &'static str> {
     if flags() & 0x600 != 0 {
-        return Err("timer setup requires IF=0 DF=0");
+        return Err("controller setup flags");
     }
     let before = paging.stats();
-    let tables = paging.table_count();
     let root = paging.root();
-    serial::write(format_args!(
-        "[NEU] Timer accounting baseline: allocated={} free={} tables={}\n",
-        before.allocated, before.free, tables
-    ))
-    .map_err(|_| "timer serial failure")?;
     if __cpuid(0x80000000).eax < 0x80000008 || (0xc0000100..=0xc0000102).any(|msr| rdmsr(msr) != 0)
     {
         return Err("timer needs physical width and zero FS/GS bases");
@@ -354,7 +371,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
             return Err("unsupported controller validation failed");
         }
         serial::write(format_args!("[NEU] Timer unsupported configuration rejected: injected_APIC=false hardware_unchanged=true IF=0\n")).map_err(|_|"timer serial failure")?;
-        return Ok(());
+        return Ok(None);
     }
     let mode = caps
         .select()
@@ -411,6 +428,24 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         return Err("APIC software enable readback failed");
     }
     serial::write(format_args!("[NEU] Timer controller verified: mode={} base={:#x} id={} version={:#x} vector=48 spurious=255 PIC=masked leaf={:#x} pat={:#x} root={:#x}\n",mode as u8,rdmsr(APIC_BASE),id,version,leaf,pat,root)).map_err(|_|"timer serial failure")?;
+    Ok(Some(mode))
+}
+#[cfg(feature = "timer-test")]
+pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+    if flags() & 0x600 != 0 {
+        return Err("timer setup requires IF=0 DF=0");
+    }
+    let before = paging.stats();
+    let tables = paging.table_count();
+    let root = paging.root();
+    serial::write(format_args!(
+        "[NEU] Timer accounting baseline: allocated={} free={} tables={}\n",
+        before.allocated, before.free, tables
+    ))
+    .map_err(|_| "timer serial failure")?;
+    let Some(mode) = initialize_controller(paging)? else {
+        return Ok(());
+    };
     if cfg!(feature = "test-timer-unexpected") {
         // SAFETY: Deliberate isolated DPL0 negative, not hardware timer evidence.
         unsafe {
@@ -439,7 +474,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         ))
         .map_err(|_| "timer serial failure")?;
     }
-    let calibrated = calibrate()?;
+    let calibrated = calibrate(1000)?;
     let mut session = Session::default();
     let runs = if cfg!(feature = "test-timer-repeat") {
         2
@@ -535,4 +570,125 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     .map_err(|_| "timer serial failure")?;
     serial::write(format_args!("[NEU] Timer shutdown verified: ticks={} eois={} spurious={} LVT=masked initial=0 current=0 SVR=disabled TPR=255 PIC=masked IF=0 root={:#x} tables={} accounting=restored\n[NEU] Timer test passed: sessions={}\n",total,EOIS.load(Ordering::Relaxed),SPURIOUS.load(Ordering::Relaxed),root,tables,runs)).map_err(|_|"timer serial failure")?;
     Ok(())
+}
+
+#[cfg(feature = "preempt-test")]
+static USER_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "preempt-test")]
+static USER_INITIAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "preempt-test")]
+pub(super) fn setup_user(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+    initialize_controller(paging)?.ok_or("no user clockevent")?;
+    let calibration = calibrate(10_000)?;
+    USER_INITIAL.store(u64::from(calibration.initial), Ordering::Release);
+    Ok(())
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn user_device() -> Option<(u64, u64)> {
+    (MODE.load(Ordering::Acquire) == Mode::Xapic as u8).then(|| {
+        (
+            rdmsr(APIC_BASE) & neu_kernel::paging::ADDRESS_FIELD,
+            rdmsr(0x277),
+        )
+    })
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn arm_user() {
+    if flags() & 0x200 != 0 || MODE.load(Ordering::Acquire) == 0 || BUSY.load(Ordering::Relaxed) {
+        fatal(48, "unsafe user arm");
+    }
+    let initial = USER_INITIAL.load(Ordering::Acquire) as u32;
+    if initial == 0 || !empty(0x100) || !empty(0x200) {
+        fatal(48, "pending user arm");
+    }
+    PHASE.store(policy::RUNNING, Ordering::Release);
+    write(LVT, MASK | VECTOR);
+    write(DIVIDE, 3);
+    write(INITIAL, initial);
+    write(LVT, VECTOR);
+    if read(LVT) != VECTOR || read(INITIAL) != initial || read(DIVIDE) != 3 {
+        fatal(48, "user timer readback");
+    }
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn stop_user() {
+    write(LVT, MASK | VECTOR);
+    write(INITIAL, 0);
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn acknowledge_user(vector: u64) -> u64 {
+    if vector > 255 || MODE.load(Ordering::Acquire) == 0 || flags() & 0x200 != 0 {
+        fatal(vector, "user controller state");
+    }
+    let before = TICKS.load(Ordering::Relaxed);
+    let event = policy::event(
+        PHASE.load(Ordering::Acquire),
+        before,
+        vector as u8,
+        bitmap(0x100, vector as u8),
+    )
+    .unwrap_or_else(|_| fatal(vector, "unexpected or non-hardware event"));
+    if !event.eoi {
+        return 0;
+    }
+    if event.ticks > MAX_EVENTS as u64 {
+        fatal(vector, "user event overflow");
+    }
+    stop_user();
+    write(0xb0, 0);
+    if bitmap(0x100, vector as u8) {
+        fatal(vector, "user EOI did not clear ISR");
+    }
+    TICKS.store(event.ticks, Ordering::Release);
+    EOIS.fetch_add(1, Ordering::Relaxed);
+    USER_EVENTS.fetch_add(1, Ordering::Relaxed);
+    event.ticks
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn reject_user(vector: u64, reason: &str) -> ! {
+    fatal(vector, reason)
+}
+#[cfg(feature = "preempt-test")]
+pub(super) fn shutdown_user(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+    if flags() & 0x200 != 0 || paging::current_root() != ROOT.load(Ordering::Acquire) {
+        return Err("user shutdown flags/root");
+    }
+    stop_user();
+    PHASE.store(policy::DRAINING, Ordering::Release);
+    window(policy::DRAIN_TICKS)?;
+    PHASE.store(0, Ordering::Release);
+    if !empty(0x100)
+        || !empty(0x200)
+        || TICKS.load(Ordering::Relaxed) != EOIS.load(Ordering::Relaxed)
+    {
+        return Err("user clock not drained");
+    }
+    let total = TICKS.load(Ordering::Acquire);
+    pit_start(policy::DRAIN_TICKS)?;
+    pit_wait()?;
+    pit_stop();
+    if TICKS.load(Ordering::Acquire) != total || BUSY.load(Ordering::Relaxed) {
+        return Err("user clock not stable");
+    }
+    write(0x80, 0xff);
+    write(0xf0, 0xff);
+    if read(LVT) != MASK | VECTOR
+        || read(INITIAL) != 0
+        || read(CURRENT) != 0
+        || read(0xf0) != 0xff
+        || read(0x80) != 0xff
+    {
+        return Err("user clock shutdown readback");
+    }
+    let mode = MODE.swap(0, Ordering::AcqRel);
+    if mode == Mode::Xapic as u8 {
+        paging.unmap_lapic().map_err(|_| "user APIC unmap")?;
+    }
+    serial::write(format_args!("[NEU] Preempt timer stopped: ticks={} eois={} user={} drain={} ISR=0 IRR=0 initial=0 current=0 SVR=disabled IF=0\n",total,EOIS.load(Ordering::Relaxed),USER_EVENTS.load(Ordering::Relaxed),total-USER_EVENTS.load(Ordering::Relaxed))).map_err(|_|"user timer serial")?;
+    Ok(())
+}
+
+#[cfg(feature = "preempt-test")]
+pub(super) fn user_in_service(vector: u8) -> bool {
+    bitmap(0x100, vector)
 }

@@ -59,7 +59,22 @@ const _: () = assert!(
         + cfg!(feature = "test-switch-stack-guard") as u8
         + cfg!(feature = "test-switch-invalid-context") as u8
         + cfg!(feature = "test-switch-rollback") as u8
-        + cfg!(feature = "test-switch-stale") as u8)
+        + cfg!(feature = "test-switch-stale") as u8
+        + cfg!(feature = "test-preempt") as u8
+        + cfg!(feature = "test-preempt-xapic") as u8
+        + cfg!(feature = "test-preempt-a-fault") as u8
+        + cfg!(feature = "test-preempt-b-fault") as u8
+        + cfg!(feature = "test-preempt-cross") as u8
+        + cfg!(feature = "test-preempt-native") as u8
+        + cfg!(feature = "test-preempt-invalid-context") as u8
+        + cfg!(feature = "test-preempt-stack-mismatch") as u8
+        + cfg!(feature = "test-preempt-handoff") as u8
+        + cfg!(feature = "test-preempt-stale") as u8
+        + cfg!(feature = "test-preempt-unsafe") as u8
+        + cfg!(feature = "test-preempt-unexpected") as u8
+        + cfg!(feature = "test-preempt-software") as u8
+        + cfg!(feature = "test-preempt-origin") as u8
+        + cfg!(feature = "test-preempt-fpu") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -217,9 +232,14 @@ extern "C" fn neu_main() -> ! {
         fail(reason);
     }
 
-    #[cfg(feature = "switch-test")]
+    #[cfg(all(feature = "switch-test", not(feature = "preempt-test")))]
     if let Err(error) = arch::cooperative::run(&mut paging) {
         arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: switching {error:?}\n"));
+        arch::halt();
+    }
+    #[cfg(feature = "preempt-test")]
+    if let Err(error) = arch::preemptive::run(&mut paging) {
+        arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: preemption {error:?}\n"));
         arch::halt();
     }
     #[cfg(all(feature = "node-test", not(feature = "switch-test")))]

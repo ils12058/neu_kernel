@@ -160,3 +160,12 @@ Thread, MEM, EXEC, SEC, DIAG or TEST proposals in the architecture register.
   switches retain IF=0. Newly allocated stack tables are accessed only through
   the common kernel workspace; no sibling or stale user workspace aliases are
   added. The accepted protection-domain distinction and earlier tests remain.
+
+### 2026-10-26 — Phase 4C extension
+
+[ADR 0013](0013-single-cpu-user-preemption.md) admits IF=1 only for explicitly
+preemptible user contexts and captures real timer-origin frames through the
+common-stack boundary. Native kernel execution and resource/scheduler mutation
+remain IF=0. Earlier fixtures retain their original behavior; the accepted ABI,
+protection-domain and ownership directions remain unchanged. This extension does
+not add general kernel preemption, SMP or public object/scheduler interfaces.

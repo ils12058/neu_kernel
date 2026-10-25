@@ -131,3 +131,15 @@ ADR 0012 adds real yielded-context ownership, private guarded entry stacks,
 space-lifetime pins and FIFO Thread selection. ABI 0.1 remains unchanged; the
 private yield operation is test-only. Timer-driven userspace preemption is
 deferred to Phase 4C, and the full scheduling/capability proposals remain open.
+
+## Phase 4C record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0013: Single-CPU user preemption](0013-single-cpu-user-preemption.md) | Accepted, two bootstrap Threads, user-only preemption | NEU-005/006/008/011; NEU-018 ownership; NEU-020 bounded round robin; NEU-021/023/024 scoped safety/tests |
+
+ADR 0013 extends the historical Phase 4B boundary with real LAPIC IRQ capture,
+a single-use acknowledged handoff and IF=1 user execution. Earlier cooperative
+and kernel-timer profiles remain supported. General kernel preemption, SMP,
+multithreaded Nodes, public scheduling/object interfaces and the complete
+scheduling proposal remain outside its accepted scope.

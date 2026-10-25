@@ -51,6 +51,9 @@ NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","n
 TIMER_CASES = ("timer", "timer-xapic", "timer-repeat", "timer-spurious", "timer-unsupported", "timer-unexpected", "timer-software")
 TIMER_POSITIVE = TIMER_CASES[:4]
 SWITCH_CASES = {name:index for index,name in enumerate(("switch","switch-a-fault","switch-b-fault","switch-cross","switch-stack-user","switch-stack-guard","switch-invalid-context","switch-rollback","switch-stale"))}
+PREEMPT_CASES = ('preempt', 'preempt-xapic', 'preempt-a-fault', 'preempt-b-fault', 'preempt-cross', 'preempt-native', 'preempt-invalid-context', 'preempt-stack-mismatch', 'preempt-handoff', 'preempt-stale', 'preempt-unsafe', 'preempt-unexpected', 'preempt-software', 'preempt-origin', 'preempt-fpu')
+PREEMPT_NEGATIVE = ("preempt-unexpected","preempt-software","preempt-origin")
+FEATURES.update({name:"test-"+name for name in PREEMPT_CASES})
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -150,7 +153,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -167,7 +170,11 @@ def elf_info(path):
         if symbols["__user_kernel_top"] - symbols["__user_kernel_bottom"] != 32768 or any(symbols[n] & 4095 for n in ("__user_kernel_bottom", "__user_kernel_top", "__user_kernel_guard_low", "__user_kernel_guard_high")):
             raise Failure("Invalid user-transition kernel stack/guards.")
         prefix = "neu_native" if "neu_native_payload" in symbols else "neu_user"
-        if not 0 < symbols[prefix + "_payload_end"] - symbols[prefix + "_payload"] <= 4096:
+        # Terminal pre-entry Phase 4C negatives have no reachable user fixture;
+        # the linker removes those payload sections. Earlier image checks stay strict.
+        if symbols.get("neu_preempt_image")==1 and prefix+"_payload_end" not in symbols:
+            prefix=None
+        elif not 0 < symbols[prefix + "_payload_end"] - symbols[prefix + "_payload"] <= 4096:
             raise Failure("Invalid embedded user fixture bounds.")
         if prefix == "neu_native":
             if symbols["__native_emergency_top"] - symbols["__native_emergency_bottom"] != 16384:
@@ -187,6 +194,11 @@ def elf_info(path):
             segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
             if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+len(opcode)]!=opcode:
                 raise Failure("Cooperative transition is missing its actual architectural instruction.")
+    if "neu_preempt_payload" in symbols:
+        if not 0<symbols["neu_preempt_payload_end"]-symbols["neu_preempt_payload"]<=4096:raise Failure("Preemption payload exceeds its owned RX page.")
+        for name,opcode in (("neu_preempt_syscall_site",b"\x0f\x05"),("neu_context_iret",b"\x48\xcf")):
+            address=symbols[name];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
+            if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+len(opcode)]!=opcode:raise Failure("Missing preemption architectural transition instruction.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -583,6 +595,15 @@ for name,number in SWITCH_CASES.items():
         EXPECT["boot"][1]+["verified=false"])
 
 
+for name in PREEMPT_CASES:
+    tail=["[NEU] Preempt two runnable:","[NEU] Preempt selected:","[NEU] Preempt timer stopped:","[NEU] Preempt accounting restored:","[NEU] Preemption test passed:","[NEU] Kernel bootstrap successful","[NEU] Idle: interrupts disabled; halting"]
+    if name in PREEMPT_NEGATIVE:
+        vector=65 if name=="preempt-unexpected" else 48
+        tail=["[NEU] Interrupt failure: vector="+str(vector)]
+    EXPECT[name]=(COMMON+PROTOCOL+OWNED+PAGING+["[NEU] Preempt baseline:","[NEU] Timer controller verified:","[NEU] Timer calibrated:"]+tail,
+                  ["BOOT FAILURE:","PANIC:","EXCEPTION:","Cooperative switch test passed:"]+([] if name in PREEMPT_NEGATIVE else ["Interrupt failure:"]))
+
+
 def switch_site(symbols,name):
     return USER_CODE+symbols[name]-symbols["neu_switch_payload"]
 
@@ -788,6 +809,200 @@ def check_switch(case,text,symbols,observations,kernel_root,qmp):
     for symbol in ("neu_native_busy","neu_native_selected_top","neu_native_saved_user_rsp","neu_user_saved_rsp"):
         if debug_words(qmp,symbols[symbol],1)[0]!=0:raise Failure("Stale entry/continuation storage survived final cleanup.")
     return {"case":number,"threads":records,"order":[[label,phase] for label,phase,_ in expected],"contexts":frames,"outcomes":outcomes,"observations":observations,"accounting":[int(v) for v in restored.groups()]}
+
+
+def preempt_site(symbols,name):
+    return USER_CODE+symbols[name]-symbols['neu_preempt_payload']
+
+
+def logged_frames(text,event):
+    pattern=r"Switch frame: event="+re.escape(event)+r" thread=(\d+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) flags=(0x[0-9a-f]+) regs=([^\n]+)\n"
+    result=[]
+    for m in re.finditer(pattern,text):
+        thread,rip,rsp,flags=[int(v,0) for v in m.groups()[:4]]
+        regs=[int(v,0) for v in m[5].split(',')]
+        if len(regs)!=15:raise Failure('Incomplete saved integer context.')
+        result.append((thread,regs+[rip,0x3b,flags,rsp,0x33]))
+    return result
+
+
+def observe_preempt(qmp,serial,symbols,start,sequence,label,root,bottom,top,deadline):
+    result={'sequence':sequence,'label':label,'root':root,'bottom':bottom,'top':top}
+    seed=35 if label==1 else 77
+    six=[0x1122334455667788,0x2233445566778899,0x33445566778899aa,0x445566778899aabb,0x5566778899aabbcc,0x66778899aabbccdd]
+    markers=[v^seed for v in (0x11225566778899aa,0xaabbccddeeff1234,0x1234567887654321)]
+    while time.monotonic()<deadline:
+        if 'Switch common restored:' in transcript(serial)[start:]:break
+        qmp.call('stop')
+        try:
+            cpu=qmp.call('human-monitor-command',{'command-line':'info registers'});reg=lambda key:native_register(cpu,key)
+            if reg('CR3')!=root:continue
+            rip=reg('RIP')
+            stage=None
+            if symbols['neu_preempt_restore_wait']<=rip<symbols['neu_preempt_restore_wait_end']:stage='restore'
+            elif 'CPL=3' in cpu and preempt_site(symbols,'neu_preempt_loop')<=rip<preempt_site(symbols,'neu_preempt_loop_end'):stage='user'
+            elif symbols['neu_preempt_irq_wait']<=rip<symbols['neu_preempt_irq_wait_end']:stage='irq'
+            if stage is None or stage in result:continue
+            if reg('CR0')&10!=10 or reg('CR4')&0x50600 or reg('EFER')&1!=1 or not re.search(r'FS =0000 0000000000000000',cpu) or not re.search(r'GS =0000 0000000000000000',cpu):
+                raise Failure('Preemption exposed unsupported CPU/TLS/extended state.')
+            tr=re.search(r'TR =0018 ([0-9a-fA-F]+)',cpu)
+            if not tr or debug_words(qmp,int(tr[1],16)+4,1)[0]!=top or debug_words(qmp,symbols['neu_native_selected_top'],1)[0]!=top:
+                raise Failure('Hardware TSS and selected entry stack disagree with the current Thread.')
+            common=debug_words(qmp,symbols['neu_user_saved_rsp'],1)[0]
+            if not symbols['__stack_bottom']<=common<symbols['__stack_top']:raise Failure('IRQ continuation lost its permanent common stack.')
+            record={'cpu':cpu,'tss_rsp0':top,'common_rsp':common}
+            if stage=='restore':
+                if 'CPL=0' not in cpu or reg('RSP')!=top-160 or reg('RFL')&0x600:raise Failure('Invalid non-preemptible restore boundary.')
+                record['frame']=debug_words(qmp,top-160,20)
+                walks={str(va):switch_walk(qmp,root,va) for va in (bottom-4096,bottom,bottom+4096,top)}
+                if any(walks[str(va)]['present'] for va in (bottom-4096,top)):raise Failure('Mapped private kernel stack guard.')
+                for va in (bottom,bottom+4096):
+                    w=walks[str(va)]
+                    if not w['present'] or any(e&4 for e in w['entries']) or w['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2:raise Failure('Preempted Thread stack lacks supervisor RW/NX protection.')
+                record['stack_walks']=walks
+                if 'x2APIC=false' in transcript(serial):
+                    device=switch_walk(qmp,root,0xffffb00000000000)
+                    if not device['present'] or any(e&4 for e in device['entries']) or device['entries'][-1]&((1<<63)|0x9f)!=(1<<63)|0x1b or device['physical']!=0xfee00000:
+                        raise Failure('Private xAPIC mapping is not supervisor UC RW/NX.')
+                    record['device_walk']=device
+            elif stage=='user':
+                if reg('CS')!=0x3b or reg('SS')!=0x33 or not reg('RFL')&0x200 or reg('RFL')&~0x10ad7:
+                    raise Failure('Preemptible user execution has wrong privilege or unsafe flags.')
+                if [reg(k) for k in ('RBX','RBP','R12','R13','R14','R15')]!=[v^seed for v in six]:raise Failure('Preempted user callee registers were corrupted.')
+                if debug_words(qmp,USER_RSP-24,3)!=markers:raise Failure('Preemption lost persistent private user-stack witnesses.')
+                words=debug_words(qmp,0x402000,4)
+                if words[0]==0 or words[1]!=1 or words[2]!=markers[0]:raise Failure('Thread restarted or failed to make independent CPU progress.')
+                record.update(words=words,markers=markers)
+            else:
+                if 'CPL=0' not in cpu or reg('CS')!=8 or reg('SS')!=0 or reg('RSP')!=top-176 or reg('RFL')&0x600:
+                    raise Failure('Hardware user IRQ did not select the trusted private stack:\n'+cpu)
+                frame=debug_words(qmp,top-176,22)
+                if frame[15:17]!=[48,0] or frame[18]!=0x3b or frame[21]!=0x33 or frame[19]&0x202!=0x202 or frame[19]&~0x10ad7:
+                    raise Failure('Hardware IRQ frame lost vector/origin/flags/stack.')
+                if not USER_CODE<=frame[17]<preempt_site(symbols,'neu_preempt_payload_end') or not 0x404000<=frame[20]<0x405000:
+                    raise Failure('Actual interrupted RIP/RSP is outside owned code/stack.')
+                lapic=qmp.call('human-monitor-command',{'command-line':'info lapic'})
+                if not re.search(r'LVTT\s+0x00000030',lapic) or not re.search(r'ISR\s+48\b',lapic) or 'APIC enabled' not in lapic or 'TPR 0x00' not in lapic:
+                    raise Failure('IRQ capture lacks independent unmasked LAPIC/in-service vector 48 evidence:\n'+lapic)
+                if debug_words(qmp,symbols['neu_native_busy'],1)[0]!=0:raise Failure('Timer interrupted an unfinished native kernel entry.')
+                record.update(frame=frame,lapic=lapic,markers=debug_words(qmp,USER_RSP-24,3))
+                if record['markers']!=markers:raise Failure('IRQ selected another Thread user stack.')
+            result[stage]=record
+            if all(key in result for key in ('restore','user','irq')):return result
+        finally:
+            qmp.call('cont')
+        time.sleep(0.001)
+    else:raise Failure('Timed out observing a preemption slice.')
+    if 'restore' not in result:raise Failure('Missing actual restore-frame observation.')
+    return result
+
+
+def check_preempt_loop_registers(case,frame,seed,symbols):
+    if case=='preempt-native' or not preempt_site(symbols,'neu_preempt_loop')<=frame[15]<preempt_site(symbols,'neu_preempt_loop_end'):return
+    # All fourteen other GPRs are invariant in the ordinary CPU-bound loop.
+    # Checking actual IRQ frames after resumption detects a wrong POP order even
+    # when the copied privileged restore-frame bytes themselves were correct.
+    expected=[0x66778899aabbccdd^seed,0x5566778899aabbcc^seed,0x445566778899aabb^seed,0x33445566778899aa^seed,
+              0xaabbccddeeff0011,44,66,55,11,22,0x2233445566778899^seed,0x778899aabbccddee,0x401000,0x1122334455667788^seed]
+    if frame[:14]!=expected or frame[14]==0:raise Failure('An ordinary interrupted/resumed loop lost a supported integer register.')
+
+
+def check_preempt(case,text,symbols,observations,kernel_root,qmp):
+    final_lapic=qmp.call('human-monitor-command',{'command-line':'info lapic'})
+    calibrated=re.search(r'Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=10000',text)
+    if not calibrated:raise Failure('Missing provisional 10 ms reference calibration.')
+    hz,ref,a,b,c,divided,initial=map(int,calibrated.groups())
+    if hz!=1193182 or ref!=11932 or divided!=sorted((a,b,c))[1]*hz//ref or initial!=(divided*10000+500000)//1000000 or max(a,b,c)-min(a,b,c)>sorted((a,b,c))[1]//4:raise Failure('Invalid measured clockevent calibration.')
+    if case in PREEMPT_NEGATIVE:
+        vector=65 if case=='preempt-unexpected' else 48
+        reason='unsupported kernel origin' if case=='preempt-origin' else 'unexpected or non-hardware event'
+        if f'Interrupt failure: vector={vector} reason={reason} ticks=0 eois=0 IF=0' not in text or 'Preempt selected:' in text or 'Preemption test passed:' in text:
+            raise Failure('Preemption negative was not rejected at the intended invariant.')
+        if not re.search(r'LVTT\s+0x00010030.*masked',final_lapic) or 'TPR 0xff' not in final_lapic or not re.search(r'initial_count = 0 current_count = 0',final_lapic):raise Failure('Fatal IRQ rejection did not mask/stop the source.')
+        if case=='preempt-origin':
+            if not re.search(r'ISR\s+48\b',final_lapic):raise Failure('Unsupported-origin test did not use a real hardware event.')
+        elif not re.search(r'ISR\s+\(none\)',final_lapic):raise Failure('Software negative unexpectedly acknowledged a real IRQ.')
+        return {'expected_rejection':reason,'vector':vector,'final_lapic':final_lapic}
+    ready=re.findall(r'Switch Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) pa0=(0x[0-9a-f]+) pa1=(0x[0-9a-f]+) code_pa=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_stack_pa=(0x[0-9a-f]+) seed=(\d+)',text)
+    if len(ready)!=2:raise Failure('Missing two independently owned initial Threads.')
+    threads={int(v[0]):dict(zip(('label','node','thread','space','root','bottom','top','pa0','pa1','code','data','user_stack','seed'),map(lambda x:int(x,0),v))) for v in ready}
+    if set(threads)!={1,2} or any(threads[1][k]==threads[2][k] for k in ('node','thread','space','root','bottom','top')):raise Failure('Preemptible Threads share identity or address space.')
+    if {threads[1][k] for k in ('pa0','pa1','code','data','user_stack')} & {threads[2][k] for k in ('pa0','pa1','code','data','user_stack')}:raise Failure('Cross-Node backing aliases.')
+    selected=list(re.finditer(r'Preempt selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false) peer=(true|false)\n',text))
+    fifo=[1,2];saved={};counts={1:0,2:0};work={1:0,2:0};outcomes={};events=[];order=[];user_samples=[]
+    for i,m in enumerate(selected):
+        seq,label,node,thread,space,root=map(lambda x:int(x,0),m.groups()[:6]);record=threads[label]
+        if seq!=i+1 or not fifo or fifo.pop(0)!=label or tuple((node,thread,space,root))!=tuple(record[k] for k in ('node','thread','space','root')) or (m[8]=='true')!=bool(fifo):raise Failure('Preemption departed from single-Running FIFO ownership.')
+        order.append(label);episode=text[m.end():selected[i+1].start() if i+1<len(selected) else len(text)]
+        taken=logged_frames(episode,'preempt-taken')
+        if len(taken)!=1 or taken[0][0]!=thread:raise Failure('Missing unique consumed saved context.')
+        frame=taken[0][1]
+        if label in saved:
+            if frame!=saved[label] or m[7]!='false':raise Failure('A preempted Thread restarted or changed its full saved context.')
+        elif m[7]!='true' or frame!=[0]*15+[USER_CODE,0x3b,0x202,USER_RSP,0x33]:raise Failure('Invalid initial preemptible context.')
+        rejected=re.search(r'Preempt rejected before entry: kind=(\d+) thread=(\d+) root=(0x[0-9a-f]+) IF=0',episode)
+        if rejected:
+            kind={'preempt-invalid-context':1,'preempt-stack-mismatch':2,'preempt-unsafe':3}.get(case)
+            if not kind or int(rejected[1])!=kind or int(rejected[2])!=thread or int(rejected[3],16)!=kernel_root or seq in observations or 'Switch native ready:' in episode:raise Failure('Invalid saved publication reached user/native activation.')
+        else:
+            if seq not in observations or observations[seq]['restore']['frame']!=frame:raise Failure('Actual privileged restore frame differs from the owned saved context.')
+            obs=observations[seq]
+            if 'user' in obs:user_samples.append((label,seq,obs['user']['words'][0]))
+            if 'irq' in obs:
+                raw=obs['irq']['frame'];actual=raw[:15]+raw[17:]
+                logged=logged_frames(episode,'irq')
+                if (thread,actual) not in logged:raise Failure('QMP hardware frame was not the actual saved IRQ context.')
+        irq_matches=list(re.finditer(r'Preempt IRQ: tick=(\d+) sequence=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) flags=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) handler=(0x[0-9a-f]+) vector=48 ISR_before=1 ISR_after=0 switch=(true|false)\n',episode))
+        irq_frames=logged_frames(episode,'irq')
+        if len(irq_frames)!=len(irq_matches):raise Failure('IRQ count and integer-context trace differ.')
+        for irq,(owner,words) in zip(irq_matches,irq_frames):
+            tick,sequence,n,t,s,r,rip,rsp,flags,cs,ss,handler=map(lambda x:int(x,0),irq.groups()[:-1]);switch=irq[13]=='true'
+            if tick!=len(events)+1 or (sequence,n,t,s,r)!=(seq,node,thread,space,root) or cs!=0x3b or ss!=0x33 or flags&0x202!=0x202 or flags&~0x10ad7 or not record['bottom']<=handler<record['top']-176 or switch!=bool(fifo) or owner!=thread or words[15:]!=[rip,cs,flags,rsp,ss]:raise Failure('IRQ ownership/origin/acknowledgment/frame mismatch.')
+            check_preempt_loop_registers(case,words,record['seed'],symbols)
+            events.append({'tick':tick,'sequence':seq,'label':label,'frame':words,'switched':switch})
+        yielded=logged_frames(episode,'preempt-saved')
+        if yielded:
+            if len(yielded)!=1 or not irq_matches or not fifo or yielded[0]!=(thread,irq_frames[-1][1]):raise Failure('Timer handoff did not save the true last interrupt frame.')
+            if seq not in observations or 'irq' not in observations[seq]:raise Failure('A scheduling handoff lacks independent hardware IRQ evidence.')
+            saved[label]=yielded[0][1];counts[label]+=1;fifo.append(label)
+            progress=re.search(r'Preempt progress: label=(\d+) preemptions=(\d+) work=(\d+) boots=1 queue=(\d+)',episode)
+            if not progress or tuple(map(int,(progress[1],progress[2],progress[4])))!=(label,counts[label],len(fifo)) or int(progress[3])<=work[label]:raise Failure('Non-yielding computation failed to progress independently.')
+            work[label]=int(progress[3])
+            if counts[label]<=4 and case!='preempt-native' and re.search(r'Native terminal:.*entries=[1-9]',episode):raise Failure('Cooperative/syscall work caused the purported non-yielding alternation.')
+        else:
+            outcome=re.search(r'Preempt outcome: label=(\d+) thread=(\d+) work=(\d+) boots=1 reason=(normal|fault) terminal_dispatch=rejected',episode)
+            if not outcome or int(outcome[1])!=label or int(outcome[2])!=thread or int(outcome[3])<work[label] or (not rejected and int(outcome[3])==work[label]):raise Failure('Missing current-Thread terminal outcome/progress.')
+            if f'Switch reclaimed: label={label} thread={thread} space={space} saved=false queued=false outcome=retained' not in episode:raise Failure('Terminated context still owns reclaimed resources.')
+            if fifo and 'Switch survivor retained:' not in episode:raise Failure('Healthy suspended context did not survive sibling teardown.')
+            expected_fault=(label==1 and case in ('preempt-a-fault','preempt-cross','preempt-invalid-context','preempt-stack-mismatch','preempt-unsafe','preempt-fpu')) or (label==2 and case=='preempt-b-fault')
+            if (outcome[4]=='fault')!=expected_fault:raise Failure('Wrong Node terminal disposition.')
+            if expected_fault and not rejected:
+                fault=re.search(r'Node user fault: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+)',episode)
+                vector,target,site=(14,0x406000,'neu_preempt_cross_site') if case=='preempt-cross' else (7,0,'neu_preempt_fpu_site') if case=='preempt-fpu' else (6,0,'neu_preempt_fault_site')
+                if not fault:raise Failure('Missing actual preempted user CPU fault.')
+                values=list(map(lambda x:int(x,0),fault.groups()))
+                if tuple(values[:7])!=(node,thread,space,root,vector,4 if vector==14 else 0,preempt_site(symbols,site)) or values[8:11]!=[0x3b,0x33,USER_RSP-24] or (vector==14 and values[7]!=target) or not record['bottom']<=values[12]<record['top']:raise Failure('Fault was fabricated or bound to the wrong preempted Node.')
+            if expected_fault and not rejected and not fifo:raise Failure('Fault test did not leave a healthy suspended sibling.')
+            outcomes[label]={'reason':outcome[4],'work':int(outcome[3])}
+    if fifo or set(outcomes)!={1,2} or order[:4]!=[1,2,1,2]:raise Failure('Missing repeated genuine A/B preemption or final empty FIFO.')
+    minimum=1 if case in ('preempt-invalid-context','preempt-stack-mismatch','preempt-unsafe') else 4
+    if min(counts.values())<minimum or any(sum(label==owner for owner,_,_ in user_samples)<(1 if minimum==1 and label==1 else 2) for label in (1,2)):raise Failure('Insufficient independently observed interrupted/resumed Ring 3 progress.')
+    if not any(not event['switched'] for event in events):raise Failure('Missing no-peer hardware return without a scheduler switch.')
+    if case=='preempt-handoff' and 'Preempt handoff negatives: duplicate=Busy wrong_owner=Identity original=retained' not in text:raise Failure('Missing duplicate/wrong-owner handoff rejection.')
+    if case=='preempt-stale' and 'Switch stale identity rejected:' not in text:raise Failure('Missing genuine reused-generation rejection.')
+    stopped=re.search(r'Preempt timer stopped: ticks=(\d+) eois=(\d+) user=(\d+) drain=(\d+) ISR=0 IRR=0 initial=0 current=0 SVR=disabled IF=0',text)
+    done=re.search(r'Preemption test passed: dispatches=(\d+) captures=(\d+) queue=empty running=none IF=0',text)
+    baseline=re.search(r'Preempt baseline: allocated=(\d+) free=(\d+) tables=(\d+) root=(0x[0-9a-f]+)',text)
+    restored=re.search(r'Preempt accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)',text)
+    if not stopped or not done or not baseline or not restored or baseline.groups()[:3]!=restored.groups() or int(baseline[4],16)!=kernel_root:raise Failure('Missing exact resource and timer cleanup.')
+    ticks,eois,user,drain=map(int,stopped.groups())
+    if ticks!=eois or user!=len(events) or ticks!=user+drain or drain>1 or tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('Timer events, EOI and scheduler counts were conflated.')
+    if not re.search(r'LVTT\s+0x00010030.*masked',final_lapic) or 'APIC disabled' not in final_lapic or 'TPR 0xff' not in final_lapic or not re.search(r'ISR\s+\(none\)',final_lapic) or not re.search(r'IRR\s+\(none\)',final_lapic) or not re.search(r'initial_count = 0 current_count = 0',final_lapic):raise Failure('Timer did not stop and drain before final halt.')
+    for name in ('neu_native_busy','neu_native_selected_top','neu_native_saved_user_rsp','neu_user_saved_rsp'):
+        if debug_words(qmp,symbols[name],1)[0]!=0:raise Failure('Stale active native/current stack state at halt.')
+    if debug_words(qmp,symbols['neu_preempt_busy'],1)[0]&255:raise Failure('Stale IRQ handoff guard at halt.')
+    if int(re.search(r'EFER=([0-9a-fA-F]+)',qmp.call('human-monitor-command',{'command-line':'info registers'}))[1],16)&1:raise Failure('Preemption left native SCE enabled.')
+    return {'threads':threads,'order':order,'preemptions':counts,'events':events,'outcomes':outcomes,'user_samples':user_samples,'observations':observations,'calibration':{'samples':[a,b,c],'divided_hz':divided,'initial':initial},'ticks':ticks,'eois':eois,'drain_ticks':drain,'accounting':list(map(int,restored.groups())),'final_lapic':final_lapic}
 
 
 def native_register(registers, name):
@@ -1114,7 +1329,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case == "timer-xapic":
+        if case in ("timer-xapic","preempt-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -1129,6 +1344,7 @@ def run_case(case, esp, timeout):
                 node_observations = {}
                 timer_observations = {}
                 switch_observations = {}
+                preempt_observations = {}
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -1165,7 +1381,17 @@ def run_case(case, esp, timeout):
                                 number=SWITCH_CASES[case]
                                 faulted=phase==1 and ((label==1 and number in (1,3,4,5)) or (label==2 and number==2))
                                 switch_observations[sequence]=observe_switch(qmp,serial,symbols,selected.start(),sequence,label,phase,root,int(ready[2],16),int(ready[3],16),started+timeout,faulted)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES else 0.05)
+                    if case in PREEMPT_CASES and case not in PREEMPT_NEGATIVE:
+                        current=transcript(serial)
+                        runs=list(re.finditer(r"Preempt selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false) peer=(true|false)\n",current))
+                        for index,selected in enumerate(runs):
+                            sequence,label,_,_,_,root=map(lambda v:int(v,0),selected.groups()[:6])
+                            episode=current[selected.start():runs[index+1].start() if index+1<len(runs) else len(current)]
+                            ready=re.search(r"Switch native ready:.*stack_bottom=(0x[0-9a-f]+) stack_top=(0x[0-9a-f]+).*fresh=(true|false)\n",episode)
+                            if sequence not in preempt_observations and ready:
+                                if qmp is None:qmp=QMP(endpoint,started+timeout)
+                                preempt_observations[sequence]=observe_preempt(qmp,serial,symbols,selected.start(),sequence,label,root,int(ready[1],16),int(ready[2],16),started+timeout)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -1214,10 +1440,11 @@ def run_case(case, esp, timeout):
                     raise Failure("User teardown did not restore the original kernel root.")
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
+                preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(timer=timer,switching=switching)
+                result.update(timer=timer,switching=switching,preemption=preemption)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result

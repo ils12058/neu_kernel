@@ -39,6 +39,16 @@ neu_enter_context:
     mov ecx, 20
     rep movsq # supervisor source and destination; never a user pointer
     lea rsp, [r13 - 160]
+.if {preemptive}
+    # Test observation occurs before arming, with the immutable user frame intact.
+    mov ecx, 0x04000000
+.global neu_preempt_restore_wait, neu_preempt_restore_wait_end
+neu_preempt_restore_wait:
+    dec ecx
+    jne neu_preempt_restore_wait
+neu_preempt_restore_wait_end:
+    call neu_preempt_arm
+.endif
     mov ax, 0x33
     mov ds, ax
     mov es, ax
@@ -65,6 +75,14 @@ neu_resume_context:
     # This normal image stack is mapped under BOTH old and common roots.
     # Move RSP before the CR3 change in the original terminal bridge.
     mov rsp, [rip + neu_user_saved_rsp]
+.if {preemptive}
+    # A long-mode Ring 3 IRQ installs null SS. Re-establish the normal kernel
+    # segment contract before its common Rust continuation/drain window.
+    mov ax, 0x10
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+.endif
     # The private entry call chain is now abandoned; only here release its guard.
     mov qword ptr [rip + neu_native_busy], 0
     jmp neu_resume_kernel

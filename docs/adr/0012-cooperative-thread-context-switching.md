@@ -148,3 +148,12 @@ preemptive scheduling proposal.
 References: [Intel SDM](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf)
 (privilege transitions/TSS/IRET) and the [freestanding Rust target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html)
 (integer-only code generation, SysV without a red zone).
+
+### 2026-10-26 — Phase 4C extension
+
+[ADR 0013](0013-single-cpu-user-preemption.md) admits IF=1 only for explicitly
+preemptible user contexts and captures real timer-origin frames through the
+common-stack boundary. Native kernel execution and resource/scheduler mutation
+remain IF=0. Earlier fixtures retain their original behavior; the accepted ABI,
+protection-domain and ownership directions remain unchanged. This extension does
+not add general kernel preemption, SMP or public object/scheduler interfaces.

@@ -38,6 +38,8 @@ pub struct SavedContext {
     pub stack: StackBinding,
     pub frame: Frame,
     pub fresh: bool,
+    pub preemptible: bool,
+    pub interrupted: bool,
 }
 impl SavedContext {
     pub fn initial(active: ActiveContext, stack: StackBinding) -> Self {
@@ -45,6 +47,8 @@ impl SavedContext {
             active,
             stack,
             fresh: true,
+            preemptible: false,
+            interrupted: false,
             frame: Frame {
                 registers: abi::Registers::default(),
                 context: ReturnContext {
@@ -63,6 +67,24 @@ impl SavedContext {
             stack,
             frame,
             fresh: false,
+            preemptible: false,
+            interrupted: false,
+        }
+    }
+    pub fn initial_preemptible(active: ActiveContext, stack: StackBinding) -> Self {
+        let mut saved = Self::initial(active, stack);
+        saved.preemptible = true;
+        saved.frame.context.flags |= 0x200;
+        saved
+    }
+    pub fn interrupted(active: ActiveContext, stack: StackBinding, frame: Frame) -> Self {
+        Self {
+            active,
+            stack,
+            frame,
+            fresh: false,
+            preemptible: true,
+            interrupted: true,
         }
     }
     pub fn valid(self, active: ActiveContext, stack: StackBinding) -> bool {
@@ -90,7 +112,14 @@ impl SavedContext {
             || c.rsp & 7 != 0
             || c.cs != abi::USER_CS
             || c.ss != abi::USER_SS
-            || c.flags & !abi::USER_FLAGS != 0
+            || (self.fresh && self.interrupted)
+            || (self.interrupted && !self.preemptible)
+            || (c.flags & 0x200 != 0) != self.preemptible
+            || c.flags
+                & !(abi::USER_FLAGS
+                    | if self.preemptible { 0x200 } else { 0 }
+                    | if self.interrupted { 1 << 16 } else { 0 })
+                != 0
             || c.flags & 2 == 0
         {
             return false;
@@ -99,6 +128,8 @@ impl SavedContext {
             c.rip == initial.entry
                 && c.rsp == initial.rsp
                 && self.frame.registers == abi::Registers::default()
+        } else if self.interrupted {
+            true // Hardware IRQs do not clobber or synthesize any GPR.
         } else {
             self.frame.registers.rcx == c.rip
                 && self.frame.registers.r11 == c.flags
@@ -115,6 +146,7 @@ pub struct Dispatch {
 #[derive(Clone, Copy, Debug)]
 pub enum SliceEvent {
     Yield(Frame),
+    Preempted(Frame),
     Exited(crate::node::ExitReason),
 }
 const _: () = assert!(core::mem::size_of::<Frame>() == 160);
