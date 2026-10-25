@@ -1,17 +1,17 @@
 //! One isolated, test-only Ring 3 execution. All user addresses remain scalars;
 //! the boundary never dereferences a user-supplied pointer or resumes its frame.
-use super::{
-    exceptions,
-    paging::{self, Paging},
-    serial,
-};
+#[cfg(not(feature = "native-test"))]
+use super::paging::Paging;
+use super::{exceptions, paging, serial};
 use core::{
     arch::{asm, global_asm},
     cell::UnsafeCell,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
-use neu_kernel::paging::{Error, PAGE, Result, USER_BASE};
+#[cfg(not(feature = "native-test"))]
+use neu_kernel::paging::{Error, Result};
+use neu_kernel::paging::{PAGE, USER_BASE};
 
 global_asm!(include_str!("userspace.S"));
 pub const CODE: u64 = USER_BASE;
@@ -21,22 +21,31 @@ pub const GUARD: u64 = CODE + 3 * PAGE;
 pub const STACK: u64 = CODE + 4 * PAGE;
 pub const USER_RSP: u64 = STACK + PAGE - 8;
 pub const UNMAPPED: u64 = CODE + 6 * PAGE;
-pub const USER_CS: u64 = 0x3b;
-pub const USER_SS: u64 = 0x33;
+pub use neu_kernel::syscall::{USER_CS, USER_SS};
 unsafe extern "C" {
+    #[cfg(not(feature = "native-test"))]
     static neu_user_payload: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_payload_end: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_done_resume: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_kernel_site: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_readonly_site: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_unmapped_site: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_privileged_site: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_gate_site: u8;
+    #[cfg(not(feature = "native-test"))]
     static neu_user_guard_site: u8;
     static __user_kernel_bottom: u8;
     static __user_kernel_top: u8;
     static __user_kernel_guard_low: u8;
     static __user_kernel_guard_high: u8;
+    #[cfg(not(feature = "native-test"))]
     fn neu_enter_user(rip: u64, rsp: u64, kernel_root: u64);
     fn neu_resume_kernel() -> !;
 }
@@ -89,9 +98,11 @@ struct UserRecord {
 #[unsafe(no_mangle)]
 static NEU_USER_RECORD: Cell<Option<UserRecord>> = Cell(UnsafeCell::new(None));
 
+#[cfg(not(feature = "native-test"))]
 fn site(symbol: *const u8) -> u64 {
     CODE + symbol as u64 - ptr::addr_of!(neu_user_payload) as u64
 }
+#[cfg(not(feature = "native-test"))]
 fn contract(kind: u64, root: u64) -> Contract {
     let (vector, error, rip, cr2) = match kind {
         0 => (128, 0, site(ptr::addr_of!(neu_user_done_resume)), 0),
@@ -191,6 +202,7 @@ pub(super) fn boundary(frame: exceptions::ExceptionFrame, cr2: u64, handler_rsp:
     unsafe { neu_resume_kernel() }
 }
 
+#[cfg(not(feature = "native-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let kind = if cfg!(feature = "test-user-kernel") {
         1
@@ -276,4 +288,20 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     ))
     .map_err(|_| Error::Corrupt)?;
     Ok(())
+}
+
+#[cfg(feature = "native-test")]
+pub fn enter_native(root: u64) {
+    unsafe extern "C" {
+        fn neu_enter_native(rip: u64, rsp: u64, kernel_root: u64);
+    }
+    // SAFETY: Native run validated MSRs, private root, RSP0 and fixture lifetime.
+    unsafe {
+        neu_enter_native(CODE, USER_RSP, root);
+    }
+}
+#[cfg(feature = "native-test")]
+pub fn resume_native() -> ! {
+    // SAFETY: Called only by the active native session; it owns this continuation.
+    unsafe { neu_resume_kernel() }
 }

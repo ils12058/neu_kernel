@@ -29,7 +29,15 @@ const _: () = assert!(
         + cfg!(feature = "test-user-unmapped") as u8
         + cfg!(feature = "test-user-privileged") as u8
         + cfg!(feature = "test-user-gate") as u8
-        + cfg!(feature = "test-user-guard") as u8)
+        + cfg!(feature = "test-user-guard") as u8
+        + cfg!(feature = "test-native") as u8
+        + cfg!(feature = "test-native-unknown") as u8
+        + cfg!(feature = "test-native-exit-invalid") as u8
+        + cfg!(feature = "test-native-return-rip") as u8
+        + cfg!(feature = "test-native-return-rsp") as u8
+        + cfg!(feature = "test-native-return-flags") as u8
+        + cfg!(feature = "test-native-return-selectors") as u8
+        + cfg!(feature = "test-native-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -182,7 +190,14 @@ extern "C" fn neu_main() -> ! {
         );
     }
 
-    #[cfg(feature = "user-test")]
+    #[cfg(feature = "native-test")]
+    if let Err(error) = arch::native::run(&mut paging) {
+        arch::serial::emergency(format_args!(
+            "[NEU] BOOT FAILURE: native execution {error:?}\n"
+        ));
+        arch::halt();
+    }
+    #[cfg(all(feature = "user-test", not(feature = "native-test")))]
     if let Err(error) = arch::userspace::run(&mut paging) {
         arch::serial::emergency(format_args!(
             "[NEU] BOOT FAILURE: user execution {error:?}\n"

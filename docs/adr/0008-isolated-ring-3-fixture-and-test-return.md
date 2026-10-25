@@ -11,6 +11,9 @@
   [Section 15](../Neu_Kernel_Architecture_v0.2.md#15-detailed-physical-and-virtual-memory--neu-mem-001),
   and [Section 18](../Neu_Kernel_Architecture_v0.2.md#18-threat-model-and-security-boundaries--neu-sec-001).
 
+[ADR 0009](0009-experimental-native-syscall-and-trusted-return.md) adds the separate
+Phase 2B native configuration. The original test gate and rationale below remain.
+
 ## Context
 
 Phase 1B owns the active kernel root and enforces supervisor mappings. Real user
@@ -118,6 +121,11 @@ halt under the original kernel root. Missing the observation is a failure.
   origin classification and test completion. Actual commands, results and limits
   are in [implementation status](../IMPLEMENTATION_STATUS.md). Architecture v0.2
   and the native syscall/startup proposals remain unchanged.
+
+- **2026-10-25, Phase 2B:** ADR 0009 enables owned native MSR configuration only
+  in native test images, using the existing guarded stack with explicit software
+  switching. Phase 2A still disables SCE and retains its original `int 0x80`
+  cases. No native operation is retroactively attributed to this Phase 2A record.
 
 Reference: [Intel SDM, Volume 3A](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf),
 U/S paging permissions, long-mode interrupt/IRET frames, TSS.RSP0 and CR0.MP/TS.

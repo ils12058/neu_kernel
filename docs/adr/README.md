@@ -88,3 +88,13 @@ ADR 0008 extends 0006/0007 with private user tables, a separate RSP0 stack and
 hardware-observed execution. Its `int 0x80` gate is test-only. The Node lifecycle,
 startup descriptor, native syscall and full execution specifications remain
 proposals; Phase 2B requires a separate concrete ABI decision.
+
+## Phase 2B record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0009: Experimental native syscall and trusted return](0009-experimental-native-syscall-and-trusted-return.md) | Accepted, experimental fixture ABI | NEU-008 initial subset; NEU-017 bootstrap execution; NEU-021 boundary; NEU-023 containment; NEU-024 local tests |
+
+ADR 0009 adds real SYSCALL entry and validated IRETQ return. ADR 0008's test-only
+interrupt gate remains an independent regression path. Operation numbers/statuses
+are provisional; this does not freeze the full Node, Thread or execution ABI.

@@ -3,6 +3,8 @@
 use core::arch::{asm, global_asm, x86_64::__cpuid};
 
 pub mod exceptions;
+#[cfg(feature = "native-test")]
+pub mod native;
 pub mod paging;
 pub mod serial;
 #[cfg(feature = "user-test")]

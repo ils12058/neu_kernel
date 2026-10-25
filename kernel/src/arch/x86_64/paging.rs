@@ -41,6 +41,10 @@ pub fn guards() -> [u64; 4] {
     ]
 }
 fn image_guard(address: u64) -> bool {
+    #[cfg(feature = "native-test")]
+    if super::native::guards().contains(&address) {
+        return true;
+    }
     #[cfg(feature = "user-test")]
     if super::userspace::kernel_guards().contains(&address) {
         return true;

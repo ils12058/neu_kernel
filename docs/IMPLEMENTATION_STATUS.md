@@ -1,56 +1,48 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-25. **Milestone:** K2 / Phase 2A, user address space and first
-Ring 3 execution. **Result:** complete against the supplied Phase 2A criteria in
-the documented single-CPU QEMU environment. All original 19 host tests and 18
-QEMU scenarios still pass; the complete suite now has **23 host tests and 26
-QEMU scenarios**. No full Node, native syscall ABI, scheduler or ELF loader is
-implemented by this execution fixture.
+**Verified:** 2026-10-25. **Milestone:** K2 / Phase 2B, native x86-64 SYSCALL and
+first Neu scalar ABI. **Result:** complete against the supplied Phase 2B criteria
+in the documented single-CPU QEMU environment. All original **23 host tests and
+26 QEMU scenarios** remain passing. The current suite has **32 host tests and
+34 QEMU scenarios**. This is a bootstrap-fixture ABI proof, not complete Node or
+Thread lifecycle management or a stable public ABI.
 
-The starting tree was clean on `main` at
-[`c9b388d`](https://github.com/ils12058/neu_kernel/commit/c9b388d92879ff22c99b79b718fe1cd25d45cc09).
-Its Phase 1B status remains historical there. The 19/18 baseline suite was rerun
-successfully before changes (`build/phase2a-baseline.log`). Architecture v0.2,
-Rust/target and the loader pin are unchanged. Current results are local;
+The inspected tree was clean on `main` at
+[`4b6887c`](https://github.com/ils12058/neu_kernel/commit/4b6887c2fb1a6b4eb288672d5e8028ed2f54b141).
+The original 23/26 suite was rerun before implementation, recorded in
+`build/phase2b-baseline.log`. Historical Phase 2A status remains at that commit.
+Architecture v0.2, Rust/target and Limine are unchanged. Current tests are local;
 physical hardware and hosted CI have not been validated.
 
-## Implemented foundation and changed files
-
-The freestanding dependency-free kernel retains its sparse 4 KiB physical-frame
-allocator, copied boot descriptors, image reservation, owned kernel root,
-controlled mappings, W^X/zeroing, GDT/TSS/IDT, normal/#DF stacks and bounded serial
-panic/fault diagnostics. The kernel root initially retains seven pinned tables.
-Ordinary builds keep the supervisor bootstrap/halt behavior. Ring 3 execution
-and its DPL=3 gate are enabled only by explicit `test-user*` configurations.
+## Created and modified files
 
 Created:
 
-- `kernel/src/arch/x86_64/userspace.rs`: fixture contract, origin/result checks,
-  trusted continuation and ownership/cleanup sequencing.
-- `kernel/src/arch/x86_64/userspace.S`: embedded independent payload, `IRETQ`
-  bridge, kernel continuation, and dedicated guarded privilege-entry stack.
-- `docs/adr/0008-isolated-ring-3-fixture-and-test-return.md`: scoped rationale.
+- `kernel/src/syscall.rs`: central experimental numbers/status/version, scalar
+  dispatch, assembly frame/register layout, return/MSR validation and nine tests.
+- `kernel/src/arch/x86_64/native.rs`: owned MSR configuration, native session,
+  trusted dispatch/return/terminal checks, diagnostics and fixture cleanup.
+- `kernel/src/arch/x86_64/native.S`: stack-independent entry, saved frame,
+  validated IRETQ return, emergency stack and independent user payload.
+- `docs/adr/0009-experimental-native-syscall-and-trusted-return.md`: rationale.
 
 Modified:
 
-- `kernel/src/paging/mod.rs` and `kernel/src/paging/tests.rs`: lower-half policy,
-  deliberate user entry encoding, unchanged supervisor checks, global backing
-  alias/reference policy, and four additional host tests.
-- `kernel/src/arch/x86_64/paging.rs`: private fixture root/tables, verification,
-  allocation rollback, deactivation and complete teardown.
-- `kernel/src/arch/x86_64/exceptions.rs` and `exceptions.S`: user descriptors,
-  test gate, RSP0 selection, safe segment/base state and origin routing.
-- `kernel/src/arch/x86_64/mod.rs`, `kernel/src/main.rs`, `kernel/Cargo.toml`:
-  isolated test configuration and sequencing.
-- `tools/neu.py`: eight user cases, fixture/stack ELF checks, direct CPL=3 QMP
-  observation and independent boundary/teardown checks.
-- `README.md`, this status, `docs/adr/README.md`, ADRs 0006/0007: current evidence
-  and dated extensions, retaining original rationale.
+- `kernel/src/arch/x86_64/userspace.rs` and `userspace.S`: retain the Phase 2A
+  path; add an explicit native bridge that preserves the selected SCE setting.
+- `kernel/src/arch/x86_64/exceptions.rs`: native RSP0/terminal IST2 configuration
+  and native user-fault classification; older fatal/#DF behavior remains.
+- `kernel/src/arch/x86_64/paging.rs`: preserve the additional emergency guards.
+- `kernel/src/main.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/mod.rs`,
+  `kernel/Cargo.toml`: module/test wiring and mutually exclusive configurations.
+- `tools/neu.py`: eight native cases, emitted SYSCALL-byte/stack checks, actual
+  three-phase QMP observations and independent ABI/return/cleanup verification.
+- `README.md`, this status, `docs/adr/README.md`, ADR 0008: current behavior,
+  evidence and a dated extension preserving the original test-gate rationale.
 
-No linker script, boot protocol, external dependency, production syscall,
-architecture baseline or host package was changed. The existing BSS wildcard
-collects the test-only assembly stack; its image reservation and guard mappings
-were revalidated with clean builds.
+No linker script, boot protocol, host package or external Rust dependency was
+changed. Existing BSS/linker collection includes the new guarded static stack;
+normal and native cold builds revalidated the resulting image layout.
 
 ## Tested environment and compatibility
 
@@ -70,7 +62,7 @@ During Phase 0 the named Rust toolchain initially lacked the freestanding target
 added using `rustup target add --toolchain 1.95.0 x86_64-unknown-none`. No Homebrew
 packages or system-wide firmware were installed for this milestone. Installed
 QEMU supplied compatible firmware. ISO utilities and mtools were absent and are
-not required by the selected boot workflow. Phase 2A adds no host packages,
+not required by the selected boot workflow. Phase 2B adds no host packages,
 nightly features, or third-party Rust dependencies.
 
 The firmware pair selected from the installed QEMU distribution was:
@@ -141,241 +133,260 @@ OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make run
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make test
 ```
 
-## User address space, ownership and permissions
+## Experimental Neu syscall contract
 
-The fixture receives a distinct allocator-owned PML4 and **private children at
-every level**, including the higher-half kernel image/workspace branches. No
-kernel child-table pointer is copied or borrowed. Both roots map the same
-permanently reserved kernel image backing supervisor-only: RX text, R/NX
-constants and RW/NX data/stacks. Kernel code is never executed from a user PTE.
-The serial interface is port I/O, not a user mapping; IOPL=0 and a TSS I/O-map
-base beyond its limit deny user port access.
+The central definition is `kernel/src/syscall.rs`; the native assembly fixture
+receives constants directly through Rust `global_asm!` operands. Absolute ELF
+symbols expose the emitted values to the host verifier. Numbers and version
+encoding remain **experimental**, without POSIX/Linux compatibility or a frozen
+wire layout.
 
-The existing table-owner ledger tracks each frame, level, parent references and
-pinned state. The original kernel root/image/workspace stay pinned. The fixture
-adds **10 privately owned table frames and 4 initialized backing frames** for the
-observed layout. Its root has no hierarchy parent; each child has exactly one.
-Workspace leaf aliases are access references, not child ownership. Both private
-workspace branches expose all live table-owner slots only to supervisor mode.
-There is no shared-subtree mutation or reclamation policy hidden in this design.
+| Register/field | Contract |
+| --- | --- |
+| RAX on entry | Unsigned 64-bit operation number: `abi_query=1`, `thread_exit=2`. |
+| Arguments | Six unsigned 64-bit values in RDI, RSI, RDX, R10, R8, R9. Unused arguments are ignored. |
+| RAX on return | Signed 64-bit status encoded in two's complement: success 0, `NEU_NOT_SUPPORTED=-1`, `NEU_INVALID_ARGUMENT=-2`. |
+| RDX on return | Scalar output, zero on errors. Query returns `0x0000000100000003`. |
+| Preserved state | RSP and all other GPRs except RAX/RDX outputs and RCX/R11 hardware clobbers. Representative 64-bit RBX/RBP/R12–R15 and argument-register canaries are tested. |
+| RCX/R11 | Caller-clobbered; current return leaves hardware-saved user return RIP/flags, never kernel addresses. |
+| Version/features | Bits 63..48 major 0, 47..32 minor 1, 31..0 features: query bit 0 and exit bit 1. |
 
-The user mapping interface is internal and limited to `0x400000..0x800000`.
-U/S must be set at **every required level**; existing supervisor parents are
-rejected instead of upgraded. The original supervisor mapper still rejects user
-parents. Alignment, canonicality, overflow, physical width, duplicate locations,
-W+X and incompatible physical aliases remain errors. Generation identities and
-mapping references are shared across the supported kernel/user mapping domains,
-so an RX user alias prevents mutable scratch access or a writable kernel alias.
+`abi_query` has no pointer argument or memory output. The user fixture checks its
+status and complete scalar tag. An unknown operation returns -1/RDX=0 and safely
+resumes Ring 3. `thread_exit` checks RDI before narrowing: 0..255 terminates the
+isolated fixture; 256 or a negative value represented as unsigned 64 bits returns
+-2/RDX=0. Other arguments are ignored. The conformance fixture must exit with 0;
+nonzero in-range terminal statuses would be recorded as a failing fixture result,
+not a returning syscall. There is no generalized Thread object or exit API yet.
 
-| Fixture region | Virtual address | Backing and permission |
-| --- | --- | --- |
-| Code | `0x400000` | One freshly initialized owned page, user RX. |
-| Constants | `0x401000` | Separate user R/NX page: integer 35 and test kind. |
-| Writable data | `0x402000` | Separate user RW/NX page, result at offset 0; a `ret` at `+0x100` supports the bounded NX probe. |
-| Low stack guard | `0x403000` | Absent; no backing allocation. |
-| User stack | `0x404000` | Separate user RW/NX page; initial RSP `0x404ff8`. |
-| High stack guard | `0x405000` | Absent; no backing allocation. |
-| Unmapped test address | `0x406000` | Absent. Page zero is also absent. |
+The internal `Registers`/`ReturnContext`/`Frame` C layouts serve assembly only,
+not user-memory ABI structures. No user copying, object syscall, capability table,
+startup descriptor, ELF parser or runtime is introduced.
 
-All backing pages are zeroed for all 4096 bytes before an identity is returned.
-The trusted 267-byte position-independent fixture is stored as **data** in kernel
-R/NX storage, copied through a scoped owned-frame RW/NX borrow, and then mapped
-user RX. Its relative branches remain valid at the lower address; data VAs are
-explicit fixture constants. It verifies zero entry GPRs, reads 35, adds 7, uses
-push/pop on its own stack, writes 42 to its data page, reads its CS/SS, and executes
-a bounded loop for host observation before completion or the selected violation.
-No filesystem, ELF parser, dynamic linker, runtime or kernel-text alias is used.
+## CPU configuration, stack and FS/GS invariants
 
-Translation mutations and frame access/allocation/release require the original
-kernel root. Once the fixture root is active, its mappings/workspace are frozen.
-The fixture owner and allocator ledger remain live across execution, exception
-handling, continuation and teardown. At most one fixture root can exist.
+The native image requires CPUID SYSCALL support and initially disabled SCE. It
+owns a snapshot of EFER/STAR/LSTAR/FMASK, configures and reads them back before
+user entry, and checks them again during dispatch. Unrelated EFER bits, including
+long mode and NXE, remain intact.
 
-## Ring 3 entry and test-return contract
+| State | Actual selected contract |
+| --- | --- |
+| EFER | Prior value OR SCE; observed `0xd01` during native execution, `0xd00` after cleanup. |
+| STAR | `0x0028000800000000`: kernel CS 0x08, derived SS 0x10; upper base 0x28 corresponds to user SS 0x33 and long-mode CS 0x3b. |
+| LSTAR | The supervisor RX `neu_native_entry` symbol, checked against the ELF and hardware MSR readback. |
+| FMASK | `0x77700`: TF/IF/DF/IOPL/NT/RF/VM/AC masked on entry. Assembly also clears DF defensively before Rust. |
+| Legacy SYSENTER | CS MSR 0x174 is zero; no legacy service is enabled. |
+| FS/GS | Selectors/bases and KERNEL_GS base zero, no TLS or kernel GS/per-CPU pointer, no SWAPGS. User return restores DS/ES 0x33. |
+| Syscall stack | The existing separate 32 KiB supervisor RW/NX privilege-entry stack, guarded below/above; suspended kernel frames stay on the 64 KiB normal stack. |
+| Critical entry | Native builds give NMI/#MC a separate guarded 16 KiB IST2; #DF retains its original 32 KiB IST1. |
 
-- `IRETQ` enters long-mode user **CS `0x3b`, SS `0x33`**, with canonical RIP
-  `0x400000` and RSP `0x404ff8` (`RSP mod 16 = 8`). There is no usable return
-  address; the fixture finishes through its test gate. All 15 GPRs start at zero,
-  including RDI. No startup descriptor or `NeuStartInfo` layout is promised.
-- Initial RFLAGS is 2: IF/DF/IOPL/TF/NT/AC clear. Synchronous faults remain
-  deliverable. Hardware interrupts, timers and preemption stay disabled.
-- FS/GS selectors and FS/GS/KERNEL_GS bases start at zero; no TLS or `swapgs`
-  convention is introduced. User-origin assembly entry restores trusted kernel
-  segments and clears bases before Rust runs.
-- CR0.MP/TS make x87/SIMD unavailable rather than expose previous extended
-  state. No extended-context implementation exists. The bridge preserves and
-  restores the prior kernel CR0/EFER. EFER.SCE is clear during user execution;
-  legacy SYSENTER CS is cleared too. Neither is a production syscall path.
-- Kernel CS/SS remain `0x08`/`0x10`, TSS selector `0x18`, #DF uses the existing
-  32 KiB IST1. Test builds append user descriptors while keeping selector
-  `0x28` invalid for the original #GP regression.
-- TSS.RSP0 selects a **separate 32 KiB supervisor RW/NX entry stack**, with low
-  and high absent guard pages. The suspended Rust continuation remains on its
-  untouched 64 KiB normal stack. Both roots preserve these kernel regions.
-- Only the dedicated `int 0x80` interrupt gate has DPL=3, only during the
-  explicit fixture run. It has its own entry stub and vector 128 classification.
-  Other gates stay DPL=0; the #DF IST path remains separate. The gate is disabled
-  and RSP0 restored after the trusted continuation resumes.
+SYSCALL does **not** choose TSS.RSP0. The first instructions read/set a
+supervisor-only RIP-relative non-reentrant guard, store user RSP as a scalar,
+and select the known kernel stack with LEA. There is no push, call, Rust or
+user-address dereference before that switch. The noncanonical-user-RSP integration
+case reaches this actual trusted stack and is then rejected, demonstrating that
+entry did not rely on the user stack being usable.
 
-The CPU saves the full user RIP/CS/RFLAGS/RSP/SS frame on RSP0. Assembly saves all
-GPRs and captures CR2. Rust records this in private `NEU_USER_RECORD` and verifies
-exact expected CS/SS, vector/error/RIP/CR2, user RSP, safe flags, result registers,
-actual current kernel CS, active user root and handler stack bounds. These user
-values remain scalars: the boundary dereferences no user pointer and never
-returns through an unchecked user frame. Ordinary CPL=3 faults terminate this
-isolated fixture. CPL=0 faults and critical NMI/#DF/#MC paths retain fatal policy.
+After switching, assembly saves every GPR and constructs a 160-byte private
+return frame. RIP and flags originate in hardware RCX/R11; RSP was saved by the
+entry sequence. User CS/SS are **synthesized** from the selected contract, because
+SYSCALL does not save their old values. The direct CPL=3 snapshots provide
+independent privilege evidence rather than treating synthesized selectors as
+hardware proof. Stack alignment is 16 bytes before calling ordinary Rust.
 
-The boundary resumes a previously saved **trusted kernel continuation**, restoring
-the original CR3, kernel stack and callee-saved registers. The kernel reads the
-data result through its owned physical-frame view, then tears down. This is a
-one-shot test completion mechanism, not a native syscall, Node exit API or
-scheduler context switch. Unknown or malformed fixture outcomes fail validation;
-no operation identifiers or arbitrary memory authority are dispatched.
+Native entry clears FS/GS bases before Rust. The Phase 2A interrupt path retains
+its original zero-base behavior. RIP-relative entry state avoids a SWAPGS state
+window for this single-CPU design; it cannot be reused as an SMP or TLS design.
 
-## Deactivation, rollback and physical reuse
+## Dispatch, validated return and terminal exit
 
-CR3 deactivation occurs before cleanup. PGE/PCIDE remain disabled, so the root
-switch retires local user translations and walk caches. The inactive fixture's
-**entire** set of parent, leaf and workspace entries is cleared before any table
-is freed. Reload the kernel root, remove user mapping records, release empty
-private tables after removing/invalidation of their remaining kernel workspace
-aliases, then free backing identities. The original seven pinned tables remain.
-Unmapping is distinct from freeing; every surviving alias/reference still blocks
-backing release. The broader 64-table/16-data-owner/64-mapping bounds are unchanged.
+The Rust handler accepts only the exact kernel-stack frame address. It checks
+actual kernel CS/SS, stack bounds, masked flags, MSRs, the non-reentrant guard,
+and the still-live user root before processing copied scalar register values.
+The snapshot is preserved in supervisor-only `NEU_NATIVE_LAST`.
 
-Construction failure follows the same inactive teardown discipline. The positive
-guest injects exhaustion at **all 10 table-allocation failpoints**, checking exact
-frame/table-accounting restoration after each. It also creates/destroys a complete
-inactive fixture before the actual execution. Successful completion and every
-expected user fault restore the kernel root and exact accounting before normal
-kernel diagnostics/halt. There is no automatic destructor that could reclaim an
-active root. **All bootloader-reclaimable memory remains reserved.**
+Return validation requires:
 
-The retained PMM still uses the copied maximum-4096-descriptor map, independent
-physical-image reservation, and 128 KiB bitmap over candidate ordinals (maximum
-1,048,576 frames; 4 GiB of eligible bytes, not a physical-address ceiling). Only
-usable full pages outside page zero/image are candidates. Loader, firmware,
-ACPI/runtime, modules, unknown types and holes remain unavailable. General loader
-reclamation still requires a separate complete dependency audit.
+- The expected sealed address-space root.
+- CS 0x3b/SS 0x33, never privileged selectors.
+- Canonical lower-half RIP inside fixture RX bytes and at an approved post-SYSCALL
+  resume site. This prototype deliberately supports only the fixture's sites.
+- Canonical, word-aligned RSP inside the live user stack, excluding both guards.
+- Required flag bit 1 and only arithmetic flags, mask `0x8d7`; unsafe direction,
+  trap, privilege and reserved flags are rejected.
 
-## Verification and actual results
+Validation runs before dispatch and is rechecked before returning. The returning
+path writes only the trusted kernel frame, restores DS/ES and saved registers,
+then uses **IRETQ**. No SYSRETQ instruction or unchecked user frame is used.
+The dispatcher changes only RAX/RDX; the ABI preservation check and user-side
+canaries separately verify the return contract.
+
+Successful `thread_exit` takes a separate nonreturning path: record the terminal
+status, restore the trusted suspended kernel continuation/root, restore/read back
+the original MSRs, then inspect owned result backing and reclaim the inactive
+fixture. No user instruction after successful exit is executed. Unsafe return
+states also terminate the isolated fixture before IRETQ; malformed user values
+are never dereferenced as privileged pointers.
+
+The native configuration leaves the Phase 2A completion gate DPL=0. Original
+`test-user*` images still enable their DPL=3 `int 0x80` gate and keep SCE disabled.
+Ordinary builds launch no user fixture and install no native syscall service.
+
+## Address-space ownership and cleanup
+
+Phase 2A's independently owned PML4/private children remain unchanged: no borrowed
+kernel subtree pointers. The supervisor kernel image/workspace appears in both
+roots, with RX text, R/NX constants and RW/NX data/stacks. User code, constants,
+data and stack use separate fully zeroed backing frames, mapped RX, R/NX, RW/NX
+and RW/NX. The bounded lower fixture range starts at `0x400000`; its stack is
+`0x404000..0x405000`, initial RSP `0x404ff8`, with absent adjacent guards. A wrapper
+CALL gives saved syscall RSP `0x404ff0`. Native bytes are copied from immutable
+kernel R/NX storage to new backing; no kernel executable page becomes user code.
+
+The user root and every table/backing/mapping reference remain live across all
+round trips. Native dispatch does not allocate, unmap or access frame contents.
+The owner remains on the suspended kernel stack. After a terminal return, restore
+MSRs while no user executes, deactivate/clear the private hierarchy and all its
+workspace/leaf references, flush with PGE/PCIDE disabled, remove mapping records,
+and release table aliases and backing identities in the established order. Exact
+frame/table accounting and the original seven pinned kernel tables are checked.
+No active root is reclaimed on an unexpected fatal kernel path.
+
+The observed layout still needs ten private user tables and four user backing
+frames. The static entry/emergency stacks are image-reserved, not allocations
+freed with the user root. Existing 64-table/16-data-owner/64-mapping bounds remain.
+**All bootloader-reclaimable memory remains reserved.** No loader reclamation,
+MemoryObject or generalized AddressSpace object has been added.
+
+## Actual validation and results
 
 Executed from the repository root:
 
 ```sh
 make doctor
-make check > build/phase2a-check.log 2>&1
+make check > build/phase2b-check.log 2>&1
 make build
-make test > build/phase2a-test-run.log 2>&1
+make test > build/phase2b-test-run.log 2>&1
 cargo test --locked --lib --target aarch64-apple-darwin
-python3 tools/neu.py test --case user
+python3 tools/neu.py test --case native
 ```
 
-Each of the other seven user cases was also run individually. Clean-directory
-validation copied source excluding `.git`, `.cache`, `build`, `target` and Python
-caches, then ran:
+The other seven native cases were also executed individually. A fresh source copy
+excluding `.git`, `.cache`, `build`, `target` and Python caches then ran:
 
 ```sh
 make build
-python3 -c "from tools.neu import build; build('user')"
+python3 -c "from tools.neu import build; build('native')"
 ```
 
-Both cold builds passed with a fresh pinned-loader download, checksum checks,
-compilation, ELF/stack/fixture validation and EFI artifact creation. No host
-packages or Rust dependencies were added.
+Cold normal/native builds both passed: fresh pinned-loader download/checksums,
+compilation, four valid LOAD segments, no writable/executable ELF segment,
+stack/guard validation, native SYSCALL bytes, and EFI artifacts. No host packages
+or external Rust dependencies were installed.
 
-| Verification | Actual result |
+| Check | Actual result |
 | --- | --- |
-| Doctor | Pass: pinned Rust/target, QEMU 11.0.0 and compatible hashed firmware. |
-| Static checks | Pass: formatting and Clippy with warnings denied for all 26 kernel configurations plus host library. Python runner syntax check also passes. |
-| Normal + clean builds | Pass: four LOAD segments, no writable/executable ELF segment, correct entry/stacks/guards; normal and Ring 3 EFI artifacts. |
-| Original host tests | All 19 pass unchanged in intent, including sparse PMM, physical ownership, zero/reuse policy, supervisor paging, aliases, rollback and flush/reuse invariants. |
-| Added host tests | All 4 pass: U/S at every level/lower-range rejection; no parent escalation between domains; user transaction rollback and cross-domain W^X/reference retention; independent private roots preserving original children on teardown. |
-| Original QEMU scenarios | All 18 pass, including actual owned kernel CR3, memory, panic, missing-map, #UD/#GP/#PF/#DF/#BP, paging rollback/zeroing and four original guards. |
-| New QEMU scenarios | All 8 pass: one successful computation/trap and seven expected security violations, each with direct CPL=3 observation, exact boundary context, trusted kernel entry and cleanup. |
-| Final halt | All 26 pass two QMP observations of HLT=1/CPL=0/IF=0 inside the ELF halt loop, then host-requested quit/exit 0. New user cases restore the original kernel root. |
+| Doctor | Pass: unchanged pinned Rust/target, QEMU and hashed OVMF pair. |
+| Static checks | Pass: formatting and Clippy with warnings denied, 34 kernel configurations plus host library; Python syntax passes. |
+| Host tests | **32 pass**: all prior 23 plus 9 for operation/status/version encoding, dispatch, exit bounds, argument order/preservation, return root/selectors/RIP/RSP/flags, and MSR configuration. |
+| Original QEMU cases | **All 26 pass**, including genuine #DF, guards, paging rollback/zeroing, direct CPL=3 execution and every Phase 2A security violation. |
+| New native cases | **All 8 pass**, described below. |
+| Final halt | **All 34 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, correct final kernel CR3, then host-requested quit/exit 0. |
 
-The harness connects while the fixture runs its bounded observation loop. It
-requires an **actual QMP CPL=3 snapshot**, with the distinct user CR3, user RIP/RSP,
-CS/SS, HLT=0, safe flags, CR0.MP/TS, EFER.SCE=0, and zero FS/GS bases. Completion
-without that observation fails. It then independently checks the hardware-saved
-boundary frame and final original-root halt. Serial announcements alone cannot
-pass. The normal per-guest deadline remains 30 seconds; unexpected reset, shutdown,
-triple fault, emulator exit, wrong context/halt/root, timeout or silent permission
-failure fails the case.
+The host independently checks that fixture syscall sites actually contain bytes
+`0f 05`. It requires a direct QMP sample at CPL=3 before the syscall and CPL=0
+inside `neu_native_kernel_wait`, with the actual RSP at the trusted frame, kernel
+CS/SS, user CR3, safe flags and preserved canaries. Returning cases also require
+a direct CPL=3 sample inside the post-query loop with RAX=0/RDX=ABI tag, restored
+user selectors/segments and RSP. The guest validates the same output and canaries
+before reaching that loop. Missing any required sample fails the test.
 
-Observed positive CPU state in the full run included:
+Observed positive flow in the full run used user CR3 `0xc000`, kernel CR3
+`0x1000`, user CS/SS 0x3b/0x33 and kernel CS/SS 0x08/0x10. The fixture performed
+**two successful query round trips and one terminal exit**, with six 64-bit
+callee-saved canaries and preserved argument registers. Physical root values are
+observations, not an ABI or allocator promise.
 
-```text
-CPL=3  CS=003b  SS=0033  RIP=000000000040005b
-RSP=0000000000404ff8  CR3=000000000000c000  HLT=0
-RAX=000000000000002a  RBX=000000000000002a
-kernel root=0000000000001000
-```
+| Native case | Actual verified behavior |
+| --- | --- |
+| `native` | 3 real entries, 2 query returns, ABI tag `0x100000003`, exit status 0; direct user/kernel/user CPU samples. |
+| `native-unknown` | 4 entries; unknown `u64::MAX` returns RAX=-1/RDX=0, user verifies it, performs another query and exits 0. |
+| `native-exit-invalid` | 4 entries; exit argument 256 returns RAX=-2/RDX=0 without termination; user verifies it, queries again and exits 0. |
+| `native-return-rip` | First entry reaches the kernel stack; a dedicated trusted hook substitutes noncanonical RIP `0x800000000000`, rejected before dispatch/IRETQ. |
+| `native-return-rsp` | User sets actual noncanonical RSP `0x800000000000` and executes SYSCALL without CALL; actual trusted kernel entry succeeds, then RSP is rejected. |
+| `native-return-flags` | User executes STD before SYSCALL; kernel entry has DF clear, original R11 retains DF, and unsafe return flags are rejected. |
+| `native-return-selectors` | Dedicated hook substitutes kernel return CS/SS 0x08/0x10; validator rejects rather than returning at CPL=0. |
+| `native-disabled` | SCE is intentionally cleared after preflight. Actual user SYSCALL raises #UD 6/error 0 at the exact site, with **zero native entries/returns**. Controlled negative containment is not counted as successful native entry. |
 
-The completion frame then recorded vector 128/error 0, RIP `0x400109`,
-CS `0x3b`, SS `0x33`, RSP `0x404ff8`, result 42, kernel CS `0x8`, handler RSP
-inside the dedicated entry stack and CR3 `0xc000`. These root values are observed
-allocations, not a fixed physical ABI.
+Each return-rejection case has one native entry and zero query dispatches or
+returns. Every expected terminal outcome restores the original kernel root,
+MSRs and allocation accounting. Exact operation sequence, arguments, statuses,
+resume RIP/RSP, selector/flag values, kernel-stack bounds and event counts are
+checked separately from human-readable pass labels.
 
-| User case | Actual CPU outcome | Exact target/context |
-| --- | --- | --- |
-| `user` | vector 128, error 0 | Post-`int 0x80` RIP; result 42 and original user RSP. |
-| `user-kernel` | #PF 14, error `0x5` | Supervisor read at `0xffffffff80000000`, CR2 exact. |
-| `user-readonly` | #PF 14, error `0x7` | User write to R/NX constants at `0x401000`. |
-| `user-nx` | #PF 14, error `0x15` | Instruction fetch at `0x402100`; RIP=CR2, saved RSP `0x404ff0` after the user call. |
-| `user-unmapped` | #PF 14, error `0x4` | User read at absent `0x406000`. |
-| `user-privileged` | #GP 13, error 0 | Exact `hlt` instruction RIP at CPL=3. |
-| `user-gate` | #GP 13, error `0x40a` | Exact `int 0x81` RIP; IDT gate DPL restriction. |
-| `user-guard` | #PF 14, error `0x4` | User read at low stack guard `0x403000`. |
-
-All fault RIPs are computed independently from ELF fixture labels. All eight
-require the actual original CS/SS/RSP/flags and kernel handler stack. The new
-kernel entry-stack guards and upper user-stack guard are verified absent by the
-walker; the new fault-injection guard case accesses the lower user guard. The
-original four kernel/#DF guard-access cases remain separate passing tests.
+The default deadline remains 30 seconds per guest. Bounded before/kernel/after
+observation loops are test instrumentation, not benchmark results. An unexpected
+reset, triple fault, emulator exit, wrong CPL/root/stack/context, missing syscall
+MSR evidence, timeout, silent return or permission failure cannot pass. Serial
+messages alone are insufficient. Existing QMP cleanup and no-debug-exit behavior
+remain intact.
 
 Local Git-ignored evidence: `build/test-results.json`,
-`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase2a-baseline.log`,
-`build/phase2a-check.log`, `build/phase2a-user-first.log`,
-`build/phase2a-negative-run.log`, `build/phase2a-test-run.log`, and
-`build/phase2a-repro-build.log`. User JSON includes the direct QMP CPL=3 register
-dump and parsed boundary context in addition to final halt/root observations,
-ELF/firmware hashes, QEMU command and exit status.
+`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase2b-baseline.log`,
+`build/phase2b-check.log`, `build/phase2b-native-first.log`,
+`build/phase2b-negative-run.log`, `build/phase2b-test-run.log`, and
+`build/phase2b-repro-build.log`. Native JSON includes raw three-phase CPU snapshots,
+parsed MSRs/entries/returns/terminal counters, final root/halt observations,
+ELF/firmware identity, exact QEMU arguments and clean exit status.
 
-## Limits, architecture relationship and next milestone
+## Nested-entry and security limits
 
-Supported execution is one trusted embedded integer-only fixture, one user root,
-one CPU, IF=0, no resumption of user faults. It does not supply CPU-time isolation:
-a different infinite user loop could occupy the CPU until the host timeout.
-Arbitrary image loading, adversarial entry-context fuzzing, user pointer copies,
-TLS, FP/SIMD context support, port-I/O/syscall-instruction/FPU rejection injections,
-physical hardware, alternate firmware, NMI/#MC hardening and performance remain
-unverified or deferred. No speculative side-channel, SMP/shootdown, arbitrary
-kernel-corruption recovery or production-readiness claim is made.
+IF=0 does not suppress NMI or synchronous exceptions. The brief early entry
+window still has a user RSP, although its memory operands are mapped trusted
+RIP-relative addresses. Native NMI/#MC use terminal IST2 and #DF retains IST1. The valid TSS pointer
+is published before the IDT IST2 selectors with explicit compiler ordering;
+other catastrophic early faults may escalate to #DF. A repeated native entry
+selects the emergency stack and fails fatally before overwriting saved user RSP.
+Those are defensive fail-stop mechanisms, **not injected/verified general nested
+NMI, machine-check or corruption recovery**. Shared terminal IST2 can itself be
+overwritten by unsupported nested critical events. No recovery or resumption is
+attempted for them.
 
-There is no NodeFactory/lifecycle/capability API, native syscall dispatch,
-preemptive scheduler, Channels, MemoryObjects, ELF loader, demand paging, COW,
-userspace driver, POSIX compatibility or general runtime. The emergency privileged
-fault/panic path remains bounded/fatal, including genuine #DF on IST1.
+Kernel and user TLS/GS state, FPU/SIMD context, SMP/per-CPU entry, interrupts and
+preemption, adversarial entry fuzzing, hardware faults and physical machines
+remain unsupported or unverified. Fatal paths use no kernel GS-relative/TLS
+state; a future per-CPU design must revisit this assumption. There is no CPU-time
+isolation: another infinite user loop could occupy the CPU until host timeout.
+Speculative/microarchitectural side channels and arbitrary privileged corruption
+are outside the demonstrated boundary.
 
-[ADR 0008](adr/0008-isolated-ring-3-fixture-and-test-return.md) accepts only this
-execution-test contract and extends ADRs 0006/0007 with dated history. Their
-original rationale is preserved; 0005 still amends the Accepted 0004 Limine
-integration. The broader Node, execution, startup and native syscall drafts
-remain proposals. Architecture v0.2 is unchanged; `NEU-025` remains open. The
-historical K0 outline's optional NeuKMon item is still not implemented.
+No full Nodes/Threads, scheduler, public capabilities, NodeFactory/ResourcePool,
+Channels, object syscalls, pointer-copying API, ELF loader, dynamic linker,
+filesystem/network service, POSIX/Linux compatibility or general runtime exists.
+The trusted continuation and private-root ownership remain explicit bootstrap
+mechanisms, not unrestricted public authority paths.
 
-Recommended **Phase 2B**: separately decide and implement native `SYSCALL` entry,
-trusted kernel stack selection, register/result/clobber conventions, safe validated
-return, and the smallest `abi_query`/`thread_exit` fixture. Define any startup
-wire layout and user-copy requirements before exposing them; test invalid syscall
-numbers and malicious contexts. Reuse these ownership/context/cleanup proofs
-without expanding into scheduling, capabilities, Nodes or an OS runtime.
+## Architecture relationship and recommended next milestone
+
+[ADR 0009](adr/0009-experimental-native-syscall-and-trusted-return.md) accepts only
+the experimental scalar ABI and trusted single-CPU entry/return contract.
+ADR 0008 retains its original test-gate rationale with a dated Phase 2B extension;
+its eight regressions still pass. Other boot/paging ADR relationships remain
+unchanged. Architecture v0.2 is preserved byte-for-byte. Complete Node/Thread,
+startup/execution and syscall specifications are not accepted by implication;
+`NEU-025` remains open, as does the older optional NeuKMon work.
+
+Recommended next milestone: **K3 / minimal independent execution-context isolation**:
+two separately owned user roots/backing sets, explicit internal lifecycle and
+fault containment, initially controlled sequential entry/exit. Decide ownership
+and remaining native ABI requirements before expanding beyond the fixture.
+Defer preemptive scheduling, public factories/capabilities and SMP to their own
+milestones rather than treating this first ABI as a full kernel-object system.
 
 ## Primary references
 
 - [Pinned Limine protocol](https://github.com/Limine-Bootloader/limine-protocol/blob/3a0526b700e356f0eac1b71a77697b3fd1c707a3/PROTOCOL.md) and [12.9.4 release](https://github.com/Limine-Bootloader/Limine/releases/tag/v12.9.4).
 - [Rust x86-64 freestanding target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html).
-- [QEMU virtual FAT](https://www.qemu.org/docs/master/system/images.html#virtual-fat-disk-images).
-- [Intel SDM, Volume 3A](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf): U/S permissions, long-mode interrupt/IRET frames, TSS and CPU privilege state.
+- [Intel instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf): SYSCALL/SYSRET state and selector rules.
+- [Intel system programming reference](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf): paging, interrupt frames, TSS/IST and privilege boundaries.

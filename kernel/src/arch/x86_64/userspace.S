@@ -18,6 +18,13 @@ __user_kernel_guard_high: .skip 4096
 .global neu_enter_user, neu_resume_kernel
 .type neu_enter_user,@function
 neu_enter_user:
+    xor r10d, r10d
+    jmp neu_user_bridge
+.global neu_enter_native
+.type neu_enter_native,@function
+neu_enter_native:
+    mov r10d, 1
+neu_user_bridge:
     cli
     cld
     push rbp
@@ -39,7 +46,10 @@ neu_enter_user:
     shl rdx, 32
     or rax, rdx
     mov [rip + neu_user_saved_efer], rax
-    and eax, -2 # SCE=0: native SYSCALL has no entry path in Phase 2A.
+    test r10d, r10d
+    jnz 8f # Native configuration owns SCE; preserve its validated setting.
+    and eax, -2 # Phase 2A explicitly keeps native SYSCALL disabled.
+8:
     mov edx, 0
     wrmsr
     # No legacy SYSENTER entry is configured either (CS=0 causes #GP).

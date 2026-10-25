@@ -31,8 +31,13 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "df-guard-low": "test-df-guard-low", "df-guard-high": "test-df-guard-high",
             "user": "test-user", "user-kernel": "test-user-kernel", "user-readonly": "test-user-readonly",
             "user-nx": "test-user-nx", "user-unmapped": "test-user-unmapped",
-            "user-privileged": "test-user-privileged", "user-gate": "test-user-gate", "user-guard": "test-user-guard"}
+            "user-privileged": "test-user-privileged", "user-gate": "test-user-gate", "user-guard": "test-user-guard",
+            "native": "test-native", "native-unknown": "test-native-unknown", "native-exit-invalid": "test-native-exit-invalid",
+            "native-return-rip": "test-native-return-rip", "native-return-rsp": "test-native-return-rsp",
+            "native-return-flags": "test-native-return-flags", "native-return-selectors": "test-native-return-selectors",
+            "native-disabled": "test-native-disabled"}
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
+NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -132,7 +137,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -148,8 +153,19 @@ def elf_info(path):
     if "__user_kernel_top" in symbols:
         if symbols["__user_kernel_top"] - symbols["__user_kernel_bottom"] != 32768 or any(symbols[n] & 4095 for n in ("__user_kernel_bottom", "__user_kernel_top", "__user_kernel_guard_low", "__user_kernel_guard_high")):
             raise Failure("Invalid user-transition kernel stack/guards.")
-        if not 0 < symbols["neu_user_payload_end"] - symbols["neu_user_payload"] <= 4096:
+        prefix = "neu_native" if "neu_native_payload" in symbols else "neu_user"
+        if not 0 < symbols[prefix + "_payload_end"] - symbols[prefix + "_payload"] <= 4096:
             raise Failure("Invalid embedded user fixture bounds.")
+        if prefix == "neu_native":
+            if symbols["__native_emergency_top"] - symbols["__native_emergency_bottom"] != 16384:
+                raise Failure("Invalid native emergency IST stack.")
+            if any(symbols[n] & 4095 for n in ("__native_guard_low", "__native_guard_high")):
+                raise Failure("Invalid native emergency guards.")
+            for label in ("neu_native_syscall_site", "neu_native_bad_rsp_site"):
+                address = symbols[label]
+                segment = next((item for item in loads if item[3] <= address < item[3] + item[5]), None)
+                if segment is None or data[segment[2] + address - segment[3]:segment[2] + address - segment[3] + 2] != b"\x0f\x05":
+                    raise Failure("Native fixture site is not an actual SYSCALL instruction.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -309,6 +325,14 @@ for name, kind in USER_CASES.items():
         "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1] + ["User boundary verified: false"])
 
 
+for name, kind in NATIVE_CASES.items():
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Native MSRs verified:",
+        f"[NEU] Native user space ready: kind={kind} ", "[NEU] Native terminal:",
+        "[NEU] Native teardown verified:", f"[NEU] Native ABI test passed: kind={kind}",
+        "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+        EXPECT["boot"][1] + ["verified=false", "User execution test passed:"])
+
+
 def user_ready(text, case):
     match = re.search(r"User space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", text)
     if not match:
@@ -369,6 +393,138 @@ def check_user(case, text, symbols, observed):
         raise Failure("User boundary vector/error/RIP/CR2/privilege/stack/result does not match.")
     observed["boundary"] = {"vector": vector, "error": error, "rip": rip, "cr2": cr2, "cs": cs, "ss": ss,
         "rsp": rsp, "rflags": flags, "result": result, "kernel_cs": kernel_cs, "handler_rsp": handler_rsp}
+    return observed
+
+
+
+def native_register(registers, name):
+    match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
+    if not match:
+        raise Failure("Missing native CPU register: " + name)
+    return int(match[1], 16)
+
+
+def native_site(symbols, name):
+    return USER_CODE + symbols[name] - symbols["neu_native_payload"]
+
+
+def observe_native(qmp, serial, case, symbols, deadline):
+    match = re.search(r"Native user space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", transcript(serial))
+    if not match:
+        raise Failure("Missing native execution contract.")
+    kind, root, kernel, entry, rsp = [int(v, 0) for v in match.groups()]
+    if kind != NATIVE_CASES[case] or root == kernel or entry != USER_CODE or rsp != USER_RSP:
+        raise Failure("Invalid native root or entry contract.")
+    observed = {"kind": kind, "root": root, "kernel_root": kernel, "observations": {}}
+    phases = ["before"] + (["kernel"] if kind != 7 else []) + (["after"] if kind <= 2 else [])
+    canaries = [symbols["neu_native_canary_" + suffix] for suffix in ("bx", "bp", "12", "13", "14", "15")]
+    for phase in phases:
+        if phase == "kernel":
+            low, high = symbols["neu_native_kernel_wait"], symbols["neu_native_kernel_wait_end"]
+        else:
+            low, high = (native_site(symbols, "neu_native_" + phase + "_wait"), native_site(symbols, "neu_native_" + phase + "_wait_end"))
+        while time.monotonic() < deadline:
+            registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+            reg = lambda name: native_register(registers, name)
+            cpl = "CPL=0" if phase == "kernel" else "CPL=3"
+            if cpl in registers and low <= reg("RIP") < high:
+                expected_rsp = symbols["__user_kernel_top"] - 160 if phase == "kernel" else USER_RSP
+                expected_cs, expected_ss = (8, 0x10) if phase == "kernel" else (0x3b, 0x33)
+                if (reg("CR3") != root or reg("RSP") != expected_rsp or reg("CS") != expected_cs
+                        or reg("SS") != expected_ss or reg("DS") != expected_ss or reg("ES") != expected_ss
+                        or reg("RFL") & symbols["neu_abi_fmask"]
+                        or bool(reg("EFER") & 1) != (kind != 7) or "HLT=0" not in registers
+                        or reg("CR0") & 10 != 10
+                        or not re.search(r"FS =0000 0000000000000000", registers)
+                        or not re.search(r"GS =0000 0000000000000000", registers)
+                        or [reg(name) for name in ("RBX", "RBP", "R12", "R13", "R14", "R15")] != canaries):
+                    raise Failure("Native QMP privilege/root/stack/flags/register state mismatch in " + phase)
+                if phase == "after" and (reg("RAX") != 0 or reg("RDX") != symbols["neu_abi_info"]):
+                    raise Failure("Ring 3 did not observe the expected native scalar result.")
+                observed["observations"][phase] = registers
+                break
+            if "Native terminal:" in transcript(serial):
+                raise Failure("Native execution finished without the required QMP " + phase + " observation.")
+            time.sleep(0.01)
+        else:
+            raise Failure("Timed out observing native phase " + phase)
+    return observed
+
+
+def check_native(case, text, symbols, observed):
+    if not observed:
+        raise Failure("Missing direct native privilege-transition observations.")
+    kind = NATIVE_CASES[case]
+    msrs = re.search(r"Native MSRs verified: EFER=(0x[0-9a-f]+) STAR=(0x[0-9a-f]+) LSTAR=(0x[0-9a-f]+) FMASK=(0x[0-9a-f]+) SYSENTER=0", text)
+    if not msrs:
+        raise Failure("Missing verified syscall MSRs.")
+    efer, star, lstar, fmask = [int(v, 16) for v in msrs.groups()]
+    if efer & 0xd01 != 0xd01 or star != symbols["neu_abi_star"] or lstar != symbols["neu_native_entry"] or fmask != symbols["neu_abi_fmask"]:
+        raise Failure("Native MSRs do not select the expected entry/selectors/mask.")
+    entries = re.findall(r"Native entry: seq=(\d+) op=(0x[0-9a-f]+) arg1=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) R11=(0x[0-9a-f]+)", text)
+    contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
+    canaries = re.findall(r"Native canaries: RBX=(0x[0-9a-f]+) RBP=(0x[0-9a-f]+) R12=(0x[0-9a-f]+) R13=(0x[0-9a-f]+) R14=(0x[0-9a-f]+) R15=(0x[0-9a-f]+)", text)
+    query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
+    operations = [query, query, exit_op] if kind == 0 else ([query, (1 << 64) - 1, query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
+    arguments = [11, 11, 0] if kind == 0 else ([11, 11, 11, 0] if kind == 1 else ([11, 256, 11, 0] if kind == 2 else ([] if kind == 7 else [11])))
+    if len(entries) != len(operations) or len(contexts) != len(entries) or len(canaries) != len(entries):
+        raise Failure("Incorrect native entry/context count.")
+    parsed = []
+    expected_canaries = [symbols["neu_native_canary_" + suffix] for suffix in ("bx", "bp", "12", "13", "14", "15")]
+    for index, (entry, context, preserved) in enumerate(zip(entries, contexts, canaries)):
+        seq, op, arg1, rip, rsp, r11 = [int(v, 0) for v in entry]
+        cs, ss, kernel_rsp, frame, flags, root = [int(v, 0) for v in context]
+        expected_rip = native_site(symbols, "neu_native_bad_rsp_resume" if kind == 4 else "neu_native_resume")
+        expected_rsp = 0x800000000000 if kind == 4 else USER_RSP - 8
+        if (seq != index + 1 or op != operations[index] or arg1 != arguments[index] or rip != expected_rip
+                or rsp != expected_rsp or cs != 8 or ss != 0x10 or root != observed["root"]
+                or frame != symbols["__user_kernel_top"] - 160 or flags & fmask
+                or not symbols["__user_kernel_bottom"] <= kernel_rsp < frame
+                or [int(v, 16) for v in preserved] != expected_canaries
+                or (kind == 5 and not r11 & (1 << 10))):
+            raise Failure("Native hardware entry/register/frame invariants failed.")
+        parsed.append({"seq": seq, "operation": op, "arg1": arg1, "return_rip": rip, "user_rsp": rsp, "user_flags": r11, "kernel_rsp": kernel_rsp, "frame": frame})
+    returns = re.findall(r"Native return prepared: seq=(\d+) RAX=(0x[0-9a-f]+) RDX=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) preserved=true", text)
+    outputs = [(0, symbols["neu_abi_info"])]
+    if kind == 1:
+        outputs.append((symbols["neu_abi_unknown"], 0))
+    if kind == 2:
+        outputs.append((symbols["neu_abi_invalid"], 0))
+    outputs.append((0, symbols["neu_abi_info"]))
+    if kind >= 3:
+        outputs = []
+    if len(returns) != len(outputs):
+        raise Failure("Incorrect native return count.")
+    for index, (returned, expected) in enumerate(zip(returns, outputs)):
+        seq, rax, rdx, rip, rsp = [int(v, 0) for v in returned]
+        if seq != index + 1 or (rax, rdx) != expected or rip != native_site(symbols, "neu_native_resume") or rsp != USER_RSP - 8:
+            raise Failure("Native returned scalar/status/context mismatch.")
+    terminal = re.search(r"Native terminal: kind=(\d+) reason=(\d+) status=(\d+) entries=(\d+) returns=(\d+) queries=(\d+) errors=(\d+) verified=true", text)
+    expected_reason = [0, 0, 0, 3, 4, 5, 2, 6][kind]
+    expected_counts = (3, 2, 2, 0) if kind == 0 else ((4, 3, 2, 1) if kind in (1, 2) else ((0, 0, 0, 0) if kind == 7 else (1, 0, 0, 0)))
+    if not terminal or tuple(int(v) for v in terminal.groups()) != (kind, expected_reason, 0, *expected_counts):
+        raise Failure("Unexpected native terminal classification/accounting.")
+    if kind <= 2:
+        if "Native thread_exit: status=0" not in text or "Native return rejected:" in text or "Native user fault:" in text:
+            raise Failure("Native thread_exit did not terminate the successful sequence.")
+    elif kind != 7:
+        rejection = re.search(r"Native return rejected: reason=(\d+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+)", text)
+        if not rejection or int(rejection[1]) != expected_reason:
+            raise Failure("Missing unsafe return-state rejection.")
+        values = [int(v, 0) for v in rejection.groups()[1:]]
+        if ((kind == 3 and values[0] != 0x800000000000) or (kind == 4 and values[1] != 0x800000000000)
+                or (kind == 5 and not values[4] & (1 << 10)) or (kind == 6 and tuple(values[2:4]) != (8, 0x10))):
+            raise Failure("Wrong return-state corruption was tested.")
+    else:
+        fault = re.search(r"Native user fault: vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+) verified=true", text)
+        if not fault:
+            raise Failure("Missing disabled-SCE hardware fault.")
+        vector, error, rip, _, cs, ss, rsp, handler = [int(v, 0) for v in fault.groups()]
+        if (vector != 6 or error != 0 or rip != native_site(symbols, "neu_native_syscall_site") or cs != 0x3b or ss != 0x33
+                or rsp != USER_RSP - 8 or not symbols["__user_kernel_bottom"] <= handler < symbols["__user_kernel_top"]):
+            raise Failure("Disabled-SCE case did not fault at the real user SYSCALL.")
+    observed.update(msrs={"efer": efer, "star": star, "lstar": lstar, "fmask": fmask}, entries=parsed,
+                    returns=[[int(v, 0) for v in returned] for returned in returns], terminal=[int(v) for v in terminal.groups()])
     return observed
 
 
@@ -444,6 +600,7 @@ def run_case(case, esp, timeout):
                 required, forbidden = EXPECT[case]
                 symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
                 user_observation = None
+                native_observation = None
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -452,7 +609,10 @@ def run_case(case, esp, timeout):
                     if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
-                    time.sleep(0.01 if case in USER_CASES else 0.05)
+                    if case in NATIVE_CASES and native_observation is None and "Native user space ready:" in transcript(serial):
+                        qmp = QMP(endpoint, started + timeout)
+                        native_observation = observe_native(qmp, serial, case, symbols, started + timeout)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -489,12 +649,17 @@ def run_case(case, esp, timeout):
                     raise Failure(f"Unexpected panic/failure/success marker in {case} transcript.")
                 fault = check_fault(case, text, symbols)
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
+                native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
+                if native and native["kernel_root"] != paging["root"]:
+                    raise Failure("Native teardown did not restore the kernel root.")
+                if native and int(re.search(r"EFER=([0-9a-fA-F]+)", second)[1], 16) & 1:
+                    raise Failure("Native teardown left SCE enabled.")
                 if user and user["kernel_root"] != paging["root"]:
                     raise Failure("User teardown did not restore the original kernel root.")
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -555,7 +720,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case in ("memory", "paging", "user"):
+            if not args.case or args.case in ("memory", "paging", "user", "native"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}

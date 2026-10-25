@@ -5,19 +5,19 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K2 / Phase 2A adds a test-only Ring 3 fixture with a private user root and child
-page tables, initialized user RX/R/NX/RW/NX pages, a guarded TSS.RSP0 kernel entry
-stack, and controlled return through `int 0x80`. QMP observes real CPL=3 execution;
-the kernel verifies the CPU-saved context, result 42, and complete teardown back
-to its original root. Ordinary builds retain the supervisor boot/halt path.
+K2 / Phase 2B adds real x86-64 `SYSCALL` entry, a guarded kernel stack switch,
+scalar `abi_query`, validated `IRETQ` return, and terminal `thread_exit` for the
+isolated bootstrap fixture. QMP observes actual Ring 3 → Ring 0 → Ring 3 state,
+then verifies original-root restoration, cleanup and controlled halt. Operation
+numbers/version encoding remain experimental. The Phase 2A `int 0x80` path stays
+available in its original test configurations; ordinary builds launch no fixture.
 
-Twenty-three host tests and twenty-six QEMU scenarios cover the original Phase
-0/1A/1B behavior plus user computation, privilege transitions, seven controlled
-security violations, and allocation-failure cleanup. The tested environment
-remains 1-vCPU/512 MiB QEMU TCG + UEFI/OVMF on Apple Silicon, Rust 1.95.0 and
-Limine 12.9.4/base revision 6. All bootloader-reclaimable RAM remains reserved.
+Thirty-two host tests and thirty-four QEMU scenarios cover all previous behavior
+plus native queries, scalar errors, unsafe return-state rejection and disabled
+SCE. The environment remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple
+Silicon, Rust 1.95.0 and Limine 12.9.4/base 6. Loader-reclaimable RAM stays reserved.
 
-General Nodes, native syscalls, capabilities, scheduling, an ELF loader, and the
+General Nodes/Threads, capability operations, scheduling, an ELF loader, and the
 other architecture dossiers remain future work. The architecture document
 describes design directions and proposals, not a list of implemented features or
 stable contracts.
@@ -44,8 +44,8 @@ are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
 QEMU. `make test` runs host memory/paging tests, observes each guest's expected
 result, active CR3, and halt through QMP, then shuts QEMU down itself. See the
 implementation status for individual user, paging, memory, and exception
-commands. For the Ring 3 fixture, run `python3 tools/neu.py test --case user`; this completion gate is
-explicitly temporary and is not the final Neu syscall ABI.
+commands. Run `python3 tools/neu.py test --case native` for the native ABI proof,
+or `python3 tools/neu.py test --case user` for the earlier test-gate fixture.
 
 ## Documentation
 

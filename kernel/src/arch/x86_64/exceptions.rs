@@ -222,6 +222,10 @@ extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
         // The complete trusted frame is copied. User termination is a separate
         // one-shot path; retain the early nested guard for privileged faults.
         FAULTING.store(false, Ordering::Relaxed);
+        #[cfg(feature = "native-test")]
+        if super::native::running() {
+            super::native::user_fault(frame, cr2, handler_rsp);
+        }
         super::userspace::boundary(frame, cr2, handler_rsp);
     }
     let ist = (ptr::addr_of!(__df_stack_bottom) as u64..ptr::addr_of!(__df_stack_top) as u64)
@@ -349,6 +353,34 @@ pub fn configure_user_test(enabled: bool) -> neu_kernel::paging::Result<()> {
             gate.attributes = 0xee;
         }
         ptr::write(IDT.0.get().cast::<Gate>().add(128), gate);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-test")]
+pub fn configure_native(enabled: bool) -> neu_kernel::paging::Result<()> {
+    configure_user_test(false)?; // the Phase 2A completion gate stays DPL=0 here
+    if enabled {
+        let (_, top) = super::userspace::kernel_stack();
+        let (bottom, emergency) = super::native::emergency_stack();
+        if emergency - bottom != 16384 || emergency & 15 != 0 {
+            return Err(neu_kernel::paging::Error::Corrupt);
+        }
+        // SAFETY: Single CPU/IF=0 before native execution. IST2 is separate from
+        // #DF's IST1 and remains image-reserved. NMI/#MC paths are terminal.
+        unsafe {
+            ptr::write_unaligned(ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(), top);
+            ptr::write_unaligned(
+                ptr::addr_of_mut!((*TSS.0.get()).ist).cast::<u64>().add(1),
+                emergency,
+            );
+            // Publish the valid TSS stack pointer before an NMI can observe
+            // IST2 in its gate. x86 orders stores; this also orders the compiler.
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            for vector in [2, 18] {
+                ptr::write_volatile(ptr::addr_of_mut!((*IDT.0.get())[vector].ist), 2);
+            }
+        }
     }
     Ok(())
 }
