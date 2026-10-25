@@ -37,10 +37,15 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "native-return-flags": "test-native-return-flags", "native-return-selectors": "test-native-return-selectors",
             "native-disabled": "test-native-disabled",
             "nodes": "test-nodes", "nodes-a-fault": "test-nodes-a-fault", "nodes-b-fault": "test-nodes-b-fault",
-            "nodes-cross": "test-nodes-cross", "nodes-reclaim": "test-nodes-reclaim", "nodes-rollback": "test-nodes-rollback"}
+            "nodes-cross": "test-nodes-cross", "nodes-reclaim": "test-nodes-reclaim", "nodes-rollback": "test-nodes-rollback",
+            "timer": "test-timer", "timer-xapic": "test-timer-xapic", "timer-repeat": "test-timer-repeat",
+            "timer-spurious": "test-timer-spurious", "timer-unsupported": "test-timer-unsupported",
+            "timer-unexpected": "test-timer-unexpected", "timer-software": "test-timer-software"}
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
+TIMER_CASES = ("timer", "timer-xapic", "timer-repeat", "timer-spurious", "timer-unsupported", "timer-unexpected", "timer-software")
+TIMER_POSITIVE = TIMER_CASES[:4]
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -140,7 +145,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -407,6 +412,157 @@ for name, number in NODE_CASES.items():
         EXPECT["boot"][1] + ["verified=false"])
 
 
+for name in TIMER_CASES:
+    end = ["[NEU] Timer test passed: sessions=" + ("2" if name == "timer-repeat" else "1"),
+           "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
+    if name == "timer-unsupported":
+        end = ["[NEU] Timer unsupported configuration rejected: injected_APIC=false hardware_unchanged=true IF=0",
+               "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
+    elif name in ("timer-unexpected", "timer-software"):
+        end = ["[NEU] Timer controller verified:", "[NEU] Interrupt failure: vector=" + ("65" if name == "timer-unexpected" else "48")]
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Timer capabilities:"] + end,
+                    EXPECT["boot"][1] + ([] if name in ("timer-unexpected", "timer-software") else ["Interrupt failure:"]))
+
+
+def observe_timer(qmp, serial, symbols, sequence, root, deadline):
+    while time.monotonic() < deadline:
+        qmp.call("stop")
+        try:
+            registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+            reg = lambda name: native_register(registers, name)
+            if ("CPL=0" in registers and reg("RFL") & 0x600 == 0x200
+                    and symbols["neu_timer_wait_begin"] <= reg("RIP") < symbols["neu_timer_wait_end"]):
+                if (reg("CR3") != root or reg("CS") != 8 or reg("SS") != 0x10
+                        or reg("DS") != 0x10 or reg("ES") != 0x10 or reg("EFER")&1
+                        or not re.search(r"FS =0000 0000000000000000",registers)
+                        or not re.search(r"GS =0000 0000000000000000",registers)
+                        or not symbols["__stack_bottom"] <= reg("RSP") < symbols["__stack_top"]
+                        or any(reg(name.upper()) != symbols["neu_timer_canary_"+name]
+                               for name in ("rbx","rcx","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"))):
+                    raise Failure("Timer enabled window used the wrong root/stack/registers.")
+                controller = qmp.call("human-monitor-command", {"command-line": "info lapic"})
+                device = []
+                selected = re.search(r"Timer controller verified: mode=(\d+) base=(0x[0-9a-f]+)",transcript(serial))
+                if selected and int(selected[1])==1:
+                    table = root
+                    for shift in (39,30,21,12):
+                        address = table + ((0xffffb00000000000 >> shift)&511)*8
+                        raw = qmp.call("human-monitor-command", {"command-line":f"xp /1gx {address:#x}"})
+                        values = re.findall(r"0x[0-9a-fA-F]+",raw)
+                        if len(values)!=1:
+                            raise Failure("Cannot independently inspect the LAPIC device PTE: " + repr(raw))
+                        entry = int(values[0],16)
+                        if entry&7!=3 or (shift!=12 and entry&128):
+                            raise Failure("LAPIC hierarchy is not private supervisor 4K paging.")
+                        device.append({"physical_address":address,"entry":entry,"raw":raw})
+                        table = entry&0x000ffffffffff000
+                    if (device[-1]["entry"]&((1<<63)|0x9f)!=(1<<63)|0x1b
+                            or table!=int(selected[2],16)&0x000ffffffffff000):
+                        raise Failure("Actual LAPIC PTE is not the selected supervisor UC mapping.")
+                return {"sequence":sequence,"registers":registers,"lapic":controller,"device_page_walk":device}
+        finally:
+            qmp.call("cont")
+        if "Timer session stopped: sequence="+str(sequence) in transcript(serial):
+            raise Failure("Timer session ended without independent enabled CPU/controller observation.")
+        time.sleep(0.001)
+    raise Failure("Timed out observing timer-enabled kernel execution.")
+
+
+def check_timer(case, text, symbols, observations, root, qmp):
+    caps = re.search(r"Timer capabilities: APIC=true x2APIC=(true|false) PAT=(true|false) base=(0x[0-9a-f]+) bits=(\d+) cpus=1",text)
+    if not caps or not 32 <= int(caps[4]) <= 52:
+        raise Failure("Missing validated BSP APIC capabilities.")
+    if case == "timer-unsupported":
+        if observations or any(marker in text for marker in ("Timer controller verified:","Timer event:","Timer session armed:")):
+            raise Failure("Unsupported configuration changed or enabled the controller.")
+        return {"rejected":True,"injection":"APIC capability removed before hardware writes"}
+    controller = re.search(r"Timer controller verified: mode=(\d+) base=(0x[0-9a-f]+) id=(\d+) version=(0x[0-9a-f]+) vector=48 spurious=255 PIC=masked leaf=(0x[0-9a-f]+) pat=(0x[0-9a-f]+) root=(0x[0-9a-f]+)",text)
+    if not controller:
+        raise Failure("Missing controller mode, device mapping or vector evidence.")
+    mode,base,apic_id,version,leaf,pat,actual_root = [int(v,0) for v in controller.groups()]
+    if (mode != (2 if caps[1]=="true" else 1) or actual_root!=root or apic_id!=0
+            or base!=int(caps[3],16)|(0x400 if mode==2 else 0)
+            or version&255 < 0x10 or not 5 <= (version>>16)&255 <= 6):
+        raise Failure("Controller does not match discovered capabilities/root.")
+    if mode==1 and (caps[2]!="true" or pat>>24&255 or leaf&((1<<63)|0x9f)!=(1<<63)|0x1b
+                    or leaf&0x000ffffffffff000 != base&0x000ffffffffff000):
+        raise Failure("xAPIC lacks a supervisor RW/NX UC device mapping.")
+    if mode==2 and (leaf or pat):
+        raise Failure("x2APIC must use its MSR interface.")
+    final_lapic = qmp.call("human-monitor-command", {"command-line":"info lapic"})
+    if case in ("timer-unexpected","timer-software"):
+        vector = 65 if case=="timer-unexpected" else 48
+        expected = f"Interrupt failure: vector={vector} reason=unexpected or non-hardware event ticks=0 eois=0 IF=0"
+        if (expected not in text or observations or "Timer event:" in text or "Timer test passed:" in text
+                or not re.search(r"LVTT\s+0x00010030.*masked",final_lapic)
+                or "TPR 0xff" not in final_lapic
+                or not re.search(r"ISR\s+\(none\)",final_lapic)
+                or not re.search(r"IRR\s+\(none\)",final_lapic)):
+            raise Failure("Unexpected/software vector was counted or resumed.")
+        return {"rejected":True,"vector":vector,"mode":mode,"final_lapic":final_lapic}
+    calibration = re.search(r"Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=1000",text)
+    if not calibration:
+        raise Failure("Missing actual reference/countdown calibration samples.")
+    hz,reference,*values = [int(v) for v in calibration.groups()]
+    samples,divided,initial = values[:3],values[3],values[4]
+    ordered = sorted(samples)
+    if (hz!=1193182 or reference!=11932 or min(samples)<100 or max(samples)>100000000
+            or (ordered[2]-ordered[0])*4>ordered[1]
+            or divided!=ordered[1]*hz//reference or initial!=(divided+500)//1000):
+        raise Failure("APIC frequency was assumed or invalidly calibrated.")
+    armed=list(re.finditer(r"Timer session armed: sequence=(\d+) ticks_before=(\d+) root=(0x[0-9a-f]+) reference=(\d+)",text))
+    stopped=list(re.finditer(r"Timer session stopped: sequence=(\d+) ticks_after=(\d+) eois=(\d+) ISR=0 IRR=0 IF=0 GPRs=15 RSP=preserved",text))
+    runs=2 if case=="timer-repeat" else 1
+    if len(armed)!=runs or len(stopped)!=runs or set(observations)!=set(range(1,runs+1)):
+        raise Failure("Missing independent timer session/CPU/controller evidence.")
+    ticks=0
+    for sequence,(start,end) in enumerate(zip(armed,stopped),1):
+        if (tuple(int(v,0) for v in start.groups())!=(sequence,ticks,root,59659)
+                or int(end[1])!=sequence or int(end[2])!=int(end[3])
+                or not 8 <= int(end[2])-ticks <= 128 or start.end()>=end.start()
+                or (sequence<runs and end.end()>=armed[sequence].start())):
+            raise Failure("Timer rearm/monotonic accounting/order mismatch.")
+        ticks=int(end[2])
+        lapic=observations[sequence]["lapic"]
+        lvtt=re.search(r"LVTT\s+(0x[0-9a-f]+)",lapic)
+        timer=re.search(r"DCR=0x3 \(divide by 16\) initial_count = (\d+) current_count = (\d+)",lapic)
+        if (not lvtt or int(lvtt[1],16)!=0x20030 or not timer or int(timer[1])!=initial
+                or not 0<=int(timer[2])<=initial or "APIC enabled" not in lapic
+                or "spurious vec 255" not in lapic or "TPR 0x00" not in lapic
+                or ("X2APIC ID" in lapic)!=(mode==2)):
+            raise Failure("Independent LAPIC snapshot does not show the calibrated unmasked periodic source.")
+        for source in ("LVT0","LVT1","LVTPC","LVTERR","LVTTHMR"):
+            if not re.search(source+r"\s+0x00010000.*masked",lapic):
+                raise Failure("Unexpected local interrupt source is unmasked.")
+    events=re.findall(r"Timer event: tick=(\d+) phase=(\d+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) saved_flags=(0x[0-9a-f]+) handler_flags=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+) root=(0x[0-9a-f]+) ISR_before=1 ISR_after=0",text)
+    if len(events)!=ticks or ticks>256:
+        raise Failure("Missing bounded hardware ISR/EOI/interrupt-frame records.")
+    records=[]
+    for tick,event in enumerate(events,1):
+        number,phase,rip,rsp,cs,ss,saved,handler,stack,cr3=[int(v,0) for v in event]
+        if (number!=tick or phase not in (2,3) or cr3!=root or cs!=8 or ss!=0x10
+                or saved&0x3600!=0x200 or handler&0x600
+                or not symbols["neu_timer_wait_begin"]<=rip<symbols["neu_timer_wait_end"]
+                or not symbols["__stack_bottom"]<=stack<rsp<symbols["__stack_top"]):
+            raise Failure("Timer trace has wrong privilege, safe point, stack, root or monotonic tick.")
+        records.append([int(v,0) for v in event])
+    shutdown=re.search(r"Timer shutdown verified: ticks=(\d+) eois=(\d+) spurious=(\d+) LVT=masked initial=0 current=0 SVR=disabled TPR=255 PIC=masked IF=0 root=(0x[0-9a-f]+) tables=(\d+) accounting=restored",text)
+    expected_spurious=1 if case=="timer-spurious" else 0
+    baseline=re.search(r"Timer accounting baseline: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    restored=re.search(r"Timer accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    if (not shutdown or tuple(int(v,0) for v in shutdown.groups())!=(ticks,ticks,expected_spurious,root,7)
+            or not baseline or not restored or baseline.groups()!=restored.groups()
+            or not re.search(r"LVTT\s+0x00030030.*masked.*periodic",final_lapic)
+            or not re.search(r"initial_count = 0 current_count = 0",final_lapic)
+            or "APIC disabled" not in final_lapic or "TPR 0xff" not in final_lapic
+            or not re.search(r"ISR\s+\(none\)",final_lapic) or not re.search(r"IRR\s+\(none\)",final_lapic)):
+        raise Failure("Controller, IRQs or resources were not quiescent before final halt.")
+    return {"mode":mode,"base":base,"version":version,"device_leaf":leaf,"pat":pat,
+            "calibration":{"samples":samples,"divided_hz":divided,"initial":initial},
+            "sessions":runs,"ticks":ticks,"eois":ticks,"events":records,"observations":observations,
+            "final_lapic":final_lapic,"accounting":[int(v) for v in restored.groups()]}
+
+
 def native_register(registers, name):
     match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
     if not match:
@@ -420,9 +576,16 @@ def native_site(symbols, name):
 
 def observe_native(qmp, serial, case, symbols, deadline, start=0, expected_kind=None, node=False):
     view = lambda: transcript(serial)[start:]
-    match = re.search(r"Native user space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)", view())
+    match = None
+    # UART files can end in a partially emitted line. Do not bind a context
+    # until its complete contract is present; a prefix is not readiness evidence.
+    while time.monotonic() < deadline:
+        match = re.search(r"Native user space ready: kind=(\d+) root=(0x[0-9a-f]+) kernel=(0x[0-9a-f]+) entry=(0x[0-9a-f]+) rsp=(0x[0-9a-f]+)\n", view())
+        if match:
+            break
+        time.sleep(0.001)
     if not match:
-        raise Failure("Missing native execution contract.")
+        raise Failure("Missing complete native execution contract.")
     kind, root, kernel, entry, rsp = [int(v, 0) for v in match.groups()]
     if kind != (NATIVE_CASES[case] if expected_kind is None else expected_kind) or root == kernel or entry != USER_CODE or rsp != USER_RSP:
         raise Failure("Invalid native root or entry contract.")
@@ -435,7 +598,11 @@ def observe_native(qmp, serial, case, symbols, deadline, start=0, expected_kind=
         else:
             low, high = (native_site(symbols, "neu_native_" + phase + "_wait"), native_site(symbols, "neu_native_" + phase + "_wait_end"))
         while time.monotonic() < deadline:
-            registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+            qmp.call("stop")
+            try:
+                registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+            finally:
+                qmp.call("cont")
             reg = lambda name: native_register(registers, name)
             cpl = "CPL=0" if phase == "kernel" else "CPL=3"
             if cpl in registers and low <= reg("RIP") < high:
@@ -449,7 +616,7 @@ def observe_native(qmp, serial, case, symbols, deadline, start=0, expected_kind=
                         or not re.search(r"FS =0000 0000000000000000", registers)
                         or not re.search(r"GS =0000 0000000000000000", registers)
                         or [reg(name) for name in ("RBX", "RBP", "R12", "R13", "R14", "R15")] != canaries):
-                    raise Failure("Native QMP privilege/root/stack/flags/register state mismatch in " + phase)
+                    raise Failure("Native QMP privilege/root/stack/flags/register state mismatch in " + phase + " expected root=" + hex(root) + "\n" + registers)
                 if phase == "after" and (reg("RAX") != 0 or reg("RDX") != symbols["neu_abi_info"]):
                     raise Failure("Ring 3 did not observe the expected native scalar result.")
                 observed["observations"][phase] = registers
@@ -720,6 +887,8 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
+        if case == "timer-xapic":
+            arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
         qmp = None
@@ -731,6 +900,7 @@ def run_case(case, esp, timeout):
                 user_observation = None
                 native_observation = None
                 node_observations = {}
+                timer_observations = {}
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -744,12 +914,18 @@ def run_case(case, esp, timeout):
                         native_observation = observe_native(qmp, serial, case, symbols, started + timeout)
                     if case in NODE_CASES:
                         current = transcript(serial)
-                        for start in re.finditer(r"Node start: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) kind=(\d+)",current):
+                        for start in re.finditer(r"Node start: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) kind=(\d+)\n",current):
                             label = int(start[1])
                             if label not in node_observations and "Native user space ready:" in current[start.start():]:
                                 if qmp is None: qmp = QMP(endpoint, started + timeout)
                                 node_observations[label] = observe_native(qmp,serial,case,symbols,started+timeout,start.start(),int(start[6]),True)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES else 0.05)
+                    if case in TIMER_POSITIVE:
+                        for armed in re.finditer(r"Timer session armed: sequence=(\d+) ticks_before=(\d+) root=(0x[0-9a-f]+) reference=\d+\n",transcript(serial)):
+                            sequence = int(armed[1])
+                            if sequence not in timer_observations:
+                                if qmp is None: qmp = QMP(endpoint, started + timeout)
+                                timer_observations[sequence] = observe_timer(qmp,serial,symbols,sequence,int(armed[3],16),started+timeout)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -796,9 +972,11 @@ def run_case(case, esp, timeout):
                     raise Failure("Native teardown left SCE enabled.")
                 if user and user["kernel_root"] != paging["root"]:
                     raise Failure("User teardown did not restore the original kernel root.")
+                timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
+                result.update(timer=timer)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
@@ -860,7 +1038,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case in ("memory", "paging", "user", "native", "nodes"):
+            if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}

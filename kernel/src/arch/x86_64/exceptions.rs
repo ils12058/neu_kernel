@@ -384,3 +384,33 @@ pub fn configure_native(enabled: bool) -> neu_kernel::paging::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "timer-test")]
+pub fn configure_interrupts() -> Result<(), &'static str> {
+    unsafe extern "C" {
+        static neu_irq_table: [u64; 224];
+    }
+    if !INITIALIZED.load(Ordering::Relaxed) || super::interrupts::flags() & 0x200 != 0 {
+        return Err("interrupt IDT requires initialized descriptors and IF=0");
+    }
+    // SAFETY: One BSP, IF=0. No exception/IST gate changes; all IRQ gates remain
+    // present DPL0 interrupt gates with IST0, using the proven normal stack.
+    unsafe {
+        for vector in 32..256 {
+            let address = ptr::read(ptr::addr_of!(neu_irq_table).cast::<u64>().add(vector - 32));
+            let gate = Gate::new(address, 0);
+            ptr::write(IDT.0.get().cast::<Gate>().add(vector), gate);
+            let actual = ptr::read(IDT.0.get().cast::<Gate>().add(vector));
+            if actual.low != gate.low
+                || actual.mid != gate.mid
+                || actual.high != gate.high
+                || actual.selector != 8
+                || actual.attributes != 0x8e
+                || actual.ist != 0
+            {
+                return Err("interrupt IDT readback failed");
+            }
+        }
+    }
+    Ok(())
+}

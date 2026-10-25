@@ -1,8 +1,10 @@
-//! Early x86-64 mechanisms. External interrupts and scheduling remain disabled.
+//! Early x86-64 mechanisms. Only isolated timer tests admit external interrupts.
 
 use core::arch::{asm, global_asm, x86_64::__cpuid};
 
 pub mod exceptions;
+#[cfg(feature = "timer-test")]
+pub mod interrupts;
 #[cfg(feature = "native-test")]
 pub mod native;
 #[cfg(feature = "node-test")]

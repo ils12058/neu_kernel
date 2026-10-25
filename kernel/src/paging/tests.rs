@@ -733,3 +733,31 @@ fn space_generation_and_owned_frame_capacity_exhaust_without_wrap_or_leaks() {
     }
     assert_eq!(r.create_space(), Err(Error::Capacity));
 }
+
+#[test]
+fn device_leaf_requires_verified_uc_pat_and_never_becomes_user_ram() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let va = 0xffffb00000000000;
+    let count = memory.pages.len();
+    assert_eq!(
+        tree.map_device_uc(&mut memory, va, 0xfee00000, 6 << 24),
+        Err(Error::Flags)
+    );
+    assert_eq!(memory.pages.len(), count);
+    tree.map_device_uc(&mut memory, va, 0xfee00000, 0x0007040600070406)
+        .unwrap();
+    let path = indices(va).unwrap();
+    let mut table = tree.root;
+    for index in &path[..3] {
+        table = memory.read(table, *index).unwrap() & ADDRESS_FIELD;
+    }
+    let raw = memory.read(table, path[3]).unwrap();
+    assert_eq!(raw & (0x9f | NX), 0x1b | NX);
+    let actual = tree.translate(&memory, va).unwrap().unwrap();
+    assert_eq!(actual.physical, 0xfee00000);
+    assert_eq!(actual.permissions, Permissions::RW);
+    assert!(!actual.user);
+    tree.unmap(&mut memory, va).unwrap();
+    assert_eq!(memory.pages.len(), count);
+}

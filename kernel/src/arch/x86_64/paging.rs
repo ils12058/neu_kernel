@@ -1174,3 +1174,57 @@ impl Paging<'_, '_> {
         self.verify()
     }
 }
+
+#[cfg(feature = "timer-test")]
+pub const LAPIC_VIEW: u64 = 0xffff_b000_0000_0000;
+#[cfg(feature = "timer-test")]
+impl Paging<'_, '_> {
+    pub fn map_lapic_uc(&mut self, physical: u64, pat: u64) -> Result<u64> {
+        if current_root() != self.tree.root || super::interrupts::flags() & 0x200 != 0 {
+            return Err(Error::InUse);
+        }
+        logic::physical(physical, self.tree.bits)?;
+        // This device view cannot alias any described RAM, executable image,
+        // loader allocation or framebuffer, even if that RAM is not allocatable.
+        if self
+            .memory
+            .boot
+            .map
+            .regions()
+            .iter()
+            .any(|r| r.kind != 1 && physical < r.base + r.length && physical + PAGE > r.base)
+        {
+            return Err(Error::NotOwned);
+        }
+        self.tree
+            .map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
+        let mut table = self.tree.root;
+        let path = logic::indices(LAPIC_VIEW)?;
+        for index in &path[..3] {
+            table = self.memory.read(table, *index)? & ADDRESS_FIELD;
+        }
+        let leaf = self.memory.read(table, path[3])?;
+        let view = self
+            .tree
+            .translate(&self.memory, LAPIC_VIEW)?
+            .ok_or(Error::NotMapped)?;
+        if leaf & (0x9f | logic::NX) != (0x1b | logic::NX)
+            || view.physical != physical
+            || view.user
+            || view.permissions != Permissions::RW
+        {
+            return Err(Error::Flags);
+        }
+        Ok(leaf)
+    }
+    pub fn unmap_lapic(&mut self) -> Result<()> {
+        if current_root() != self.tree.root || super::interrupts::flags() & 0x200 != 0 {
+            return Err(Error::InUse);
+        }
+        self.tree.unmap(&mut self.memory, LAPIC_VIEW)?;
+        if self.tree.translate(&self.memory, LAPIC_VIEW)?.is_some() {
+            return Err(Error::Corrupt);
+        }
+        self.verify()
+    }
+}

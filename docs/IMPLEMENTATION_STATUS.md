@@ -1,52 +1,50 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-25. **Milestone:** K3 / Phase 3A, independent bootstrap
-Nodes, private address spaces and user-fault containment. **Result:** complete
-against the supplied Phase 3A criteria in the documented single-CPU QEMU profile.
-The suite has **43 host tests and 40 QEMU scenarios**, preserving all original
-**32 host tests and 34 QEMU scenarios**. Two Nodes retain their resources before
-either initial Thread executes; execution is sequential through trusted control.
-This does not complete capability governance or implement scheduling.
+**Verified:** 2026-10-25. **Milestone:** K4 / Phase 4A, safe interrupt delivery and
+scheduler clockevent foundation. **Result:** complete against the supplied Phase
+4A criteria within the documented single-CPU QEMU profile. The suite has **52
+host tests and 47 QEMU scenarios**, retaining all previous **43 host tests and
+40 QEMU scenarios**. Real periodic local-APIC events return to a bounded kernel
+wait loop. There is no Thread switch, user preemption or scheduler.
 
 The inspected tree was clean on `main` at
-[`ae69d2e`](https://github.com/ils12058/neu_kernel/commit/ae69d2ea73da4332c0bd122af0a50fb60347dfdc).
-The original 32/34 suite was rerun before implementation, recorded in
-`build/phase3a-baseline.log`. Historical Phase 2B status remains at that commit.
-Architecture v0.2, Rust/target and Limine are unchanged. Tests are local;
-physical hardware and hosted CI have not been validated.
+[`3049d2a`](https://github.com/ils12058/neu_kernel/commit/3049d2a03b14771a890f9ff8b6ea964182495631).
+The original 43/40 suite was rerun before implementation, recorded in
+`build/phase4a-baseline.log`. Historical Phase 3A status remains at that commit.
+Architecture v0.2, Rust/target and Limine are unchanged. Both x2APIC and xAPIC
+were exercised locally; physical hardware and hosted CI remain unverified.
 
 ## Created and modified files
 
 Created:
 
-- `kernel/src/node.rs`: typed Node/Thread identities, associations, bounded
-  lifecycle, copied outcomes and seven host tests.
-- `kernel/src/arch/x86_64/nodes.rs`: trusted two-domain construction, execution,
-  survivor validation, fault checks, rollback and independent reclamation.
-- `docs/adr/0010-independent-bootstrap-nodes-and-fault-containment.md`: rationale.
+- `kernel/src/timer.rs`: vector/controller/configuration policy, checked PIT
+  calibration arithmetic, session transitions and eight host tests.
+- `kernel/src/arch/x86_64/interrupts.rs`: BSP controller discovery, MSR/UC access,
+  PIC/LVT masking, calibration, bounded handler, event records and shutdown.
+- `kernel/src/arch/x86_64/interrupts.S`: vector-specific IRQ stubs, returning
+  full-GPR entry and assembly-only bounded enabled window with 15 GPR canaries.
+- `docs/adr/0011-local-timer-interrupt-foundation.md`: decision and prerequisites
+  for Phase 4B, recorded before implementing timer delivery.
 
 Modified:
 
-- `kernel/src/paging/mod.rs`: two generation-checked user address spaces, frame
-  owners, mapping keys `(SpaceId, VA)`, root binding and active-resource guards.
-- `kernel/src/paging/tests.rs`: four additional host tests for coexistence,
-  cross-owner/root rejection, rollback, stale identities and exhaustion.
-- `kernel/src/arch/x86_64/paging.rs`: multiple private roots, per-owner cleanup,
-  own-only user workspace aliases, kernel-root-only backend access.
-- `kernel/src/arch/x86_64/native.rs` and `native.S`: per-execution trusted binding,
-  session reset, copied Node outcomes, user fault capture and distinct payloads.
-- `kernel/src/arch/x86_64/userspace.rs`: explicitly deactivate ownership metadata
-  after the original interrupt-gate fixture restores the kernel root.
+- `kernel/src/arch/x86_64/exceptions.rs`: installs/read-backs external gates only
+  for timer tests; existing exception/IST and user-gate paths remain intact.
+- `kernel/src/paging/mod.rs`, `kernel/src/arch/x86_64/paging.rs`: explicit UC
+  device leaves and scoped APIC view/teardown, separate from RAM ownership.
+- `kernel/src/paging/tests.rs`: one added host test for PAT/cache/privilege flags,
+  rejection before allocation and device-table reclamation.
 - `kernel/src/main.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/mod.rs`,
-  `kernel/Cargo.toml`: module wiring and six mutually exclusive Node scenarios.
-- `tools/neu.py`: per-Node three-phase QMP observations, independent identity,
-  syscall, actual exception, ordering, ownership and accounting verification.
-- `README.md`, this status, `docs/adr/README.md`, ADRs 0007 and 0009: current
-  behavior and dated extensions preserving earlier rationale.
+  `kernel/Cargo.toml`: module wiring and seven exclusive timer configurations.
+- `tools/neu.py`: QMP enabled CPU/controller snapshots, xAPIC physical page-table
+  walk, independent calibration/frame/count/EOI/state validation and negatives.
+- `README.md`, this status, `docs/adr/README.md`, ADRs 0006 and 0010: current
+  evidence and dated extensions preserving earlier rationale.
 
-No linker, boot protocol, exception assembly, syscall numbers/status definitions,
-host package or external Rust dependency changed. Architecture v0.2 is preserved
-byte-for-byte (SHA-256
+Node/Thread models and native syscall implementation/ABI are unchanged. No linker,
+boot protocol, dependency, toolchain feature or host package changed. Architecture
+v0.2 remains byte-for-byte unchanged (SHA-256
 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`).
 
 ## Tested environment and compatibility
@@ -67,7 +65,7 @@ During Phase 0 the named Rust toolchain initially lacked the freestanding target
 added using `rustup target add --toolchain 1.95.0 x86_64-unknown-none`. No Homebrew
 packages or system-wide firmware were installed for this milestone. Installed
 QEMU supplied compatible firmware. ISO utilities and mtools were absent and are
-not required by the selected boot workflow. Phase 3A adds no host packages,
+not required by the selected boot workflow. Phase 4A adds no host packages,
 nightly features, or third-party Rust dependencies.
 
 The firmware pair selected from the installed QEMU distribution was:
@@ -137,6 +135,128 @@ locations. To select another compatible pair, supply both variables:
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make run
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make test
 ```
+
+## Controller and clockevent foundation
+
+Timer code is compiled only by `timer-test` configurations. The normal kernel,
+all supervisor negative tests and all Ring 3/Node/native cases retain IF=0.
+The timer profile uses no Node or Thread and performs no context switch.
+
+CPUID.1 APIC/x2APIC/PAT support, physical-address width and IA32_APIC_BASE select
+the BSP controller. Require a hardware-enabled BSP and one logical processor.
+CPUID's logical-count field is used only when HTT is set; HTT clear means one
+logical processor even if EBX's count field is zero. QMP also records `-smp 1`.
+An unsupported capability/base/width fails before the enabled window.
+
+The verified QEMU 11 `max` profile advertises x2APIC. Neu transitions
+IA32_APIC_BASE from `0xfee00900` to `0xfee00d00`, reads it back and uses MSRs at
+`0x800 + register_offset/16`. Actual APIC ID is 0, version `0x50014` (six LVT
+entries), physical width 40. The separate `timer-xapic` profile uses
+`-cpu max,x2apic=off`, making the same discovery policy select MMIO. These values
+are observed platform details, not a portable CPU/base promise.
+
+For xAPIC, only the discovered 4 KiB controller page is mapped at
+`0xffffb00000000000`, supervisor RW/NX. PAT index 3 must contain UC type 0;
+PWT=PCD=1, PAT=0 selects it. The observed PAT MSR is `0x0000010500070406` and
+initial leaf is `0x80000000fee0001b`. A QMP physical walk independently checks
+all four actual entries and effective supervisor/cache flags (hardware A/D bits
+may subsequently change). Reject any overlap with described non-reserved RAM,
+loader/kernel backing or framebuffer. Device physical memory is neither an
+allocator frame nor a data-frame identity. No HHDM/device WB alias is created.
+Three temporary page-table frames are released after stopping; seven pinned
+kernel tables remain. Existing 64-table/16-data-owner/64-mapping bounds stay fixed.
+
+This is BSP-local discovery, so no MADT/RSDP parser, ACPI interpreter, IOAPIC route,
+MSI or userspace IRQ interface is needed. Mask both PICs (ports 0x21/0xa1,
+read back 0xff), all unused LVT entries and the timer before opening IF. Check
+APIC version, ID, masks, SVR, TPR, divisor, initial count and absence of inherited
+ISR/IRR events. Setup rejects an unknown pending firmware APIC service.
+
+Reserve **vector 0x30 (48)** for the local periodic timer and **0xff (255)** for
+spurious delivery. All external vectors have dedicated DPL0 interrupt-gate stubs
+in timer configurations, so unexpected delivery retains its actual vector and
+fails closed. Exception vectors 0–31 and #DF IST1 are unchanged. Test-only user
+gates retain their original configurations and interrupt policy.
+
+Calibrate the divided APIC countdown with **three PIT channel 2 mode-0 one-shot
+samples**, each 11,932 PIT input ticks (about 10 ms). The reference is the QEMU PC
+PIT's **1,193,182 Hz** oscillator, not the host Mac frequency. Speaker output is
+disabled and the channel is polled rather than routed as IRQ0. Divisor 16 is
+programmed explicitly; reject missing/stopped counters, inconsistent sample
+spread, invalid periods and checked-arithmetic overflow. The median divided
+frequency determines a rounded **1,000 microsecond** initial count. TSC deadline
+is not required or used.
+
+This establishes an approximate periodic **clockevent**, not a monotonic
+nanosecond clocksource, scheduling quantum, timer manager or CPU-time accounting.
+Delivered ticks count acknowledged events and remain monotonically increasing
+across repeated windows. TCG delivery/coalescing and debugger pauses affect event
+counts; do not derive precise elapsed nanoseconds from them. The proposed 10 ms
+scheduling quantum is still unimplemented.
+
+## Interrupt entry, ownership and shutdown
+
+Each stub pushes zero error and its actual vector, then saves all 15 GPRs. The
+64-bit CPU frame supplies RIP/CS/RFLAGS/RSP/SS. Assembly clears DF, retains the
+saved frame pointer in a preserved register, aligns RSP for Rust, then restores
+the original frame/GPRs and executes IRETQ. The existing freestanding Rust target
+uses SysV without a red zone or floating-point/vector-register code generation;
+no x87/SIMD context management is introduced.
+
+Only `neu_timer_wait` executes with IF=1, on the guarded 64 KiB normal kernel
+stack under the original kernel CR3, CPL=0, FS/GS bases zero. The loop uses PIT
+output and a separate ten-million-iteration budget, so missing timer delivery
+cannot cause an unbounded HLT wait. It checks all 15 GPR canaries and exact RSP
+after CLI. QMP independently samples 13 stable GPRs during the loop; RAX/RDX are
+temporarily used for the port read and are checked after return by assembly.
+Hardware frame RIP/RSP must lie within that exact assembly window/stack span.
+A timer interrupt from CPL=3 or unrelated kernel code is not a supported return.
+
+Interrupt gates clear IF; handlers never execute STI. A guard rejects reentry.
+The handler verifies its trusted stack/frame, actual root, saved privilege/IF,
+current IF=0/DF=0 and running/draining phase. A timer event requires its **actual
+APIC ISR bit**. It writes **exactly one EOI**, verifies ISR clears, records the
+hardware frame and publishes the next tick. Software INT 0x30 without an ISR bit
+is rejected before accounting. Spurious 0xff returns without EOI or timer count.
+Unexpected vectors halt, leaving IF=0 and the timer stopped/masked; they never
+masquerade as ticks. Exceptions receive no timer EOI.
+
+Immediate work is bounded: classification, checks, controller acknowledgment,
+atomic counters and one fixed event record. There is no ordinary logger,
+allocation, blocking, scheduler lock, deferred switch or mutable paging/allocator/
+Node access. The fixed trace has 256 entries in reserved kernel BSS. Overflow
+fails closed, including before a u64 tick wrap. Atomic mode/root/phase state is
+published before enable; ticks publish completed records with Release/Acquire.
+One non-nested CPU writes raw trace slots; setup/inspection create no trace
+reference during IF=1. Existing exclusive mutable kernel objects are untouched
+by the handler even when their trusted caller remains suspended.
+
+For each session, configure/read back the masked periodic timer with IF=0,
+publish Running, unmask and enter the assembly window. PIT interval 59,659
+bounds the enabled measurement (about 50 ms). Return with CLI, mask the LVT and
+write initial count zero, then publish Draining and open a separate bounded
+2,386-PIT-tick window to acknowledge any already pending timer event. No new
+periodic count is armed while draining. Verify ISR/IRR empty, no busy entry,
+unchanged CR3 and equal tick/EOI totals. A further IF=0 reference interval must
+leave ticks unchanged. Repeat sessions rearm only after this quiescence check;
+the global event count does not reset.
+
+Final shutdown keeps all LVT sources and both PICs masked, timer initial/current
+counts zero, TPR=0xff and SVR software-enable clear. It restores IF=0, removes the
+xAPIC device mapping if present, checks exact allocator/table accounting and
+uses the established controlled halt. APIC hardware enable/x2 mode is retained;
+unknown firmware services and PIT channel programming are not restored. PIT
+channel 2 ends gated off with speaker disabled. Fatal invariant paths halt rather
+than promise device/memory rollback after arbitrary kernel corruption.
+
+The current native session, shared syscall stack, TSS.RSP0, sealed return contract
+and two-Node controller remain IF=0. Their single-active-context restrictions
+cannot be relaxed by merely enabling this timer. The
+[Phase 4B constraints](adr/0011-local-timer-interrupt-foundation.md#constraints-before-phase-4b-context-switching)
+cover per-Thread kernel stacks, saved CPU/extended state, root/TSS/identity
+publication, interrupts during SYSCALL and deferred switching at safe user-return
+boundaries. Initial direction: userspace preemption, kernel not generally
+preemptible. None of those switches or `need_resched` machinery exists here.
 
 ## Internal Node and Thread model
 
@@ -344,40 +464,100 @@ restore accounting or recover safely.
 Executed from the repository root:
 
 ```sh
-make doctor > build/phase3a-doctor.log 2>&1
-make check > build/phase3a-check.log 2>&1
-make build > build/phase3a-build.log 2>&1
-make test > build/phase3a-test-run.log 2>&1
+make doctor > build/phase4a-doctor.log 2>&1
+make check > build/phase4a-check.log 2>&1
+make build > build/phase4a-build.log 2>&1
+make test > build/phase4a-test-run.log 2>&1
 cargo test --locked --lib --target aarch64-apple-darwin
-python3 tools/neu.py test --case nodes
-python3 tools/neu.py test --case nodes-a-fault
-python3 tools/neu.py test --case nodes-b-fault
-python3 tools/neu.py test --case nodes-cross
-python3 tools/neu.py test --case nodes-reclaim
-python3 tools/neu.py test --case nodes-rollback
+python3 tools/neu.py test --case timer
+python3 tools/neu.py test --case timer-xapic
+python3 tools/neu.py test --case timer-repeat
+python3 tools/neu.py test --case timer-spurious
+python3 tools/neu.py test --case timer-unsupported
+python3 tools/neu.py test --case timer-unexpected
+python3 tools/neu.py test --case timer-software
 ```
 
-All six focused Node cases were also executed before the complete suite. A fresh
-source copy excluding `.git`, `.cache`, `build`, `target` and Python caches ran:
+All seven focused timer cases were run before the complete suite. A fresh source
+copy without `.git`, `.cache`, `build`, `target` or Python caches also ran:
 
 ```sh
 make build
-python3 -c "from tools.neu import build; build('nodes')"
+python3 -c "from tools.neu import build; build('timer')"
+python3 -c "from tools.neu import build; build('timer-xapic')"
 ```
 
-Both cold builds pass with a fresh pinned-loader download/checksum verification,
-Cargo `--locked`, ELF64/x86-64 four LOAD segments, no writable/executable ELF
-segment, validated stacks/guards, native SYSCALL bytes and EFI artifacts. No host
-packages or external Rust dependencies were installed.
+All three cold builds pass with a fresh pinned-loader download and checksum
+verification, Cargo `--locked`, ELF64/x86-64 four LOAD segments, W^X segment
+validation, guarded stacks and EFI artifacts. No host packages or external Rust
+dependencies were installed.
 
 | Check | Actual result |
 | --- | --- |
 | Doctor | Pass: unchanged Rust/target, QEMU and hashed OVMF pair. |
-| Static checks | Pass: formatting and Clippy with warnings denied, 40 kernel configurations plus host library; Python syntax passes. |
-| Host tests | **43 pass**: all prior 32 plus 7 lifecycle/association/outcome tests and 4 scoped paging/ownership/rollback/capacity tests. |
-| Original QEMU cases | **All 34 pass**, including genuine #DF, supervisor faults/guards, paging rollback/zeroing, all 8 Phase 2A cases and all 8 native ABI cases below. |
-| New Node cases | **All 6 pass**, described below, with two live roots before either execution. |
-| Final halt | **All 40 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, correct final kernel CR3 and host-requested quit/exit 0. |
+| Static checks | Pass: formatting and Clippy with warnings denied, 47 kernel configurations plus host library; Python syntax passes. |
+| Host tests | **52 pass**: all original 43 plus 8 timer/controller/state/overflow tests and 1 UC device-mapping test. |
+| Original QEMU cases | **All 40 pass** with their existing IF=0 policies, including supervisor/#DF, all Ring 3/ABI security negatives and all 6 two-Node scenarios below. |
+| New timer cases | **All 7 pass**, covering both APIC modes and the controls below. |
+| Final halt | **All 47 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, original owned CR3 and host-controlled quit/exit 0. |
+
+| Timer case | Actual verified behavior |
+| --- | --- |
+| `timer` | Discovered x2APIC, MSR readbacks, three reference samples, multiple hardware timer events, per-event ISR/EOI checks, all-GPR return and quiescent shutdown. |
+| `timer-xapic` | QEMU CPU explicitly hides x2APIC; actual xAPIC delivery through the UC page. QMP physically walks all four device-table entries while the CPU is stopped for observation. |
+| `timer-repeat` | Two independent arm/run/mask/drain/stop cycles; one monotonically increasing tick/EOI total, with QMP observations in each enabled window. |
+| `timer-spurious` | Controlled INT 0xff returns with zero ticks/EOIs and one spurious count; genuine periodic delivery then succeeds. This exercises no-EOI dispatch, not spontaneous hardware spurious generation. |
+| `timer-unsupported` | Trusted hook removes APIC capability before any controller/PIC/mapping writes. Selection rejects it; APIC base, IF/root and allocation state remain unchanged. Physical APIC-less boot is unverified. |
+| `timer-unexpected` | Controlled INT 0x41 reaches its actual vector-specific entry and halts with zero ticks/EOIs; no timer-success result. |
+| `timer-software` | Controlled INT 0x30 without an in-service APIC bit is rejected with zero ticks/EOIs; it cannot serve as fake hardware delivery evidence. |
+
+The final full-run timer observations were:
+
+| Case | Mode | Calibration samples (divided ticks) | Initial count | Delivered ticks / EOI |
+| --- | --- | --- | --- | --- |
+| `timer` | x2APIC | 627187, 626812, 626687 | 62680 | 32 / 32 |
+| `timer-xapic` | xAPIC | 627812, 627687, 627062 | 62768 | 33 / 33 |
+| `timer-repeat` | x2APIC | 627062, 627062, 626812 | 62705 | 64 / 64 across two windows |
+| `timer-spurious` | x2APIC | 626937, 626875, 627062 | 62693 | 26 / 26; separate spurious count 1 |
+
+Original CR3 stays `0x1000`. The independent xAPIC walk reads entries `0x8023`,
+`0x9023`, `0xa023`, `0x80000000fee0007b`; the final leaf's A/D bits reflect
+actual MMIO access while UC, supervisor RW and NX remain set. Final allocation
+accounting in these images is seven allocated table frames, 118,495 free and
+seven retained tables, matching each guest's baseline. These numbers are
+observations, not fixed ABI or allocator promises.
+
+The runner pauses/resumes QEMU briefly for consistent QMP CPU/LAPIC snapshots.
+It requires actual IF=1/CPL=0 inside the ELF wait region, original CR3, kernel
+selectors/stack, zero FS/GS and stable canaries. `info lapic` must independently
+show LVTT=0x20030, divide 16, the calculated nonzero initial count, enabled SVR,
+TPR=0 and other LVT sources masked. xAPIC snapshots include the physical page
+walk. Final controller observations require LVTT=0x30030, zero countdown,
+disabled SVR, TPR=0xff and empty ISR/IRR. The observer does not inject timer
+interrupts or write guest registers/memory.
+
+The host independently recomputes the median-based calibration, checks every
+actual frame record's RIP/RSP/CS/SS/flags/root/handler-stack, requires consecutive
+ticks and equal EOI totals, validates rearm ordering and compares numerical
+baseline/final frame/table accounting. Both CPU/controller evidence and genuine
+ISR-gated repeated entry are required; an initialization/pass label cannot pass.
+The accepted per-50-ms-window delivered-event range is 8–128, with actual totals
+reported in structured JSON. It is deliberately a delivery/liveness bound, not a
+precision or interrupt-latency guarantee. The observed delivered totals differ
+from an ideal 50 events per 50 ms, so precise 1 kHz delivery and elapsed-time
+accounting are explicitly unverified despite reproducible countdown calibration.
+
+The first complete-suite attempt failed an existing native CPU snapshot check.
+A focused audit also reproduced a partially emitted UART execution contract.
+The harness now waits for complete per-run identity/contract lines and briefly
+stops/resumes QEMU for coherent native register snapshots; all original privilege,
+root, stack, flag and canary assertions remain. Five consecutive A-fault runs,
+reverse fault, native and timer controls passed after the observer changes.
+Initial failures are retained in `build/phase4a-test-initial.log` and
+`build/phase4a-node-observer-audit-initial.log`; the final full suite is recorded
+separately in `build/phase4a-test-run.log`. No Node/native kernel code changed.
+
+The retained Node/native proofs continue as follows.
 
 The host verifies emitted SYSCALL bytes `0f 05`. For **each Node** it requires
 direct QMP CPU samples before the syscall at CPL=3, at CPL=0 in the guarded native
@@ -436,13 +616,16 @@ wrong privilege/root/stack/context, missing CPU evidence, timeout, early halt or
 permission failure cannot pass. Serial pass messages alone are insufficient.
 
 Local Git-ignored evidence: `build/test-results.json`,
-`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase3a-baseline.log`,
-`build/phase3a-doctor.log`, `build/phase3a-check.log`, `build/phase3a-build.log`,
-`build/phase3a-nodes-first.log`, `build/phase3a-isolation-run.log`,
-`build/phase3a-test-run.log`, and `build/phase3a-repro-build.log`. Each Node JSON
-contains separate identity/root/outcome records, raw three-phase CPU snapshots,
-actual fault values, accounting, final halt observations, ELF/firmware identities,
-QEMU arguments and clean exit status.
+`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase4a-baseline.log`,
+`build/phase4a-host-tests.log`, `build/phase4a-doctor.log`, `build/phase4a-check.log`,
+`build/phase4a-build.log`, `build/phase4a-focused-timers.log`,
+`build/phase4a-device-walk.log`, `build/phase4a-node-observer-audit.log`,
+`build/phase4a-test-run.log` and
+`build/phase4a-repro-build.log`. Timer JSON contains calibration samples,
+monotonic event/frame records, mode/base/PAT/device flags, per-session QMP CPU and
+LAPIC snapshots, xAPIC physical walks, final controller state and exact accounting.
+Existing per-Node CPU/ABI/fault evidence, two halt samples, kernel/firmware hashes,
+QEMU arguments and clean exits remain recorded.
 
 ## Nested-entry and security limits
 
@@ -457,8 +640,8 @@ NMI, machine-check or corruption recovery**. Shared terminal IST2 can itself be
 overwritten by unsupported nested critical events. No recovery or resumption is
 attempted for them.
 
-Kernel and user TLS/GS state, FPU/SIMD context, SMP/per-CPU entry, interrupts and
-preemption, adversarial entry fuzzing, hardware faults and physical machines
+Kernel and user TLS/GS state, FPU/SIMD context, SMP/per-CPU entry, interrupts outside the isolated timer window,
+and preemption, adversarial entry fuzzing, hardware faults and physical machines
 remain unsupported or unverified. Fatal paths use no kernel GS-relative/TLS
 state; a future per-CPU design must revisit this assumption. There is no CPU-time
 isolation: another infinite user loop could occupy the CPU until host timeout.
@@ -475,21 +658,23 @@ must revisit synchronization, references, cancellation and lifetime publication.
 
 ## Architecture relationship and recommended next milestone
 
-[ADR 0010](adr/0010-independent-bootstrap-nodes-and-fault-containment.md) accepts
-the scoped Node/Thread boundaries, two live private roots, sequential bindings,
-local user-fault policy and ordered ownership cleanup. ADRs 0007 and 0009 retain
-their original rationale with dated extensions. The accepted native ABI 0.1 and
-all earlier test paths remain intact. Architecture v0.2 is unchanged; complete
-capability-oriented Nodes and the full MEM/EXEC/SEC/DIAG/TEST proposals are not
-accepted or implemented by implication. `NEU-025` and optional NeuKMon remain open.
+[ADR 0011](adr/0011-local-timer-interrupt-foundation.md) accepts only the scoped
+controller/clockevent, returning IRQ and safe enable/drain/stop contract, including
+the prerequisites for future switching. ADRs 0006 and 0010 retain their rationale
+with dated extensions. Native ABI 0.1, Node ownership/lifecycle and all earlier
+interrupt-disabled paths remain intact. Architecture v0.2 is unchanged; the full
+scheduling proposal and capability-oriented Node design are not accepted or
+implemented by implication. `NEU-025` and optional NeuKMon remain open.
 
-Recommended next milestone: **K4 / single-CPU timer-driven scheduling**, beginning
-with an explicit ADR for interrupt/context ownership, saved CPU state, safe
-native-entry interactions and scheduling policy. Establish timer delivery and
-controlled context switching with focused fault/cleanup tests before claiming
-preemption or CPU-time isolation. Keep public capabilities/factories, SMP and
-multithreaded Nodes as separate scoped decisions rather than extending this
-single-active-context mechanism without a new safety contract.
+Recommended next milestone: **K4 / Phase 4B, controlled single-CPU Thread context
+switching**. Resolve per-Thread guarded kernel stacks, complete saved contexts,
+root/TSS/active identity publication and native shared-entry/continuation ownership
+before switching two user Threads. Define deferred rescheduling from Ring 0 and
+validated safe return boundaries; arbitrary kernel preemption remains excluded.
+Keep x87/SIMD policy explicit and retain interrupt-disabled memory/lifecycle
+transactions until synchronization is proven. Timer delivery alone provides no
+fairness, preemption or CPU-time isolation. Scheduling policy, SMP and public
+capabilities/factories need their own scoped decisions.
 
 ## Primary references
 
@@ -497,3 +682,5 @@ single-active-context mechanism without a new safety contract.
 - [Rust x86-64 freestanding target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html).
 - [Intel instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf): SYSCALL/SYSRET state and selector rules.
 - [Intel system programming reference](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf): paging, interrupt frames, TSS/IST and privilege boundaries.
+- [QEMU 11 PIT frequency](https://github.com/qemu/qemu/blob/v11.0.0/include/hw/timer/i8254.h) and [PIT output semantics](https://github.com/qemu/qemu/blob/v11.0.0/hw/timer/i8254_common.c).
+- [QEMU local APIC observation](https://github.com/qemu/qemu/blob/v11.0.0/hmp-commands-info.hx): `info lapic`.

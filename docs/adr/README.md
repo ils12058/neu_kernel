@@ -109,3 +109,14 @@ ADR 0010 extends the singleton ownership/lifecycle portions of 0007–0009 while
 preserving the accepted ABI 0.1 contract. Full capability governance, multiple
 runnable Threads and scheduling remain unimplemented; related proposals are not
 accepted wholesale. Architecture v0.2 and the original ADR rationale are retained.
+
+## Phase 4A record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0011: Local timer interrupt foundation](0011-local-timer-interrupt-foundation.md) | Accepted, isolated kernel interrupt window only | NEU-003/011; NEU-018 device view; NEU-020 clockevent subset; NEU-021/023/024 scoped safety/tests |
+
+ADR 0011 adds calibrated APIC timer delivery, returning IRQ entries and bounded
+enable/drain/shutdown. All earlier Node/syscall and ordinary boot paths retain
+IF=0. It records prerequisites for future userspace preemption without accepting
+or implementing the complete scheduling proposal or a context switch.

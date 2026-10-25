@@ -222,7 +222,7 @@ impl PageTree {
         pa: u64,
         permissions: Permissions,
     ) -> Result<()> {
-        self.map_kind(memory, va, pa, permissions, false)
+        self.map_kind(memory, va, pa, permissions, false, 0)
     }
 
     pub fn map_user(
@@ -233,7 +233,22 @@ impl PageTree {
         permissions: Permissions,
     ) -> Result<()> {
         user_range(va, 1)?;
-        self.map_kind(memory, va, pa, permissions, true)
+        self.map_kind(memory, va, pa, permissions, true, 0)
+    }
+
+    /// Device-only supervisor leaf. PAT index 3 MUST be verified as UC first.
+    /// This does not allocate or transfer ownership of the device's physical page.
+    pub fn map_device_uc(
+        &self,
+        memory: &mut impl TableMemory,
+        va: u64,
+        pa: u64,
+        pat: u64,
+    ) -> Result<()> {
+        if (pat >> 24) & 0xff != 0 {
+            return Err(Error::Flags);
+        }
+        self.map_kind(memory, va, pa, Permissions::RW, false, 0x18)
     }
 
     fn map_kind(
@@ -243,10 +258,11 @@ impl PageTree {
         pa: u64,
         permissions: Permissions,
         user: bool,
+        cache: u64,
     ) -> Result<()> {
         page_address(va)?;
         let user_bit = if user { 4 } else { 0 };
-        let leaf = leaf_entry(pa, permissions, self.bits)? | user_bit;
+        let leaf = leaf_entry(pa, permissions, self.bits)? | user_bit | cache;
         let path = indices(va)?;
         let mut table = self.root;
         let mut created = [(0u64, 0usize, 0u64); 3];

@@ -148,3 +148,8 @@ Thread, MEM, EXEC, SEC, DIAG or TEST proposals in the architecture register.
   ABI remains accepted; its singleton lifecycle is extended only in this scope.
   Architecture v0.2 remains unchanged. Commands, actual results and remaining
   limits are recorded in [implementation status](../IMPLEMENTATION_STATUS.md).
+
+- **2026-10-25, Phase 4A:** [ADR 0011](0011-local-timer-interrupt-foundation.md)
+  establishes a separate kernel-only timer window. These Nodes still execute
+  sequentially with IF=0; their model, ownership and ABI remain unchanged. Safe
+  Thread switching requires the new record's stack/context prerequisites first.

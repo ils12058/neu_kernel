@@ -43,7 +43,14 @@ const _: () = assert!(
         + cfg!(feature = "test-nodes-b-fault") as u8
         + cfg!(feature = "test-nodes-cross") as u8
         + cfg!(feature = "test-nodes-reclaim") as u8
-        + cfg!(feature = "test-nodes-rollback") as u8)
+        + cfg!(feature = "test-nodes-rollback") as u8
+        + cfg!(feature = "test-timer") as u8
+        + cfg!(feature = "test-timer-xapic") as u8
+        + cfg!(feature = "test-timer-repeat") as u8
+        + cfg!(feature = "test-timer-spurious") as u8
+        + cfg!(feature = "test-timer-unsupported") as u8
+        + cfg!(feature = "test-timer-unexpected") as u8
+        + cfg!(feature = "test-timer-software") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -194,6 +201,11 @@ extern "C" fn neu_main() -> ! {
         log!(
             "[NEU] Paging self-test passed: aliases, mapping, zero/reuse, rollback, TLB, accounting\n"
         );
+    }
+
+    #[cfg(feature = "timer-test")]
+    if let Err(reason) = arch::interrupts::run(&mut paging) {
+        fail(reason);
     }
 
     #[cfg(feature = "node-test")]

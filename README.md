@@ -5,26 +5,26 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K3 / Phase 3A constructs two simultaneously live bootstrap Nodes with distinct
-Node, Thread and address-space identities, private roots and owned user backing.
-Their initial Threads run sequentially through trusted kernel control, using the
-existing native ABI 0.1 (`abi_query=1`, `thread_exit=2`). Node A computes 42 and
-Node B computes 84. A supported user fault ends its own Node; the healthy sibling
-can still execute after independent teardown.
+K4 / Phase 4A adds calibrated local-APIC timer delivery in an isolated kernel
+interrupt window. QEMU's verified x2APIC MSR interface is preferred; a separate
+xAPIC test verifies a supervisor UC MMIO mapping. Dedicated returning entries
+preserve GPRs and the interrupted stack, count real timer events and send EOI.
+Shutdown masks/stops the source, drains pending delivery and returns to IF=0.
 
-Forty-three host tests and forty QEMU scenarios cover the original 32/34 suite
-plus both directions of fault containment, same-VA isolation, a B-only mapping,
-early sibling reclamation and failed second-Node construction. QMP samples actual
-CPL=3 → CPL=0 → CPL=3 and distinct CR3 values for both Threads. The environment
-remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple Silicon, Rust 1.95.0
-and Limine 12.9.4/base 6. Loader-reclaimable RAM stays reserved.
+The suite contains **52 host tests and 47 QEMU scenarios**, retaining all previous
+43/40 tests. It covers repeated timer delivery and rearming, spurious no-EOI
+handling, unsupported configuration and software/unexpected-vector rejection.
+QMP observes the enabled CPU and programmed controller independently. The tested
+environment remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple Silicon,
+Rust 1.95.0 and Limine 12.9.4/base 6.
 
-The Node/Thread model is kernel-internal and bounded to two of each. Capability
-governance, public factories, multiple runnable Threads per Node, scheduling and
-ELF loading remain future work. One Thread per Node is a bootstrap policy, not
-the permanent object model. Only explicit test configurations launch userspace;
-ordinary builds launch no Node. Architecture directions and proposals remain
-distinct from implemented features and stable contracts.
+The two bootstrap Nodes and native ABI 0.1 remain available in their original
+IF=0 configurations. Ordinary boot also retains IF=0. There is no Thread context
+switch, preemptive scheduler, public capability interface or general IRQ routing.
+The approximately 1 ms clockevent is calibrated against the emulated PIT;
+TCG delivery counts are not a precise clocksource or CPU-time guarantee. See
+[ADR 0011](docs/adr/0011-local-timer-interrupt-foundation.md) for the safety
+boundary and prerequisites for Phase 4B.
 
 ## Build and run
 
@@ -45,11 +45,11 @@ The first build downloads the pinned Limine binary and checks its SHA-256. The
 boot artifact is `build/boot/esp/`; QEMU serves a private copy as a read-only FAT
 disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
-QEMU. `make test` runs host memory/paging/lifecycle/ABI tests, observes each
+QEMU. `make test` runs host memory/paging/lifecycle/ABI/timer tests, observes each
 guest's expected result, active CR3 and halt through QMP, then shuts QEMU down
-itself. See the
-implementation status for individual user, paging, memory, and exception
-commands. Run `python3 tools/neu.py test --case nodes` for the two-Node proof,
+itself. See the implementation status for the individual test commands. Run `python3 tools/neu.py test --case timer` for hardware timer delivery,
+`python3 tools/neu.py test --case timer-xapic` for the MMIO fallback, or
+`python3 tools/neu.py test --case nodes` for the two-Node proof; use
 `python3 tools/neu.py test --case native` for the original native ABI proof, or
 `python3 tools/neu.py test --case user` for the earlier test-gate fixture.
 

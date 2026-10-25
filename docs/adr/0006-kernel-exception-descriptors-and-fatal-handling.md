@@ -104,3 +104,10 @@ halt. Unexpected reset, triple fault, shutdown, or emulator exit cannot pass.
 
 Reference: [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html),
 Volume 3A, interrupt/exception handling, error codes, TSS and Interrupt Stack Table.
+
+### 2026-10-25 — Phase 4A extension
+
+[ADR 0011](0011-local-timer-interrupt-foundation.md) adds separate returning
+external-interrupt entries only in isolated timer configurations. Exception
+vectors and #DF IST1 retain this record's fatal policy. Earlier test gates and
+their IF=0 behavior are preserved; ordinary boot does not enable interrupts.
