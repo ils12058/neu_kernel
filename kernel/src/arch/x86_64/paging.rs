@@ -833,6 +833,8 @@ pub struct UserSpace {
     tables: [bool; TABLES],
     frames: [Option<FrameId>; 4],
     private: Option<FrameId>,
+    #[cfg(feature = "switch-test")]
+    stack: Option<OwnedStack>,
 }
 #[cfg(feature = "user-test")]
 impl UserSpace {
@@ -844,6 +846,7 @@ impl UserSpace {
 
 #[cfg(feature = "user-test")]
 impl Paging<'_, '_> {
+    #[cfg(not(feature = "switch-test"))]
     pub fn prepare_user(
         &mut self,
         bytes: &[u8],
@@ -874,6 +877,8 @@ impl Paging<'_, '_> {
             tables: [false; TABLES],
             frames: [None; 4],
             private: None,
+            #[cfg(feature = "switch-test")]
+            stack: None,
         };
         self.memory.budget = budget;
         let result = (|| {
@@ -1043,7 +1048,11 @@ impl Paging<'_, '_> {
         }
         for slot in 0..TABLES {
             let actual = tree.translate(&self.memory, WINDOW + slot as u64 * PAGE)?;
-            if space.tables[slot] {
+            #[cfg(feature = "switch-test")]
+            let stack_table = space.stack.as_ref().is_some_and(|s| s.tables[slot]);
+            #[cfg(not(feature = "switch-test"))]
+            let stack_table = false;
+            if space.tables[slot] && !stack_table {
                 let table = self.memory.tables[slot];
                 if table.physical == 0
                     || actual.is_none_or(|a| {
@@ -1101,6 +1110,7 @@ impl Paging<'_, '_> {
         }
         self.registry.deactivate_space(space.id)
     }
+    #[cfg(not(feature = "switch-test"))]
     pub fn user_result(&mut self, space: &UserSpace) -> Result<u64> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -1136,7 +1146,11 @@ impl Paging<'_, '_> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
-        self.registry.can_allocate(space.id)?; // also refuses an active root
+        self.registry.can_allocate(space.id)?; // also refuses active/pinned roots
+        #[cfg(feature = "switch-test")]
+        if space.stack.is_some() {
+            return Err(Error::InUse);
+        }
         let before = self.stats();
         let old_tables = self.table_count();
         let tables = space.tables.iter().filter(|v| **v).count();
@@ -1226,5 +1240,204 @@ impl Paging<'_, '_> {
             return Err(Error::Corrupt);
         }
         self.verify()
+    }
+}
+
+#[cfg(feature = "switch-test")]
+struct OwnedStack {
+    binding: neu_kernel::context::StackBinding,
+    frames: [Option<FrameId>; logic::KSTACK_PAGES],
+    tables: [bool; TABLES],
+}
+#[cfg(feature = "switch-test")]
+impl Paging<'_, '_> {
+    pub fn prepare_thread_stack(
+        &mut self,
+        space: &mut UserSpace,
+        active: neu_kernel::node::ActiveContext,
+        budget: Option<usize>,
+    ) -> Result<neu_kernel::context::StackBinding> {
+        use neu_kernel::context::StackBinding;
+        if current_root() != self.tree.root
+            || space.stack.is_some()
+            || active.context.root != space.root
+            || active.context.space != space.id
+        {
+            return Err(Error::InUse);
+        }
+        self.registry.can_allocate(space.id)?;
+        let binding = StackBinding::new(active);
+        if !binding.valid(active) {
+            return Err(Error::NotOwned);
+        }
+        let before = self.stats();
+        let tables = self.table_count();
+        let old = self.memory.tables.map(|t| t.physical != 0);
+        let mut stack = OwnedStack {
+            binding,
+            frames: [None; logic::KSTACK_PAGES],
+            tables: [false; TABLES],
+        };
+        let mut remaining = budget;
+        let result = (|| {
+            for frame in &mut stack.frames {
+                if let Some(left) = &mut remaining {
+                    if *left == 0 {
+                        return Err(Error::Exhausted);
+                    }
+                    *left -= 1;
+                }
+                let id = self.allocate_frame_for(space.id)?;
+                *frame = Some(id);
+                self.with_frame_mut(id, |bytes| bytes.fill(0xa5))?;
+            }
+            let [Some(a), Some(b)] = stack.frames else {
+                return Err(Error::Corrupt);
+            };
+            self.memory.budget = remaining;
+            logic::map_stack_frames_for(
+                &PageTree {
+                    root: space.root,
+                    bits: self.tree.bits,
+                },
+                &mut self.memory,
+                &mut self.registry,
+                space.id,
+                binding.bottom,
+                &[a, b],
+            )
+        })();
+        self.memory.budget = None;
+        stack.tables = core::array::from_fn(|i| !old[i] && self.memory.tables[i].physical != 0);
+        for i in 0..TABLES {
+            space.tables[i] |= stack.tables[i];
+        }
+        space.stack = Some(stack);
+        if let Err(error) = result {
+            self.destroy_thread_stack(space, active.thread)?;
+            if self.stats() != before || self.table_count() != tables {
+                return Err(Error::Corrupt);
+            }
+            return Err(error);
+        }
+        self.verify_thread_stack(space, binding)?;
+        Ok(binding)
+    }
+    pub fn verify_thread_stack(
+        &self,
+        space: &UserSpace,
+        binding: neu_kernel::context::StackBinding,
+    ) -> Result<()> {
+        self.verify_user(space)?;
+        let stack = space.stack.as_ref().ok_or(Error::NotOwned)?;
+        if stack.binding != binding || binding.space != space.id || binding.root != space.root {
+            return Err(Error::NotOwned);
+        }
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        for (index, frame) in stack.frames.iter().enumerate() {
+            let frame = frame.ok_or(Error::NotOwned)?;
+            let va = binding.bottom + index as u64 * PAGE;
+            let pte = tree.translate(&self.memory, va)?.ok_or(Error::NotMapped)?;
+            if pte.user
+                || pte.permissions != Permissions::RW
+                || pte.page_size != PAGE
+                || pte.physical != self.registry.physical(frame)?
+                || self.registry.owner(frame)? != space.id
+                || self.registry.mapping_for(space.id, va)?.frame != frame
+                || self.tree.translate(&self.memory, va)?.is_some()
+            {
+                return Err(Error::Flags);
+            }
+        }
+        for va in [binding.bottom - PAGE, binding.top] {
+            if tree.translate(&self.memory, va)?.is_some() {
+                return Err(Error::Flags);
+            }
+        }
+        let other =
+            logic::KSTACK_BASE + (1 - binding.thread.index()) as u64 * logic::KSTACK_STRIDE + PAGE;
+        for offset in [0, PAGE] {
+            if tree.translate(&self.memory, other + offset)?.is_some() {
+                return Err(Error::Flags);
+            }
+        }
+        Ok(())
+    }
+    pub fn pin_context(&mut self, space: &UserSpace) -> Result<()> {
+        let stack = space.stack.as_ref().ok_or(Error::NotOwned)?;
+        self.verify_thread_stack(space, stack.binding)?;
+        self.registry.pin_space(space.id)
+    }
+    pub fn unpin_context(&mut self, space: &UserSpace) -> Result<()> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.registry.unpin_space(space.id)
+    }
+    pub fn context_reclaimable(&self, space: &UserSpace) -> Result<()> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.registry.can_allocate(space.id)
+    }
+    pub fn destroy_thread_stack(
+        &mut self,
+        space: &mut UserSpace,
+        owner: neu_kernel::node::ThreadId,
+    ) -> Result<()> {
+        self.context_reclaimable(space)?;
+        if space
+            .stack
+            .as_ref()
+            .is_none_or(|s| s.binding.thread != owner)
+        {
+            return Err(Error::NotOwned);
+        }
+        let stack = space.stack.take().ok_or(Error::NotOwned)?;
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        for index in 0..logic::KSTACK_PAGES {
+            let va = stack.binding.bottom + index as u64 * PAGE;
+            if tree.translate(&self.memory, va)?.is_some() {
+                if self.registry.mapping_for(space.id, va)?.frame
+                    != stack.frames[index].ok_or(Error::Corrupt)?
+                {
+                    return Err(Error::Corrupt);
+                }
+                tree.unmap(&mut self.memory, va)?;
+                self.registry.remove_for(space.id, va)?;
+            }
+        }
+        for frame in stack.frames.into_iter().flatten() {
+            self.free_frame(frame)?;
+        }
+        for slot in 0..TABLES {
+            space.tables[slot] &= self.memory.tables[slot].physical != 0;
+        }
+        self.verify_user(space)?;
+        self.verify()
+    }
+    pub fn stack_high_water(&mut self, space: &UserSpace) -> Result<()> {
+        let frame =
+            space.stack.as_ref().ok_or(Error::NotOwned)?.frames[0].ok_or(Error::NotOwned)?;
+        if !self.with_frame(frame, |bytes| bytes[..512].iter().all(|byte| *byte == 0xa5))? {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
+    pub fn user_words(&mut self, space: &UserSpace) -> Result<[u64; 3]> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            core::array::from_fn(|i| {
+                u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+            })
+        })
     }
 }

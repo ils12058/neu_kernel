@@ -2,10 +2,12 @@
 # storage. No push/call or user-address dereference precedes the trusted RSP.
 .section .bss.native_entry,"aw",@nobits
 .balign 8
-.global neu_native_busy, neu_native_observed
+.global neu_native_busy, neu_native_observed, neu_native_saved_user_rsp
 neu_native_busy: .skip 8
 neu_native_saved_user_rsp: .skip 8
 neu_native_observed: .skip 8
+.global neu_native_selected_top
+neu_native_selected_top: .skip 8
 
 .section .bss.native_emergency,"aw",@nobits
 .balign 4096
@@ -23,7 +25,11 @@ neu_native_entry:
     jne neu_native_nested_entry
     mov qword ptr [rip + neu_native_busy], 1
     mov [rip + neu_native_saved_user_rsp], rsp
+.if {cooperative}
+    mov rsp, [rip + neu_native_selected_top]
+.else
     lea rsp, [rip + __user_kernel_top]
+.endif
 neu_native_stack_ready:
     push {user_ss}
     push qword ptr [rip + neu_native_saved_user_rsp]
@@ -63,7 +69,7 @@ neu_native_stack_ready:
     cmp qword ptr [rip + neu_native_observed], 0
     jne 9f
     mov qword ptr [rip + neu_native_observed], 1
-    mov ecx, 0x10000000
+    mov ecx, {kernel_wait}
 .global neu_native_kernel_wait, neu_native_kernel_wait_end
 neu_native_kernel_wait:
     dec ecx

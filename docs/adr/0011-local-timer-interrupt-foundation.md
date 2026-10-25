@@ -156,3 +156,12 @@ The freestanding [Rust target](https://doc.rust-lang.org/rustc/platform-support/
 uses the System V convention without a red zone and defaults to no floating-point
 or vector-register code generation. The integer-only handler retains that policy;
 this is not an x87/SIMD Thread context switch.
+
+### 2026-10-26 — cooperative switching boundary
+
+[ADR 0012](0012-cooperative-thread-context-switching.md) implements the cooperative
+subset using private entry stacks and copied user contexts. It finishes every
+kernel slice before FIFO selection; it does not schedule from this timer or
+enable interrupts in native/user execution. These timer tests retain their
+original enable/drain/stop policy. Deferred interrupt-driven switching belongs
+to Phase 4C and still requires an explicit safe-entry/rescheduling contract.

@@ -1,5 +1,6 @@
 //! Bounded kernel-internal bootstrap lifecycle, not capabilities or a scheduler.
 //! Nodes own domains/resources; separately identified Threads refer to a Node.
+use crate::context::{Dispatch, SavedContext, StackBinding};
 use crate::paging::{SpaceId, canonical, physical};
 pub const MAX_NODES: usize = 2;
 pub const MAX_THREADS: usize = 2;
@@ -19,6 +20,9 @@ impl NodeId {
     }
 }
 impl ThreadId {
+    pub fn index(self) -> usize {
+        self.slot
+    }
     pub fn raw(self) -> u64 {
         (u64::from(self.generation) << 32) | (self.slot as u64 + 1)
     }
@@ -36,6 +40,7 @@ pub enum NodeState {
 pub enum ThreadState {
     Configuring,
     Ready,
+    Runnable,
     Running,
     Exited,
     Reclaimed,
@@ -90,6 +95,9 @@ pub struct Thread {
     pub state: ThreadState,
     pub context: ThreadContext,
     pub outcome: Option<ExitReason>,
+    pub stack: Option<StackBinding>,
+    pub saved: Option<SavedContext>,
+    pub queued: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -121,6 +129,9 @@ impl Nodes {
             thread_generations: [0; MAX_THREADS],
             active: None,
         }
+    }
+    pub fn active(&self) -> Option<ActiveContext> {
+        self.active
     }
     pub fn node(&self, id: NodeId) -> Result<Node> {
         self.nodes
@@ -221,6 +232,9 @@ impl Nodes {
             state: ThreadState::Configuring,
             context,
             outcome: None,
+            stack: None,
+            saved: None,
+            queued: false,
         });
         Ok(id)
     }
@@ -279,6 +293,8 @@ impl Nodes {
         }
         t.state = ThreadState::Exited;
         t.outcome = Some(outcome);
+        t.saved = None;
+        t.queued = false;
         self.threads[t.id.slot] = Some(t);
         if matches!(outcome, ExitReason::UserFault(_)) {
             for other in self
@@ -289,13 +305,18 @@ impl Nodes {
             {
                 other.state = ThreadState::Exited;
                 other.outcome = Some(outcome);
+                other.saved = None;
+                other.queued = false;
             }
         }
         let live = self.threads.iter().flatten().any(|t| {
             t.node == n.id
                 && matches!(
                     t.state,
-                    ThreadState::Configuring | ThreadState::Ready | ThreadState::Running
+                    ThreadState::Configuring
+                        | ThreadState::Ready
+                        | ThreadState::Runnable
+                        | ThreadState::Running
                 )
         });
         // A normal Thread exit ends its Node only when no live Threads remain.
@@ -309,6 +330,118 @@ impl Nodes {
         }
         self.nodes[n.id.slot] = Some(n);
         self.active = None;
+        Ok(())
+    }
+    pub fn install_execution(&mut self, id: ThreadId, saved: SavedContext) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        if t.state != ThreadState::Ready
+            || n.state != NodeState::Ready
+            || t.stack.is_some()
+            || t.saved.is_some()
+            || t.queued
+            || n.space != Some(t.context.space)
+            || !saved.fresh
+            || !saved.valid(active, saved.stack)
+        {
+            return Err(Error::Association);
+        }
+        t.stack = Some(saved.stack);
+        t.saved = Some(saved);
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    pub fn enqueue(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        if !matches!(t.state, ThreadState::Ready | ThreadState::Runnable)
+            || t.queued
+            || n.state != NodeState::Ready
+            || n.space != Some(t.context.space)
+            || t.stack
+                .is_none_or(|stack| t.saved.is_none_or(|s| !s.valid(active, stack)))
+        {
+            return Err(Error::State);
+        }
+        t.state = ThreadState::Runnable;
+        t.queued = true;
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    pub fn dispatch(&mut self, id: ThreadId) -> Result<Dispatch> {
+        let mut t = self.thread(id)?;
+        let mut n = self.node(t.node)?;
+        if self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        let saved = t.saved.ok_or(Error::State)?;
+        if t.state != ThreadState::Runnable
+            || !t.queued
+            || n.state != NodeState::Ready
+            || n.space != Some(t.context.space)
+            || t.stack.is_none_or(|stack| !saved.valid(active, stack))
+        {
+            return Err(Error::Association);
+        }
+        t.saved = None;
+        t.queued = false;
+        t.state = ThreadState::Running;
+        n.state = NodeState::Active;
+        self.threads[id.slot] = Some(t);
+        self.nodes[n.id.slot] = Some(n);
+        self.active = Some(active);
+        Ok(Dispatch { active, saved })
+    }
+    pub fn suspend(&mut self, active: ActiveContext, frame: crate::syscall::Frame) -> Result<()> {
+        if self.active != Some(active) {
+            return Err(Error::Association);
+        }
+        let mut t = self.thread(active.thread)?;
+        let mut n = self.node(active.node)?;
+        let stack = t.stack.ok_or(Error::State)?;
+        let saved = SavedContext::yielded(active, stack, frame);
+        if t.state != ThreadState::Running
+            || t.queued
+            || t.saved.is_some()
+            || !saved.valid(active, stack)
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Runnable;
+        t.saved = Some(saved);
+        n.state = NodeState::Ready;
+        self.threads[t.id.slot] = Some(t);
+        self.nodes[n.id.slot] = Some(n);
+        self.active = None;
+        Ok(())
+    }
+    pub fn release_stack(&mut self, id: ThreadId, stack: StackBinding) -> Result<()> {
+        let mut t = self.thread(id)?;
+        if t.state != ThreadState::Exited
+            || t.queued
+            || t.saved.is_some()
+            || t.stack != Some(stack)
+            || self.active.is_some_and(|a| a.thread == id)
+        {
+            return Err(Error::InUse);
+        }
+        t.stack = None;
+        self.threads[id.slot] = Some(t);
         Ok(())
     }
     pub fn construction_failed(&mut self, id: NodeId) -> Result<()> {
@@ -327,7 +460,13 @@ impl Nodes {
     }
     pub fn release_space(&mut self, id: NodeId, space: SpaceId) -> Result<()> {
         let mut n = self.node(id)?;
-        if n.state != NodeState::Exited {
+        if n.state != NodeState::Exited
+            || self
+                .threads
+                .iter()
+                .flatten()
+                .any(|t| t.node == id && (t.stack.is_some() || t.saved.is_some() || t.queued))
+        {
             return Err(Error::InUse);
         }
         if n.space != Some(space) {
@@ -346,7 +485,11 @@ impl Nodes {
             return Err(Error::InUse);
         }
         if self.threads.iter().flatten().any(|t| {
-            t.node == id && t.state != ThreadState::Exited && t.state != ThreadState::Reclaimed
+            t.node == id
+                && ((t.state != ThreadState::Exited && t.state != ThreadState::Reclaimed)
+                    || t.stack.is_some()
+                    || t.saved.is_some()
+                    || t.queued)
         }) {
             return Err(Error::InUse);
         }
@@ -549,6 +692,9 @@ mod tests {
             state: ThreadState::Ready,
             context: n.thread(t).unwrap().context,
             outcome: None,
+            stack: None,
+            saved: None,
+            queued: false,
         });
         let active = n.start(t).unwrap();
         n.complete(active, ExitReason::Normal(0)).unwrap();

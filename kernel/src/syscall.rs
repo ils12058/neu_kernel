@@ -96,7 +96,7 @@ pub struct ReturnContext {
     pub ss: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     pub registers: Registers,
     pub context: ReturnContext,

@@ -414,3 +414,40 @@ pub fn configure_interrupts() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+#[cfg(feature = "switch-test")]
+pub fn configure_thread_stack(
+    stack: neu_kernel::context::StackBinding,
+) -> neu_kernel::paging::Result<()> {
+    let flags: u64;
+    // SAFETY: Read-only flags at the non-preemptible dispatch boundary.
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+    }
+    if !INITIALIZED.load(Ordering::Relaxed)
+        || flags & 0x200 != 0
+        || stack.top - stack.bottom != 8192
+        || !stack.top.is_multiple_of(4096)
+        || stack.bottom < neu_kernel::paging::KSTACK_BASE
+        || stack.top > neu_kernel::paging::KSTACK_BASE + 2 * neu_kernel::paging::KSTACK_STRIDE
+    {
+        return Err(neu_kernel::paging::Error::Flags);
+    }
+    // SAFETY: Caller verified private supervisor stack mappings under the next
+    // root. IF=0, no user context can observe a partially published selection.
+    unsafe {
+        ptr::write_unaligned(
+            ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(),
+            stack.top,
+        );
+    }
+    if rsp0() != stack.top {
+        return Err(neu_kernel::paging::Error::Corrupt);
+    }
+    Ok(())
+}
+#[cfg(feature = "switch-test")]
+pub fn rsp0() -> u64 {
+    // SAFETY: Initialized packed TSS, read at IF=0; copy without an aligned borrow.
+    unsafe { ptr::read_unaligned(ptr::addr_of!((*TSS.0.get()).rsp).cast::<u64>()) }
+}

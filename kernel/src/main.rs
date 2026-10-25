@@ -50,7 +50,16 @@ const _: () = assert!(
         + cfg!(feature = "test-timer-spurious") as u8
         + cfg!(feature = "test-timer-unsupported") as u8
         + cfg!(feature = "test-timer-unexpected") as u8
-        + cfg!(feature = "test-timer-software") as u8)
+        + cfg!(feature = "test-timer-software") as u8
+        + cfg!(feature = "test-switch") as u8
+        + cfg!(feature = "test-switch-a-fault") as u8
+        + cfg!(feature = "test-switch-b-fault") as u8
+        + cfg!(feature = "test-switch-cross") as u8
+        + cfg!(feature = "test-switch-stack-user") as u8
+        + cfg!(feature = "test-switch-stack-guard") as u8
+        + cfg!(feature = "test-switch-invalid-context") as u8
+        + cfg!(feature = "test-switch-rollback") as u8
+        + cfg!(feature = "test-switch-stale") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -208,7 +217,12 @@ extern "C" fn neu_main() -> ! {
         fail(reason);
     }
 
-    #[cfg(feature = "node-test")]
+    #[cfg(feature = "switch-test")]
+    if let Err(error) = arch::cooperative::run(&mut paging) {
+        arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: switching {error:?}\n"));
+        arch::halt();
+    }
+    #[cfg(all(feature = "node-test", not(feature = "switch-test")))]
     if let Err(error) = arch::nodes::run(&mut paging) {
         arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: Nodes {error:?}\n"));
         arch::halt();

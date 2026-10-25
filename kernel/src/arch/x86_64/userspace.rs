@@ -291,7 +291,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "native-test")]
+#[cfg(all(feature = "native-test", not(feature = "switch-test")))]
 pub fn enter_native(root: u64) {
     unsafe extern "C" {
         fn neu_enter_native(rip: u64, rsp: u64, kernel_root: u64);
@@ -301,8 +301,28 @@ pub fn enter_native(root: u64) {
         neu_enter_native(CODE, USER_RSP, root);
     }
 }
-#[cfg(feature = "native-test")]
+#[cfg(all(feature = "native-test", not(feature = "switch-test")))]
 pub fn resume_native() -> ! {
     // SAFETY: Called only by the active native session; it owns this continuation.
     unsafe { neu_resume_kernel() }
+}
+
+#[cfg(feature = "switch-test")]
+pub fn enter_context(frame: &neu_kernel::syscall::Frame, root: u64, top: u64) {
+    unsafe extern "C" {
+        fn neu_enter_context(frame: *const neu_kernel::syscall::Frame, root: u64, top: u64);
+    }
+    // SAFETY: Caller validated the copied frame, selected root and stack. The
+    // common normal image stack remains mapped in both roots and holds this borrow.
+    unsafe {
+        neu_enter_context(frame, root, top);
+    }
+}
+#[cfg(feature = "switch-test")]
+pub fn resume_context() -> ! {
+    unsafe extern "C" {
+        fn neu_resume_context() -> !;
+    }
+    // SAFETY: Active slice owns the single live common-stack continuation.
+    unsafe { neu_resume_context() }
 }

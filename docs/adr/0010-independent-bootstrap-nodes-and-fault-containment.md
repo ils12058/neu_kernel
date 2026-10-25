@@ -153,3 +153,10 @@ Thread, MEM, EXEC, SEC, DIAG or TEST proposals in the architecture register.
   establishes a separate kernel-only timer window. These Nodes still execute
   sequentially with IF=0; their model, ownership and ABI remain unchanged. Safe
   Thread switching requires the new record's stack/context prerequisites first.
+
+- **2026-10-26, Phase 4B:** [ADR 0012](0012-cooperative-thread-context-switching.md)
+  adds FIFO Thread admission/suspension, by-value user contexts, private entry
+  stacks and lifetime pins. Root/backing ownership remains Node-scoped and all
+  switches retain IF=0. Newly allocated stack tables are accessed only through
+  the common kernel workspace; no sibling or stale user workspace aliases are
+  added. The accepted protection-domain distinction and earlier tests remain.

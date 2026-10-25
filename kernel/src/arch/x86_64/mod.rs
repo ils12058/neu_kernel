@@ -2,12 +2,14 @@
 
 use core::arch::{asm, global_asm, x86_64::__cpuid};
 
+#[cfg(feature = "switch-test")]
+pub mod cooperative;
 pub mod exceptions;
 #[cfg(feature = "timer-test")]
 pub mod interrupts;
 #[cfg(feature = "native-test")]
 pub mod native;
-#[cfg(feature = "node-test")]
+#[cfg(all(feature = "node-test", not(feature = "switch-test")))]
 pub mod nodes;
 pub mod paging;
 pub mod serial;

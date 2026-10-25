@@ -98,6 +98,18 @@ pub fn user_range(base: u64, pages: usize) -> Result<()> {
     }
     Ok(())
 }
+pub const KSTACK_BASE: u64 = 0xffff_c000_0000_0000;
+pub const KSTACK_STRIDE: u64 = 4 * PAGE;
+pub const KSTACK_PAGES: usize = 2;
+pub fn stack_range(base: u64, pages: usize) -> Result<()> {
+    page_address(base)?;
+    if pages != KSTACK_PAGES
+        || ![KSTACK_BASE + PAGE, KSTACK_BASE + KSTACK_STRIDE + PAGE].contains(&base)
+    {
+        return Err(Error::Address);
+    }
+    Ok(())
+}
 pub fn table_entry(address: u64, bits: u8) -> Result<u64> {
     physical(address, bits)?;
     Ok(address | 3)
@@ -385,6 +397,7 @@ struct Space {
     generation: u64,
     live: bool,
     root: u64,
+    pins: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameId {
@@ -442,6 +455,7 @@ impl Registry {
                 generation: 0,
                 live: false,
                 root: 0,
+                pins: 0,
             }; USER_SPACES],
             active: None,
         }
@@ -460,6 +474,7 @@ impl Registry {
             generation,
             live: true,
             root: 0,
+            pins: 0,
         };
         Ok(SpaceId { slot, generation })
     }
@@ -478,11 +493,30 @@ impl Registry {
     }
     pub fn can_allocate(&self, id: SpaceId) -> Result<()> {
         self.valid_space(id)?;
-        if self.active.is_some() {
+        if self.active.is_some() || (id != SpaceId::KERNEL && self.space(id)?.pins != 0) {
             Err(Error::InUse)
         } else {
             Ok(())
         }
+    }
+    pub fn pin_space(&mut self, id: SpaceId) -> Result<()> {
+        let space = self.space(id)?;
+        if self.active.is_some() || space.root == 0 {
+            return Err(Error::InUse);
+        }
+        if space.pins == 2 {
+            return Err(Error::Capacity);
+        }
+        self.spaces[id.slot].pins += 1;
+        Ok(())
+    }
+    pub fn unpin_space(&mut self, id: SpaceId) -> Result<()> {
+        let space = self.space(id)?;
+        if self.active.is_some() || space.pins == 0 {
+            return Err(Error::InUse);
+        }
+        self.spaces[id.slot].pins -= 1;
+        Ok(())
     }
     pub fn bind_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
         self.space(id)?;
@@ -516,6 +550,7 @@ impl Registry {
     }
     pub fn clear_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
         if self.root(id)? != root
+            || self.space(id)?.pins != 0
             || self.active == Some(id)
             || self.frames.iter().any(|f| f.live && f.owner == id)
             || self.mappings.iter().any(|m| m.live && m.space == id)
@@ -528,6 +563,7 @@ impl Registry {
     pub fn retire_space(&mut self, id: SpaceId) -> Result<()> {
         self.space(id)?;
         if self.active == Some(id)
+            || self.space(id)?.pins != 0
             || self.spaces[id.slot].root != 0
             || self.frames.iter().any(|f| f.live && f.owner == id)
             || self.mappings.iter().any(|m| m.live && m.space == id)
@@ -595,7 +631,9 @@ impl Registry {
     }
     pub fn releasable(&self, id: FrameId) -> Result<u64> {
         let frame = self.frame(id)?;
-        if self.active == Some(frame.owner) || self.mappings.iter().any(|m| m.live && m.frame == id)
+        if self.active == Some(frame.owner)
+            || (frame.owner != SpaceId::KERNEL && self.space(frame.owner)?.pins != 0)
+            || self.mappings.iter().any(|m| m.live && m.frame == id)
         {
             return Err(Error::InUse);
         }
@@ -619,6 +657,7 @@ impl Registry {
             Target {
                 space: SpaceId::KERNEL,
                 user: true,
+                stack: false,
             },
             base,
             frames,
@@ -633,7 +672,9 @@ impl Registry {
         permissions: Permissions,
     ) -> Result<()> {
         self.can_allocate(target.space)?;
-        if target.user {
+        if target.stack {
+            stack_range(base, frames.len())?;
+        } else if target.user {
             user_range(base, frames.len())?;
         } else {
             test_range(base, frames.len())?;
@@ -683,6 +724,7 @@ impl Registry {
             Target {
                 space: SpaceId::KERNEL,
                 user: true,
+                stack: false,
             },
             base,
             frames,
@@ -729,7 +771,8 @@ impl Registry {
     }
     pub fn remove_for(&mut self, space: SpaceId, address: u64) -> Result<FrameId> {
         self.valid_space(space)?;
-        if self.active == Some(space) {
+        if self.active == Some(space) || (space != SpaceId::KERNEL && self.space(space)?.pins != 0)
+        {
             return Err(Error::InUse);
         }
         let slot = self
@@ -745,11 +788,13 @@ impl Registry {
 struct Target {
     space: SpaceId,
     user: bool,
+    stack: bool,
 }
 impl Target {
     const KERNEL: Self = Self {
         space: SpaceId::KERNEL,
         user: false,
+        stack: false,
     };
 }
 
@@ -810,7 +855,36 @@ pub fn map_user_frames_for(
         base,
         frames,
         permissions,
-        Target { space, user: true },
+        Target {
+            space,
+            user: true,
+            stack: false,
+        },
+    )
+}
+pub fn map_stack_frames_for(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    space: SpaceId,
+    base: u64,
+    frames: &[FrameId],
+) -> Result<()> {
+    if registry.root(space)? != tree.root {
+        return Err(Error::NotOwned);
+    }
+    map_frames_kind(
+        tree,
+        memory,
+        registry,
+        base,
+        frames,
+        Permissions::RW,
+        Target {
+            space,
+            user: false,
+            stack: true,
+        },
     )
 }
 fn map_frames_kind(

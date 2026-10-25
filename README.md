@@ -5,26 +5,27 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K4 / Phase 4A adds calibrated local-APIC timer delivery in an isolated kernel
-interrupt window. QEMU's verified x2APIC MSR interface is preferred; a separate
-xAPIC test verifies a supervisor UC MMIO mapping. Dedicated returning entries
-preserve GPRs and the interrupted stack, count real timer events and send EOI.
-Shutdown masks/stops the source, drains pending delivery and returns to IF=0.
+K4 / Phase 4B adds cooperative FIFO switching between two independently owned
+Ring 3 Threads, one per Node. Yield saves a complete user context; the kernel
+finishes that slice on its common stack before resuming another Thread. Each
+Thread has a private guarded 8 KiB kernel-entry stack and a pinned address space.
+Eight A/B dispatches preserve registers and user-stack witnesses, producing 63
+and 105 after four computation stages per Thread.
 
-The suite contains **52 host tests and 47 QEMU scenarios**, retaining all previous
-43/40 tests. It covers repeated timer delivery and rearming, spurious no-EOI
-handling, unsupported configuration and software/unexpected-vector rejection.
-QMP observes the enabled CPU and programmed controller independently. The tested
-environment remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple Silicon,
-Rust 1.95.0 and Limine 12.9.4/base 6.
+The suite contains **64 host tests and 56 QEMU scenarios**, retaining all previous
+52/47 tests. It covers actual suspended-context resumption, private stack/TSS/CR3
+selection, fault containment in both directions, cross-Node isolation, guard and
+supervisor permissions, invalid saved state, rollback and stale identities.
+The environment remains 1-vCPU/512 MiB QEMU 11.0.0 TCG + UEFI/OVMF on Apple
+Silicon, Rust 1.95.0 and Limine 12.9.4/base 6.
 
-The two bootstrap Nodes and native ABI 0.1 remain available in their original
-IF=0 configurations. Ordinary boot also retains IF=0. There is no Thread context
-switch, preemptive scheduler, public capability interface or general IRQ routing.
-The approximately 1 ms clockevent is calibrated against the emulated PIT;
-TCG delivery counts are not a precise clocksource or CPU-time guarantee. See
-[ADR 0011](docs/adr/0011-local-timer-interrupt-foundation.md) for the safety
-boundary and prerequisites for Phase 4B.
+Switching and userspace retain IF=0; Phase 4A timer tests stay independent.
+`abi_query=1`, `thread_exit=2` and ABI 0.1 results/features are unchanged. Yield
+uses a private test-only operation without allocating a public ABI number.
+Timer-driven preemption, SMP, multiple Threads per Node and capability/factory
+interfaces remain unimplemented. See [ADR 0012](docs/adr/0012-cooperative-thread-context-switching.md)
+for the decision and Phase 4C boundary. Architecture v0.2 remains the historical
+design baseline.
 
 ## Build and run
 
@@ -47,11 +48,10 @@ disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
 QEMU. `make test` runs host memory/paging/lifecycle/ABI/timer tests, observes each
 guest's expected result, active CR3 and halt through QMP, then shuts QEMU down
-itself. See the implementation status for the individual test commands. Run `python3 tools/neu.py test --case timer` for hardware timer delivery,
-`python3 tools/neu.py test --case timer-xapic` for the MMIO fallback, or
-`python3 tools/neu.py test --case nodes` for the two-Node proof; use
-`python3 tools/neu.py test --case native` for the original native ABI proof, or
-`python3 tools/neu.py test --case user` for the earlier test-gate fixture.
+itself. Run `python3 tools/neu.py test --case switch` for cooperative switching,
+`--case switch-a-fault` for suspended-sibling containment, or
+`--case switch-rollback` for construction failure. Earlier `timer`, `timer-xapic`,
+`nodes`, `native` and `user` cases remain available with the same command.
 
 ## Documentation
 

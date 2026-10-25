@@ -761,3 +761,145 @@ fn device_leaf_requires_verified_uc_pat_and_never_becomes_user_ram() {
     tree.unmap(&mut memory, va).unwrap();
     assert_eq!(memory.pages.len(), count);
 }
+
+#[test]
+fn context_pins_preserve_owned_mappings_frames_and_root_lifetimes() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let mut r = Registry::new();
+    let space = r.create_space().unwrap();
+    r.bind_root(space, tree.root).unwrap();
+    let frame = r.insert_for(space, 0x100000).unwrap();
+    let unmapped = r.insert_for(space, 0x101000).unwrap();
+    r.initialize(frame).unwrap();
+    r.initialize(unmapped).unwrap();
+    map_user_frames_for(
+        &tree,
+        &mut memory,
+        &mut r,
+        space,
+        USER_BASE,
+        &[frame],
+        Permissions::RW,
+    )
+    .unwrap();
+    r.pin_space(space).unwrap();
+    let count = memory.pages.len();
+    assert_eq!(r.remove_for(space, USER_BASE), Err(Error::InUse));
+    assert_eq!(r.releasable(unmapped), Err(Error::InUse));
+    assert_eq!(r.clear_root(space, tree.root), Err(Error::InUse));
+    assert_eq!(r.retire_space(space), Err(Error::InUse));
+    assert_eq!(
+        map_user_frames_for(
+            &tree,
+            &mut memory,
+            &mut r,
+            space,
+            USER_BASE + PAGE,
+            &[unmapped],
+            Permissions::R
+        ),
+        Err(Error::InUse)
+    );
+    assert_eq!(memory.pages.len(), count);
+    assert_eq!(r.mapping_for(space, USER_BASE).unwrap().frame, frame);
+    r.unpin_space(space).unwrap();
+    tree.unmap(&mut memory, USER_BASE).unwrap();
+    r.remove_for(space, USER_BASE).unwrap();
+    r.retire(frame).unwrap();
+    r.retire(unmapped).unwrap();
+    r.clear_root(space, tree.root).unwrap();
+    r.retire_space(space).unwrap();
+}
+#[test]
+fn context_pin_bounds_refuse_wrap_underflow_active_release_and_stale_ids() {
+    let mut r = Registry::new();
+    let id = r.create_space().unwrap();
+    r.bind_root(id, 0x1000).unwrap();
+    assert_eq!(r.unpin_space(id), Err(Error::InUse));
+    r.pin_space(id).unwrap();
+    r.pin_space(id).unwrap();
+    assert_eq!(r.pin_space(id), Err(Error::Capacity));
+    r.activate_space(id).unwrap();
+    assert_eq!(r.unpin_space(id), Err(Error::InUse));
+    r.deactivate_space(id).unwrap();
+    r.unpin_space(id).unwrap();
+    r.unpin_space(id).unwrap();
+    r.clear_root(id, 0x1000).unwrap();
+    r.retire_space(id).unwrap();
+    let new = r.create_space().unwrap();
+    r.bind_root(new, 0x2000).unwrap();
+    r.pin_space(new).unwrap();
+    assert_eq!(r.unpin_space(id), Err(Error::NotOwned));
+    assert_eq!(r.can_allocate(new), Err(Error::InUse));
+    r.unpin_space(new).unwrap();
+}
+#[test]
+fn supervisor_stack_arena_guards_owner_checks_and_rollback_are_enforced() {
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let mut r = Registry::new();
+    let space = r.create_space().unwrap();
+    r.bind_root(space, tree.root).unwrap();
+    let other = r.create_space().unwrap();
+    r.bind_root(other, 0x9000).unwrap();
+    let a = r.insert_for(space, 0x100000).unwrap();
+    let b = r.insert_for(space, 0x101000).unwrap();
+    r.initialize(a).unwrap();
+    r.initialize(b).unwrap();
+    let count = memory.pages.len();
+    assert_eq!(
+        map_stack_frames_for(&tree, &mut memory, &mut r, space, KSTACK_BASE, &[a, b]),
+        Err(Error::Address)
+    );
+    assert_eq!(
+        map_stack_frames_for(
+            &tree,
+            &mut memory,
+            &mut r,
+            other,
+            KSTACK_BASE + PAGE,
+            &[a, b]
+        ),
+        Err(Error::NotOwned)
+    );
+    memory.budget = Some(2);
+    assert_eq!(
+        map_stack_frames_for(
+            &tree,
+            &mut memory,
+            &mut r,
+            space,
+            KSTACK_BASE + PAGE,
+            &[a, b]
+        ),
+        Err(Error::Exhausted)
+    );
+    assert_eq!(memory.pages.len(), count);
+    assert!(r.releasable(a).is_ok());
+    memory.budget = None;
+    map_stack_frames_for(
+        &tree,
+        &mut memory,
+        &mut r,
+        space,
+        KSTACK_BASE + PAGE,
+        &[a, b],
+    )
+    .unwrap();
+    for va in [KSTACK_BASE, KSTACK_BASE + 3 * PAGE] {
+        assert!(tree.translate(&memory, va).unwrap().is_none());
+    }
+    for va in [KSTACK_BASE + PAGE, KSTACK_BASE + 2 * PAGE] {
+        let t = tree.translate(&memory, va).unwrap().unwrap();
+        assert!(!t.user);
+        assert_eq!(t.permissions, Permissions::RW);
+    }
+    for va in [KSTACK_BASE + PAGE, KSTACK_BASE + 2 * PAGE] {
+        tree.unmap(&mut memory, va).unwrap();
+        r.remove_for(space, va).unwrap();
+    }
+    r.retire(a).unwrap();
+    r.retire(b).unwrap();
+    assert_eq!(memory.pages.len(), count);
+}

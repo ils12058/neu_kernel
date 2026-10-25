@@ -148,3 +148,13 @@ Operation numbers, scalar/register/status/version contract, guarded native entry
 and validated IRETQ stay unchanged. This ADR remains Accepted; its original
 Phase 2B rationale and fixture regressions are preserved. Capability governance
 and scheduling are not supplied by this extension.
+
+### 2026-10-26 — Phase 4B extension
+
+[ADR 0012](0012-cooperative-thread-context-switching.md) adds feature-gated
+cooperative execution. Its native entry selects a validated Thread-owned stack;
+yield copies user state and abandons the entry call chain through the common
+stack before another Thread runs. The entry guard stays held until that handoff.
+Earlier configurations keep their original stack and ABI behavior. Query/exit
+numbers, results, register conventions and advertised 0.1 features remain
+accepted and unchanged; no public yield number is allocated by this extension.

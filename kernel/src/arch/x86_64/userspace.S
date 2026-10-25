@@ -1,6 +1,7 @@
 # Test-only bridge. No SYSCALL/SYSRET, scheduler, or user-pointer arguments.
 .section .bss.user_bridge,"aw",@nobits
 .balign 8
+.global neu_user_saved_rsp, neu_user_saved_root, neu_user_saved_cr0, neu_user_saved_efer
 neu_user_saved_rsp: .skip 8
 neu_user_saved_root: .skip 8
 neu_user_saved_cr0: .skip 8

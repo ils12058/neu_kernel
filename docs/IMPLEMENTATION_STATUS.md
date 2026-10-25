@@ -1,50 +1,58 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-25. **Milestone:** K4 / Phase 4A, safe interrupt delivery and
-scheduler clockevent foundation. **Result:** complete against the supplied Phase
-4A criteria within the documented single-CPU QEMU profile. The suite has **52
-host tests and 47 QEMU scenarios**, retaining all previous **43 host tests and
-40 QEMU scenarios**. Real periodic local-APIC events return to a bounded kernel
-wait loop. There is no Thread switch, user preemption or scheduler.
+**Verified:** 2026-10-26. **Milestone:** K4 / Phase 4B, controlled single-CPU
+cooperative Thread context switching. **Result:** complete against the supplied
+Phase 4B criteria within the documented QEMU profile. The suite has **64 host
+tests and 56 QEMU scenarios**, preserving all previous **52 host tests and 47
+QEMU scenarios**. Two live Ring 3 Threads yield and resume real saved contexts
+through FIFO selection. No timer-driven or general kernel preemption exists.
 
 The inspected tree was clean on `main` at
-[`3049d2a`](https://github.com/ils12058/neu_kernel/commit/3049d2a03b14771a890f9ff8b6ea964182495631).
-The original 43/40 suite was rerun before implementation, recorded in
-`build/phase4a-baseline.log`. Historical Phase 3A status remains at that commit.
-Architecture v0.2, Rust/target and Limine are unchanged. Both x2APIC and xAPIC
-were exercised locally; physical hardware and hosted CI remain unverified.
+[`0fba57e`](https://github.com/ils12058/neu_kernel/commit/0fba57e409bf600380b6544397ecbb303483c962).
+The full original 52/47 suite was rerun before implementation in
+`build/phase4b-baseline.log`; historical Phase 4A status remains at that commit.
+Architecture v0.2, Rust/target, Limine and firmware are unchanged. Verification is
+local single-CPU QEMU; hosted CI and physical hardware remain unverified.
 
 ## Created and modified files
 
 Created:
 
-- `kernel/src/timer.rs`: vector/controller/configuration policy, checked PIT
-  calibration arithmetic, session transitions and eight host tests.
-- `kernel/src/arch/x86_64/interrupts.rs`: BSP controller discovery, MSR/UC access,
-  PIC/LVT masking, calibration, bounded handler, event records and shutdown.
-- `kernel/src/arch/x86_64/interrupts.S`: vector-specific IRQ stubs, returning
-  full-GPR entry and assembly-only bounded enabled window with 15 GPR canaries.
-- `docs/adr/0011-local-timer-interrupt-foundation.md`: decision and prerequisites
-  for Phase 4B, recorded before implementing timer delivery.
+- `kernel/src/context.rs`: owned x86-64 register/return context, identity and
+  kernel-stack binding, initial/yielded validity rules and ABI-layout assertions.
+- `kernel/src/scheduler.rs`: bounded ThreadId FIFO, admission, selection, yield,
+  terminal removal and nine host tests; no privileged CPU/timer operations.
+- `kernel/src/arch/x86_64/cooperative.rs`: trusted construction, dispatch,
+  outcome/rollback/lifetime checks and scoped fault-injection controllers.
+- `kernel/src/arch/x86_64/cooperative.S`: complete user-context restore, safe
+  common-stack handoff and multi-stage payload with persistent stack witnesses.
+- `docs/adr/0012-cooperative-thread-context-switching.md`: rationale and Phase 4C
+  requirements, recorded before implementing the switching mechanism.
 
 Modified:
 
-- `kernel/src/arch/x86_64/exceptions.rs`: installs/read-backs external gates only
-  for timer tests; existing exception/IST and user-gate paths remain intact.
-- `kernel/src/paging/mod.rs`, `kernel/src/arch/x86_64/paging.rs`: explicit UC
-  device leaves and scoped APIC view/teardown, separate from RAM ownership.
-- `kernel/src/paging/tests.rs`: one added host test for PAT/cache/privilege flags,
-  rejection before allocation and device-table reclamation.
+- `kernel/src/node.rs`: Runnable state, saved context/stack/FIFO ownership,
+  checked suspend/dispatch and terminal resource-reference guards.
+- `kernel/src/paging/mod.rs`, `kernel/src/paging/tests.rs`: bounded context pins,
+  owner-scoped supervisor stack mappings and three added lifetime/rollback tests.
+- `kernel/src/arch/x86_64/paging.rs`: allocator-backed private guarded stacks,
+  stack-table ownership, pin/unpin, teardown, high-water and owned result views.
+- `kernel/src/arch/x86_64/native.rs` and `native.S`: selected trusted stack,
+  per-slice binding, private yield and copied-context terminal handoff.
+- `kernel/src/arch/x86_64/userspace.rs` and `userspace.S`: expose the common
+  continuation storage and a typed saved-context bridge only for switching.
+- `kernel/src/arch/x86_64/exceptions.rs`: validated TSS.RSP0 selection/readback.
+- `kernel/src/syscall.rs`: equality derives for by-value context comparisons;
+  existing numbers, feature/version/status values and assembly layout unchanged.
 - `kernel/src/main.rs`, `kernel/src/lib.rs`, `kernel/src/arch/x86_64/mod.rs`,
-  `kernel/Cargo.toml`: module wiring and seven exclusive timer configurations.
-- `tools/neu.py`: QMP enabled CPU/controller snapshots, xAPIC physical page-table
-  walk, independent calibration/frame/count/EOI/state validation and negatives.
-- `README.md`, this status, `docs/adr/README.md`, ADRs 0006 and 0010: current
-  evidence and dated extensions preserving earlier rationale.
+  `kernel/Cargo.toml`: wiring and nine mutually exclusive switching scenarios.
+- `tools/neu.py`: actual per-slice CPL/root/GPR/stack/TSS observations, page walks,
+  saved-frame/FIFO/lifecycle checks and emitted transition instruction checks.
+- `README.md`, this status, ADR index and ADRs 0009–0011: current behavior,
+  verification and dated extensions preserving earlier rationale.
 
-Node/Thread models and native syscall implementation/ABI are unchanged. No linker,
-boot protocol, dependency, toolchain feature or host package changed. Architecture
-v0.2 remains byte-for-byte unchanged (SHA-256
+Timer implementation, linker, boot protocol, dependencies and toolchain are
+unchanged. Architecture v0.2 stays byte-for-byte unchanged (SHA-256
 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`).
 
 ## Tested environment and compatibility
@@ -65,7 +73,7 @@ During Phase 0 the named Rust toolchain initially lacked the freestanding target
 added using `rustup target add --toolchain 1.95.0 x86_64-unknown-none`. No Homebrew
 packages or system-wide firmware were installed for this milestone. Installed
 QEMU supplied compatible firmware. ISO utilities and mtools were absent and are
-not required by the selected boot workflow. Phase 4A adds no host packages,
+not required by the selected boot workflow. Phase 4B adds no host packages,
 nightly features, or third-party Rust dependencies.
 
 The firmware pair selected from the installed QEMU distribution was:
@@ -135,6 +143,166 @@ locations. To select another compatible pair, supply both variables:
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make run
 OVMF_CODE=/path/to/OVMF_CODE.fd OVMF_VARS=/path/to/OVMF_VARS.fd make test
 ```
+
+## Cooperative Thread scheduling and saved contexts
+
+The new configurations are explicitly cooperative. A two-entry FIFO contains
+**ThreadId**, not NodeId. Selection has no CR3, TSS, MSR, assembly or timer work;
+the architecture controller supplies/captures execution values and applies the
+selected context. The initial Thread remains Ready until its execution record,
+stack and space pin exist. Admission makes it Runnable and records FIFO ownership.
+Dispatch takes its saved context, clears queued ownership and makes it Running.
+Yield saves a new context and appends it to the FIFO tail. Exit/fault removes
+resumption eligibility. Empty FIFO returns no work; one eligible Thread can yield
+to itself. Duplicate, stale, Running and terminal admission are rejected.
+
+Node and Thread identities remain separate generation-checked types. Node
+Ready/Active reflect this bounded prototype's inactive/selected slice; normal exit
+ends the Node only after the final live associated Thread. A supported fault
+terminates its own Node. One initial Thread per Node is still a construction
+policy. There is no public creation, priority, affinity, wait queue or capability
+implementation.
+
+`SavedContext` owns a **copy** of all 15 GPRs, user RIP/RSP/RFLAGS and CS/SS, plus
+NodeId/ThreadId/SpaceId/root and kernel-stack binding. Its 160-byte `Frame` has
+120 bytes of GPRs followed by the 40-byte return frame; RAX offset is 112, return
+RSP offset is 24. Layout assertions, host tests and QMP reads of the actual native
+stack frame check this assembly boundary. Metadata is kernel-only, not a new
+userspace ABI structure or a pointer to an abandoned stack frame.
+
+Fresh contexts are constructed with the initial entry/RSP, flags=2 and zero GPRs;
+native preflight requires that exact initial record. Yielded
+contexts require matching ownership, valid canonical code/stack ranges, fixed
+user selectors, permitted flags, successful RAX/RDX outputs and coherent RCX/R11
+return RIP/flags. The native layer additionally seals the exact RX resume site
+and verifies live mappings/root/stack before entry. A rejected saved record never
+activates its root or configures a native session. Integer-only execution, zero
+FS/GS bases and MP/TS restrictions remain; no extended-state context is exposed.
+
+The private test operation **`0xffffffffffffff00`** yields only in switching
+configurations. It eventually resumes with RAX=0/RDX=0 and the original ABI's
+preserved-register convention. It carries no Thread/Node/stack selector argument.
+`abi_query=1`, `thread_exit=2`, tag `0x100000003` and advertised 0.1 features remain
+unchanged. The core dispatcher still returns NOT_SUPPORTED for this private
+number; a public yield number/feature requires another compatibility decision.
+
+## Private entry stacks, pins and switching order
+
+Each Thread owns two allocated backing pages (8 KiB) through its Node's existing
+SpaceId, mapped supervisor RW/NX only in that Node's root. The fixed arena is:
+
+| Thread slot | Low guard | Mapped stack | High guard |
+| --- | --- | --- | --- |
+| A / slot 0 | `0xffffc00000000000` | `0xffffc00000001000..0xffffc00000003000` | `0xffffc00000003000` |
+| B / slot 1 | `0xffffc00000004000` | `0xffffc00000005000..0xffffc00000007000` | `0xffffc00000007000` |
+
+Guards are absent 4 KiB pages; the table's range ends are exclusive. Full Thread
+identity, SpaceId and root bind the stack rather than raw slot numbers. The
+common kernel root maps neither private stack, and each user root maps no sibling
+stack. Stack backing is zeroed before its initialized frame identity, then filled
+with a high-water pattern. The lowest 512 bytes must remain untouched after every
+slice, in addition to the hardware guards. This bounds the tested scalar-handler
+footprint; it does not establish a universal kernel stack size for future calls.
+
+Each stack adds three private table frames. Those new table frames have aliases
+only in the **common kernel workspace**, never in a user-root workspace. Existing
+user-root aliases remain its original private table subset. Backend table access
+still requires the actual common kernel CR3. Removing one stack therefore cannot
+leave borrowed table aliases in another root. PTE removal, local invalidation and
+detachment/flush precede table and backing reuse.
+
+A queued/running/suspended context holds a space-lifetime pin. Pins block mapping
+removal, owned-frame release, stack teardown and root retirement even while that
+root is inactive. There are at most two pins per scope; stale pins, underflow,
+capacity overflow and active-root unpin are rejected. Thread metadata separately
+refuses reclamation with queued, active, saved-context or stack associations.
+The trusted controller releases pins only after terminal state on the common
+stack. Historical diagnostic numbers do not authorize resumption.
+
+The current layout uses A's four user frames, B's five and four stack frames:
+**thirteen data owners**, within the unchanged limit sixteen. Ten original private
+tables plus three stack tables per root fit the 64-table bound. Mapping records
+remain bounded to 64, and Nodes/Threads/live user spaces remain two each. No pool
+increase, heap, static per-Thread stack reservation or MemoryObject is introduced.
+
+Every dispatch occurs under the common root with IF=0:
+
+1. Consume the FIFO's exact live Thread context; verify Node/SpaceId/root, full
+   saved record, stack ownership/permissions/guards and return contract.
+2. Establish the native critical IST contract. Publish the validated kernel-only
+   selected-stack pointer and read back the same value in TSS.RSP0. Configure and
+   read back MSRs; bind the current Thread/Node/root before permitting user entry.
+3. Activate the verified root while still on the permanent normal image stack,
+   mapped in both roots. Copy the saved frame onto that Thread's stack and restore
+   GPRs/return state through validated IRETQ.
+4. Native entry stores user RSP as a scalar, then loads the selected supervisor
+   stack pointer **before any push/call/user-stack access**. No unchecked user
+   argument selects it. Query/exit retain the established validation and statuses.
+5. On yield, copy the successful user frame into a bounded kernel handoff record.
+   Finish logging before abandoning that entry call chain. Move RSP to the common
+   image stack, release the busy guard there, then restore common CR3 through the
+   original bridge. No suspended Rust call chain remains on a private stack.
+6. Restore/read back original MSRs, reset TSS.RSP0, deactivate root metadata and
+   clear selected-stack/saved-user-RSP/session storage. Verify stack margin, then
+   publish Runnable/terminal state and perform the next FIFO selection.
+
+The common continuation is live for only **one slice**, and is consumed before
+another starts. It holds normal Rust controller/paging borrows, mapped permanently
+in every root; handlers access only copied session values and their own frames.
+No references into abandoned Thread stacks or a switched-out address space remain.
+#DF IST1 and native NMI/#MC IST2 retain separate guarded image-reserved stacks.
+
+On terminal exit/fault, discard the resumable record and FIFO eligibility, release
+the lifetime pin, unmap/free the private entry stack, clear its model association,
+destroy the inactive user root/backing, then release Node/Thread metadata. Outcome
+retention survives resource release until metadata-slot reuse. Invalid saved-state
+rejection is distinct from an actual CPU exception. Unexpected privileged faults
+remain fatal; none of this promises arbitrary kernel-corruption recovery.
+
+## Demonstrated user resumption
+
+Each payload reserves 24 bytes on its private user stack and retains three
+Node-specific 64-bit markers across calls/yields. Four different code regions
+perform seed+7, seed+14, seed+21 and seed+28, advancing a private progress word.
+A uses seed 35 and ends at **63**; B uses 77 and ends at **105**. B also checks its
+private-only sentinel at `0x406000`. Identical user VAs map distinct owned frames.
+
+Yield occurs through a CALL/SYSCALL wrapper. Saved RIP is its post-SYSCALL RET;
+saved RSP `0x404fd8` points to the **later-phase return address on that Thread's
+user stack**. Resumption restores this actual frame and RET continues at the
+previously saved caller site. QMP reads the stack return address for middle
+yields and then observes later phase-specific instruction ranges, stable markers,
+progress and canaries under the same owner/root. Restarting the entry point
+would fail those CPU/data/phase checks even if serial names alternated.
+
+The positive FIFO order is A0, B0, A1, B1, A2, B2, A3, B3. Every non-initial
+dispatch consumes exactly the previous saved full frame. Normal A reclamation
+occurs before B's final resume; faults also reclaim only the offending Node while
+the healthy saved context remains pinned and later progresses alone.
+
+The final `switch` run recorded the following actual QMP CPU/data samples. Every
+row had CPL=3, CS/SS=`0x3b/0x33`, IF=0 and user RSP=`0x404fe0`:
+
+| Dispatch | Thread / phase | User RIP | CR3 | Private result / progress |
+| --- | --- | --- | --- | --- |
+| 1 | A / 0 | `0x4000f2` | `0xc000` | 42 / 1 |
+| 2 | B / 0 | `0x4000f2` | `0x20000` | 84 / 1 |
+| 3 | A / 1 | `0x40017c` | `0xc000` | 49 / 2 |
+| 4 | B / 1 | `0x40017c` | `0x20000` | 91 / 2 |
+| 5 | A / 2 | `0x400211` | `0xc000` | 56 / 3 |
+| 6 | B / 2 | `0x400211` | `0x20000` | 98 / 3 |
+| 7 | A / 3 | `0x400270` | `0xc000` | 63 / 4 |
+| 8 | B / 3 | `0x400270` | `0x20000` | 105 / 4 |
+
+TSS.RSP0 was `0xffffc00000003000` for A and `0xffffc00000007000` for B;
+their actual native frame RSPs were `0xffffc00000002f60` and
+`0xffffc00000006f60`. Saved yield RIP/RSP were `0x4002d9/0x404fd8`.
+The QMP frame at A's phase-1 yield contained the next caller return address
+`0x4001c9` on its user stack, followed by the later phase-2 CPU observation.
+Final allocation/free/table counts returned to **7 / 118385 / 7**, equal to that
+image's baseline. These are QEMU observations for this build, not fixed physical
+addresses or hardware guarantees; the checker resolves symbols and compares
+per-image baselines on each run.
 
 ## Controller and clockevent foundation
 
@@ -249,14 +417,12 @@ unknown firmware services and PIT channel programming are not restored. PIT
 channel 2 ends gated off with speaker disabled. Fatal invariant paths halt rather
 than promise device/memory rollback after arbitrary kernel corruption.
 
-The current native session, shared syscall stack, TSS.RSP0, sealed return contract
-and two-Node controller remain IF=0. Their single-active-context restrictions
-cannot be relaxed by merely enabling this timer. The
-[Phase 4B constraints](adr/0011-local-timer-interrupt-foundation.md#constraints-before-phase-4b-context-switching)
-cover per-Thread kernel stacks, saved CPU/extended state, root/TSS/identity
-publication, interrupts during SYSCALL and deferred switching at safe user-return
-boundaries. Initial direction: userspace preemption, kernel not generally
-preemptible. None of those switches or `need_resched` machinery exists here.
+Earlier native/Node configurations retain their shared entry-stack and IF=0
+contract. Cooperative configurations use the private stacks and common handoff
+above. No configuration schedules from a hardware timer. The
+[Phase 4A prerequisite analysis](adr/0011-local-timer-interrupt-foundation.md#constraints-before-phase-4b-context-switching)
+remains historical rationale; [ADR 0012](adr/0012-cooperative-thread-context-switching.md#phase-4c-prerequisites)
+records the remaining timer-preemption boundary.
 
 ## Internal Node and Thread model
 
@@ -274,19 +440,19 @@ governance remains incomplete.
 
 | Object | Lifecycle and terminal rule |
 | --- | --- |
-| Node | Created → Configuring → Ready → Active → Exited → Reclaimed. Construction failure can exit Created/Configuring. |
-| Thread | Configuring → Ready → Running → Exited → Reclaimed; one initial Thread per Node is current bootstrap policy. |
+| Node | Created → Configuring → Ready ↔ Active → Exited → Reclaimed. Construction failure can exit Created/Configuring. |
+| Thread | Configuring → Ready → Runnable ↔ Running → Exited → Reclaimed; earlier run-once fixtures go directly from Ready to Running. One initial Thread per Node is current bootstrap policy. |
 | Normal exit | Ends the bound Thread. Node exits only after its final live associated Thread ends; a model test checks that rule independently of bootstrap policy. |
 | User fault | Ends only that Node's associations, copies actual fault metadata, returns to the trusted controller without resuming the Thread. |
 | Construction failure | Separate `ConstructionFailure` outcome; owned paging resources roll back before model reclamation. |
-| Reclamation | Requires Exited, no active context/live Thread and released address-space association. Outcomes remain until metadata-slot reuse. |
+| Reclamation | Requires Exited, no active/live/queued/saved context, released kernel stack and released address-space association. Outcomes remain until metadata-slot reuse. |
 
 `ExitReason` separates `Normal(u8)`, `UserFault(Fault)` and
 `ConstructionFailure`. `Fault` distinguishes actual CPU exceptions from rejected
 return state and copies vector, error, RIP, RSP, CS, SS, RFLAGS and CR2. No
 user-memory diagnostic structure is dereferenced. Generation exhaustion refuses
-reuse rather than wrapping. This is a small internal model, not a scheduler,
-public object API or multiple-runnable-Thread implementation.
+reuse rather than wrapping. FIFO policy is implemented separately; this remains
+a small internal model without a public object API or multithreaded Nodes.
 
 ## Experimental Neu syscall contract
 
@@ -335,12 +501,13 @@ long mode and NXE, remain intact.
 | FMASK | `0x77700`: TF/IF/DF/IOPL/NT/RF/VM/AC masked on entry. Assembly also clears DF defensively before Rust. |
 | Legacy SYSENTER | CS MSR 0x174 is zero; no legacy service is enabled. |
 | FS/GS | Selectors/bases and KERNEL_GS base zero, no TLS or kernel GS/per-CPU pointer, no SWAPGS. User return restores DS/ES 0x33. |
-| Syscall stack | The existing separate 32 KiB supervisor RW/NX privilege-entry stack, guarded below/above; suspended kernel frames stay on the 64 KiB normal stack. |
+| Syscall stack | Earlier fixtures use the separate guarded 32 KiB image stack. Switching fixtures use their selected private guarded 8 KiB stack. Only the active common continuation remains on the permanent 64 KiB normal stack. |
 | Critical entry | Native builds give NMI/#MC a separate guarded 16 KiB IST2; #DF retains its original 32 KiB IST1. |
 
 SYSCALL does **not** choose TSS.RSP0. The first instructions read/set a
 supervisor-only RIP-relative non-reentrant guard, store user RSP as a scalar,
-and select the known kernel stack with LEA. There is no push, call, Rust or
+and select the trusted stack: LEA for earlier fixtures, or a validated published
+kernel pointer for switching fixtures. There is no push, call, Rust or
 user-address dereference before that switch. The noncanonical-user-RSP integration
 case reaches this actual trusted stack and is then rejected, demonstrating that
 entry did not rely on the user stack being usable.
@@ -413,22 +580,26 @@ aliases in the surviving root. The scratch slot is absent in both user roots.
 | --- | --- | --- |
 | `0x400000` | Private RX payload frame | Different private RX payload frame |
 | `0x401000` | Private R/NX constants, seed 35 | Different R/NX constants, seed 77 |
-| `0x402000` | Private RW/NX data, result 42 | Different RW/NX data, result 84 |
+| `0x402000` | Private RW/NX data, result 42 in run-once fixtures / 63 after four switching stages | Different RW/NX data, result 84 / 105 respectively |
 | `0x403000` | Absent low stack guard | Absent low stack guard |
 | `0x404000` | Private RW/NX stack | Different RW/NX stack |
 | `0x405000` | Absent high stack guard | Absent high stack guard |
 | `0x406000` | Absent | Private R/NX sentinel `0x5152535461626364` |
 
-All allocated backing is zeroed before initialization/publication. Initial RSP is
+The following sizes and CALL offset describe the earlier run-once fixtures;
+Phase 4B's additional private stacks and three user-stack witnesses are detailed
+above. All allocated backing is zeroed before initialization/publication. Initial RSP is
 `0x404ff8`; the syscall wrapper CALL gives saved RSP `0x404ff0`. The payload
 checks the complete query output and register canaries, stores seed+7, and B
 actually reads/checks its private-only sentinel. Fixture values are test data,
 not ABI requirements. No user code shares the kernel payload's physical backing.
 
-Both scopes are constructed and verified before either executes. The observed
+Both scopes are constructed and verified before either executes. The run-once
 profile needs ten private table frames per root, A's four backing frames and B's
 five: 29 domain frames plus seven pinned kernel table frames. Static guarded
-entry/emergency stacks remain image-reserved. The existing bounds are unchanged:
+entry/emergency stacks remain image-reserved. Switching adds two backing pages
+and three private table pages per Thread (46 total allocations with both live,
+including the seven common kernel tables). The existing bounds are unchanged:
 64 table frames, 16 data owners, 64 controlled mappings. Newly explicit bounds
 are two live user scopes, two Nodes and two Threads. A third scope is rejected
 without allocation changes; host tests also cover exhausted generations/data
@@ -464,42 +635,83 @@ restore accounting or recover safely.
 Executed from the repository root:
 
 ```sh
-make doctor > build/phase4a-doctor.log 2>&1
-make check > build/phase4a-check.log 2>&1
-make build > build/phase4a-build.log 2>&1
-make test > build/phase4a-test-run.log 2>&1
+make doctor > build/phase4b-doctor.log 2>&1
+make check > build/phase4b-check.log 2>&1
+make build > build/phase4b-build.log 2>&1
+make test > build/phase4b-test-run.log 2>&1
 cargo test --locked --lib --target aarch64-apple-darwin
-python3 tools/neu.py test --case timer
-python3 tools/neu.py test --case timer-xapic
-python3 tools/neu.py test --case timer-repeat
-python3 tools/neu.py test --case timer-spurious
-python3 tools/neu.py test --case timer-unsupported
-python3 tools/neu.py test --case timer-unexpected
-python3 tools/neu.py test --case timer-software
+python3 tools/neu.py test --case switch
+python3 tools/neu.py test --case switch-a-fault
+python3 tools/neu.py test --case switch-b-fault
+python3 tools/neu.py test --case switch-cross
+python3 tools/neu.py test --case switch-stack-user
+python3 tools/neu.py test --case switch-stack-guard
+python3 tools/neu.py test --case switch-invalid-context
+python3 tools/neu.py test --case switch-rollback
+python3 tools/neu.py test --case switch-stale
 ```
 
-All seven focused timer cases were run before the complete suite. A fresh source
-copy without `.git`, `.cache`, `build`, `target` or Python caches also ran:
+All nine focused switching cases passed before the complete suite. A clean source
+copy excluding `.git`, `.cache`, `build`, `target` and Python caches also ran:
 
 ```sh
 make build
-python3 -c "from tools.neu import build; build('timer')"
-python3 -c "from tools.neu import build; build('timer-xapic')"
+python3 -c "from tools.neu import build; build('switch')"
+python3 -c "from tools.neu import build; build('switch-rollback')"
 ```
 
-All three cold builds pass with a fresh pinned-loader download and checksum
-verification, Cargo `--locked`, ELF64/x86-64 four LOAD segments, W^X segment
-validation, guarded stacks and EFI artifacts. No host packages or external Rust
-dependencies were installed.
+All three cold builds pass with a fresh pinned-loader download/checksum check,
+Cargo `--locked`, ELF64/x86-64 four LOAD segments, W^X segment checks, guarded
+stacks and EFI artifacts. The harness also validates cooperative payload bounds
+and actual SYSCALL (`0f 05`) and IRETQ (`48 cf`) instruction bytes. No host packages
+or external Rust dependencies were installed.
 
 | Check | Actual result |
 | --- | --- |
 | Doctor | Pass: unchanged Rust/target, QEMU and hashed OVMF pair. |
-| Static checks | Pass: formatting and Clippy with warnings denied, 47 kernel configurations plus host library; Python syntax passes. |
-| Host tests | **52 pass**: all original 43 plus 8 timer/controller/state/overflow tests and 1 UC device-mapping test. |
-| Original QEMU cases | **All 40 pass** with their existing IF=0 policies, including supervisor/#DF, all Ring 3/ABI security negatives and all 6 two-Node scenarios below. |
-| New timer cases | **All 7 pass**, covering both APIC modes and the controls below. |
-| Final halt | **All 47 pass** two QMP HLT=1/CPL=0/IF=0 observations in the ELF halt loop, original owned CR3 and host-controlled quit/exit 0. |
+| Static checks | Pass: formatting and Clippy with warnings denied for 56 kernel configurations plus host library; Python syntax passes. |
+| Host tests | **64 pass**: all original 52 plus 9 FIFO/context/lifecycle tests and 3 pin/stack-mapping/rollback tests. |
+| Original QEMU cases | **All 47 pass** with their original intent: supervisor/#DF, Ring 3/ABI negatives, two-Node isolation and all 7 timer cases. |
+| New switching cases | **All 9 pass**, described below. |
+| Final halt | **All 56 pass** two QMP HLT=1/CPL=0/IF=0 observations inside the ELF halt loop, original owned CR3 and host-controlled quit/exit 0. |
+
+| Switching case | Verified behavior |
+| --- | --- |
+| `switch` | Both Threads queued before entry; eight real A/B slices, three yields each, exact saved-context restoration, four stages and normal results 63/105. |
+| `switch-a-fault` | A resumes phase 1 and raises actual #UD vector 6/error 0 while B is suspended; A is reclaimed and B resumes/completes. |
+| `switch-b-fault` | B raises actual #UD after resumption while A is suspended; A later completes alone. |
+| `switch-cross` | Resumed A reads B-only `0x406000`: actual user #PF vector 14/error 4/CR2=`0x406000`; B's saved context and sentinel survive. |
+| `switch-stack-user` | A attempts its mapped supervisor entry-stack bottom: actual #PF 14/error 5, CR2=`0xffffc00000001000`; B resumes normally. |
+| `switch-stack-guard` | A reads its absent low guard: actual #PF 14/error 4, CR2=`0xffffc00000000000`; B resumes normally. QMP also checks both guards absent. |
+| `switch-invalid-context` | Trusted hook substitutes noncanonical saved RIP for A's second dispatch; rejected before activation/MSR setup/IRETQ. B resumes. This is rejected saved state, not a fabricated hardware exception. |
+| `switch-rollback` | Five stack allocation failure points plus an invalid initial context roll back while A is queued/pinned. A's saved state is unchanged; both then alternate/exit normally. |
+| `switch-stale` | After A's normal early reclamation, a real temporary Node/Thread reuses its metadata slot; the old ThreadId is rejected. Temporary resources are released while B remains suspended and then resumes. |
+
+QMP pauses/resumes each slice briefly to observe actual CPL=3 in that phase's
+user loop and CPL=0 on its selected native stack (fault-only slices instead
+supply the actual exception frame). It checks root, selectors, flags, MP/TS,
+zero FS/GS, full-width canaries, progress/data and persistent user-stack markers.
+It reads actual TSS.RSP0, selected-stack/guard storage and common continuation
+RSP, and physically walks the private stack pages/guards under each root.
+Native samples include all twenty actual frame words; saved/taken records are
+compared across every yield, and later user return addresses/instruction regions
+prove resumption rather than restart.
+
+The host independently simulates FIFO selection and verifies per-Thread
+identity/Node/SpaceId/root, query/yield/exit counts, MSR setup/restoration, exact
+fault RIP/vector/error/CR2/CS/SS/RSP/flags and private handler-stack bounds. It
+checks survivor retention after sibling teardown, terminal dispatch rejection,
+rollback/stale-generation evidence, empty final FIFO and numerical allocation
+accounting. Native busy/selected-stack/saved-user-RSP/common-continuation storage
+must all be clear at final halt. Initial serial names or pass labels alone cannot
+pass. Missing observations, resets, unexpected vectors, early exits, triple
+faults or the 30-second guest timeout fail the test.
+
+The first new host-test run passed 63/64: its wrong-owner yield test expected
+Association while the earlier duplicate-entry guard correctly returned InUse.
+The assertion was corrected without weakening ownership/state checks; final host
+and QEMU results above are subsequent runs. The independent Phase 4A checks and
+older execution paths remain as follows.
 
 | Timer case | Actual verified behavior |
 | --- | --- |
@@ -511,7 +723,8 @@ dependencies were installed.
 | `timer-unexpected` | Controlled INT 0x41 reaches its actual vector-specific entry and halts with zero ticks/EOIs; no timer-success result. |
 | `timer-software` | Controlled INT 0x30 without an in-service APIC bit is rejected with zero ticks/EOIs; it cannot serve as fake hardware delivery evidence. |
 
-The final full-run timer observations were:
+Historical Phase 4A timer observations at `0fba57e` were (current raw timer
+results remain in the per-case JSON from this run):
 
 | Case | Mode | Calibration samples (divided ticks) | Initial count | Delivered ticks / EOI |
 | --- | --- | --- | --- | --- |
@@ -547,7 +760,8 @@ precision or interrupt-latency guarantee. The observed delivered totals differ
 from an ideal 50 events per 50 ms, so precise 1 kHz delivery and elapsed-time
 accounting are explicitly unverified despite reproducible countdown calibration.
 
-The first complete-suite attempt failed an existing native CPU snapshot check.
+During historical Phase 4A validation, the first complete-suite attempt failed
+an existing native CPU snapshot check.
 A focused audit also reproduced a partially emitted UART execution contract.
 The harness now waits for complete per-run identity/contract lines and briefly
 stops/resumes QEMU for coherent native register snapshots; all original privilege,
@@ -616,16 +830,15 @@ wrong privilege/root/stack/context, missing CPU evidence, timeout, early halt or
 permission failure cannot pass. Serial pass messages alone are insufficient.
 
 Local Git-ignored evidence: `build/test-results.json`,
-`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase4a-baseline.log`,
-`build/phase4a-host-tests.log`, `build/phase4a-doctor.log`, `build/phase4a-check.log`,
-`build/phase4a-build.log`, `build/phase4a-focused-timers.log`,
-`build/phase4a-device-walk.log`, `build/phase4a-node-observer-audit.log`,
-`build/phase4a-test-run.log` and
-`build/phase4a-repro-build.log`. Timer JSON contains calibration samples,
-monotonic event/frame records, mode/base/PAT/device flags, per-session QMP CPU and
-LAPIC snapshots, xAPIC physical walks, final controller state and exact accounting.
-Existing per-Node CPU/ABI/fault evidence, two halt samples, kernel/firmware hashes,
-QEMU arguments and clean exits remain recorded.
+`build/test-logs/<case>.{serial.log,qemu.log,json}`, `build/phase4b-baseline.log`,
+`build/phase4b-host-tests.log`, `build/phase4b-doctor.log`, `build/phase4b-check.log`,
+`build/phase4b-build.log`, `build/phase4b-switch-first.log`,
+`build/phase4b-focused-switches.log`, `build/phase4b-test-run.log` and
+`build/phase4b-repro-build.log`. Switching JSON includes full identity/stack
+bindings, FIFO phases, full saved contexts, outcomes, per-slice raw CPU/TSS/frame
+observations, physical stack walks, data/witness values and exact accounting.
+Existing timer, Node, ABI, exception, final halt, image/firmware and clean-exit
+evidence remains in the same structured report.
 
 ## Nested-entry and security limits
 
@@ -650,7 +863,7 @@ are outside the demonstrated boundary.
 
 The two-Node implementation remains trusted bootstrap machinery. Node-local
 capabilities, public factories/ResourcePools, multiple runnable Threads per Node,
-scheduling, Channels/IPC, shared MemoryObjects, pointer-copy APIs, full ELF
+preemptive scheduling, Channels/IPC, shared MemoryObjects, pointer-copy APIs, full ELF
 loading, a userspace runtime, filesystem/network/drivers and POSIX/Linux
 compatibility remain unimplemented. Construction/teardown assumes one trusted
 controller with no asynchronous observers. A future concurrent object system
@@ -658,23 +871,27 @@ must revisit synchronization, references, cancellation and lifetime publication.
 
 ## Architecture relationship and recommended next milestone
 
-[ADR 0011](adr/0011-local-timer-interrupt-foundation.md) accepts only the scoped
-controller/clockevent, returning IRQ and safe enable/drain/stop contract, including
-the prerequisites for future switching. ADRs 0006 and 0010 retain their rationale
-with dated extensions. Native ABI 0.1, Node ownership/lifecycle and all earlier
-interrupt-disabled paths remain intact. Architecture v0.2 is unchanged; the full
-scheduling proposal and capability-oriented Node design are not accepted or
-implemented by implication. `NEU-025` and optional NeuKMon remain open.
+[ADR 0012](adr/0012-cooperative-thread-context-switching.md) accepts only bounded
+cooperative FIFO selection, owned user contexts, private entry stacks and safe
+native/common-stack handoffs. ADRs 0009–0011 retain their original rationale with
+dated extensions. Public ABI 0.1 and all earlier test paths remain intact.
+Architecture v0.2 is unchanged. Complete capability-oriented Nodes and the full
+preemptive scheduling proposal remain unimplemented; `NEU-025` and optional
+NeuKMon remain open. No failed acceptance criterion remains within the tested
+Phase 4B profile; hardware, SMP, extended-state and adversarial-fuzz coverage are
+explicitly outside that evidence.
 
-Recommended next milestone: **K4 / Phase 4B, controlled single-CPU Thread context
-switching**. Resolve per-Thread guarded kernel stacks, complete saved contexts,
-root/TSS/active identity publication and native shared-entry/continuation ownership
-before switching two user Threads. Define deferred rescheduling from Ring 0 and
-validated safe return boundaries; arbitrary kernel preemption remains excluded.
-Keep x87/SIMD policy explicit and retain interrupt-disabled memory/lifecycle
-transactions until synchronization is proven. Timer delivery alone provides no
-fairness, preemption or CPU-time isolation. Scheduling policy, SMP and public
-capabilities/factories need their own scoped decisions.
+Recommended next milestone: **K4 / Phase 4C, controlled timer-driven userspace
+preemption**. Capture real interrupt contexts, define IRQ acknowledgment and
+rescheduling ownership, and allow IF=1 only after native early-entry/return and
+root/TSS/current-Thread publication support it. A Ring 0 timer may request
+rescheduling but must defer the switch until a proven safe boundary; it must not
+switch an arbitrary Rust frame. Preserve non-preemptible memory/lifecycle
+transactions until synchronization is established. The current syscall flag
+contract excludes IF and needs an explicit interrupt-resumption extension before
+it can serve that phase. Keep floating-point/SIMD, per-CPU/SMP and public yield/
+factory/capability decisions separately scoped. Cooperative yielding alone gives
+no CPU-time isolation from a Thread that never yields.
 
 ## Primary references
 

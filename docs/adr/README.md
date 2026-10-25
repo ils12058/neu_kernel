@@ -120,3 +120,14 @@ ADR 0011 adds calibrated APIC timer delivery, returning IRQ entries and bounded
 enable/drain/shutdown. All earlier Node/syscall and ordinary boot paths retain
 IF=0. It records prerequisites for future userspace preemption without accepting
 or implementing the complete scheduling proposal or a context switch.
+
+## Phase 4B record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0012: Cooperative Thread context switching](0012-cooperative-thread-context-switching.md) | Accepted, two bootstrap Threads with IF=0 | NEU-005/006/008/011; NEU-017/018; NEU-020 cooperative FIFO subset; NEU-021/023/024 scoped safety/tests |
+
+ADR 0012 adds real yielded-context ownership, private guarded entry stacks,
+space-lifetime pins and FIFO Thread selection. ABI 0.1 remains unchanged; the
+private yield operation is test-only. Timer-driven userspace preemption is
+deferred to Phase 4C, and the full scheduling/capability proposals remain open.

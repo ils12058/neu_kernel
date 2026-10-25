@@ -40,12 +40,17 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "nodes-cross": "test-nodes-cross", "nodes-reclaim": "test-nodes-reclaim", "nodes-rollback": "test-nodes-rollback",
             "timer": "test-timer", "timer-xapic": "test-timer-xapic", "timer-repeat": "test-timer-repeat",
             "timer-spurious": "test-timer-spurious", "timer-unsupported": "test-timer-unsupported",
-            "timer-unexpected": "test-timer-unexpected", "timer-software": "test-timer-software"}
+            "timer-unexpected": "test-timer-unexpected", "timer-software": "test-timer-software",
+            "switch": "test-switch", "switch-a-fault": "test-switch-a-fault", "switch-b-fault": "test-switch-b-fault",
+            "switch-cross": "test-switch-cross", "switch-stack-user": "test-switch-stack-user",
+            "switch-stack-guard": "test-switch-stack-guard", "switch-invalid-context": "test-switch-invalid-context",
+            "switch-rollback": "test-switch-rollback", "switch-stale": "test-switch-stale"}
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
 TIMER_CASES = ("timer", "timer-xapic", "timer-repeat", "timer-spurious", "timer-unsupported", "timer-unexpected", "timer-software")
 TIMER_POSITIVE = TIMER_CASES[:4]
+SWITCH_CASES = {name:index for index,name in enumerate(("switch","switch-a-fault","switch-b-fault","switch-cross","switch-stack-user","switch-stack-guard","switch-invalid-context","switch-rollback","switch-stale"))}
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -145,7 +150,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -174,6 +179,14 @@ def elf_info(path):
                 segment = next((item for item in loads if item[3] <= address < item[3] + item[5]), None)
                 if segment is None or data[segment[2] + address - segment[3]:segment[2] + address - segment[3] + 2] != b"\x0f\x05":
                     raise Failure("Native fixture site is not an actual SYSCALL instruction.")
+    if "neu_switch_payload" in symbols:
+        if not 0<symbols["neu_switch_payload_end"]-symbols["neu_switch_payload"]<=4096:
+            raise Failure("Cooperative payload exceeds its owned RX page.")
+        for name,opcode in (("neu_switch_syscall_site",b"\x0f\x05"),("neu_context_iret",b"\x48\xcf")):
+            address=symbols[name]
+            segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
+            if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+len(opcode)]!=opcode:
+                raise Failure("Cooperative transition is missing its actual architectural instruction.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -563,6 +576,220 @@ def check_timer(case, text, symbols, observations, root, qmp):
             "final_lapic":final_lapic,"accounting":[int(v) for v in restored.groups()]}
 
 
+for name,number in SWITCH_CASES.items():
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Switch Thread ready: label=1", "[NEU] Switch Thread ready: label=2",
+        "[NEU] Switch two runnable:", "[NEU] Switch selected:", "[NEU] Switch accounting restored:",
+        f"[NEU] Cooperative switch test passed: case={number}", "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+        EXPECT["boot"][1]+["verified=false"])
+
+
+def switch_site(symbols,name):
+    return USER_CODE+symbols[name]-symbols["neu_switch_payload"]
+
+
+def debug_words(qmp,address,count,physical=False):
+    raw=qmp.call("human-monitor-command",{"command-line":f"{'xp' if physical else 'x'} /{count}gx {address:#x}"})
+    values=[int(value,16) for value in re.findall(r"0x[0-9a-fA-F]+",raw)]
+    if len(values)!=count:
+        raise Failure("Incomplete debugger memory observation: "+raw)
+    return values
+
+
+def switch_walk(qmp,root,address):
+    table=root;entries=[]
+    for shift in (39,30,21,12):
+        value=debug_words(qmp,table+((address>>shift)&511)*8,1,True)[0]
+        entries.append(value)
+        if value&1==0: return {"entries":entries,"present":False}
+        if shift!=12 and value&128: raise Failure("Unexpected large switch-stack page.")
+        table=value&0x000ffffffffff000
+    return {"entries":entries,"present":True,"physical":table}
+
+
+def observe_switch(qmp,serial,symbols,start,sequence,label,phase,root,bottom,top,deadline,faulted):
+    snapshots={};seed=35 if label==1 else 77
+    for stage in (["user"] if faulted else ["user","kernel"]):
+        low,high=(switch_site(symbols,f"neu_switch_phase{phase}_wait"),switch_site(symbols,f"neu_switch_phase{phase}_wait_end")) if stage=="user" else (symbols["neu_native_kernel_wait"],symbols["neu_native_kernel_wait_end"])
+        while time.monotonic()<deadline:
+            qmp.call("stop")
+            try:
+                cpu=qmp.call("human-monitor-command",{"command-line":"info registers"})
+                reg=lambda name:native_register(cpu,name)
+                if ("CPL=3" if stage=="user" else "CPL=0") in cpu and low<=reg("RIP")<high:
+                    selector=0x33 if stage=="user" else 0x10
+                    rsp=USER_RSP-24 if stage=="user" else top-160
+                    expected=[symbols["neu_switch_canary_"+key]^seed for key in ("bx","bp","12","13","14","15")]
+                    if (reg("CR3")!=root or reg("CS")!=(0x3b if stage=="user" else 8) or reg("SS")!=selector
+                            or reg("DS")!=selector or reg("ES")!=selector or reg("RSP")!=rsp or reg("RFL")&0x3600
+                            or reg("CR0")&10!=10 or reg("EFER")&1!=1
+                            or [reg(name) for name in ("RBX","RBP","R12","R13","R14","R15")]!=expected
+                            or not re.search(r"FS =0000 0000000000000000",cpu) or not re.search(r"GS =0000 0000000000000000",cpu)):
+                        raise Failure("Wrong cooperative CPU identity/root/stack/register state:\n"+cpu)
+                    tr=re.search(r"TR =0018 ([0-9a-fA-F]+)",cpu)
+                    if not tr or debug_words(qmp,int(tr[1],16)+4,1)[0]!=top:
+                        raise Failure("Actual TSS.RSP0 does not select the running Thread's stack.")
+                    if (debug_words(qmp,symbols["neu_native_selected_top"],1)[0]!=top
+                            or debug_words(qmp,symbols["neu_native_busy"],1)[0]!=(0 if stage=="user" else 1)):
+                        raise Failure("Native selected-stack/entry guard does not match the active Thread.")
+                    common_rsp=debug_words(qmp,symbols["neu_user_saved_rsp"],1)[0]
+                    if not symbols["__stack_bottom"]<=common_rsp<symbols["__stack_top"]:
+                        raise Failure("Cooperative continuation is not on the permanent common stack.")
+                    record={"cpu":cpu,"tss_rsp0":top,"common_rsp":common_rsp}
+                    if stage=="user":
+                        words=debug_words(qmp,0x402000,3);markers=debug_words(qmp,USER_RSP-24,3)
+                        expected_markers=[symbols[f"neu_switch_marker_{i}"]^seed for i in range(3)]
+                        if words!=[seed+7*(phase+1),phase+1,expected_markers[0]] or markers!=expected_markers or reg("RAX")!=words[0] or reg("RDX")!=(33 if phase==0 else 0):
+                            raise Failure("Resumed user computation or persistent stack witnesses were lost/restarted.")
+                        walks={str(address):switch_walk(qmp,root,address) for address in (bottom-4096,bottom,bottom+4096,top)}
+                        for address in (bottom-4096,top):
+                            if walks[str(address)]["present"]: raise Failure("Thread kernel-stack guard is mapped.")
+                        for address in (bottom,bottom+4096):
+                            walk=walks[str(address)]
+                            if not walk["present"] or any(value&4 for value in walk["entries"]) or walk["entries"][-1]&((1<<63)|0x82)!=(1<<63)|2:
+                                raise Failure("Thread kernel stack is not supervisor RW/NX 4K backing.")
+                        record.update(words=words,markers=markers,walks=walks)
+                    else:
+                        frame=debug_words(qmp,rsp,20)
+                        if (frame[15]!=switch_site(symbols,"neu_switch_resume") or frame[16]!=0x3b
+                                or frame[18]!=USER_RSP-32 or frame[19]!=0x33 or frame[17]&~0x8d7
+                                or frame[12]!=frame[15] or frame[4]!=frame[17]
+                                or frame[14]!=(1 if phase in (0,3) else symbols["neu_switch_yield_op"])):
+                            raise Failure("Native entry did not preserve the correct complete suspended frame.")
+                        user_return=debug_words(qmp,USER_RSP-32,1)[0]
+                        if phase in (1,2) and user_return!=switch_site(symbols,f"neu_switch_after_yield_{phase}"):
+                            raise Failure("Yield lost the user stack's later-instruction return address.")
+                        record.update(frame=frame,user_return=user_return)
+                    snapshots[stage]=record
+                    break
+            finally:
+                qmp.call("cont")
+            if "Switch common restored:" in transcript(serial)[start:]:
+                raise Failure("Cooperative slice ended before its required CPU observation.")
+            time.sleep(0.001)
+        else: raise Failure("Timed out observing cooperative "+stage+" context.")
+    return {"sequence":sequence,"label":label,"phase":phase,"root":root,"bottom":bottom,"top":top,"snapshots":snapshots}
+
+
+def check_switch(case,text,symbols,observations,kernel_root,qmp):
+    number=SWITCH_CASES[case]
+    ready=list(re.finditer(r"Switch Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) pa0=(0x[0-9a-f]+) pa1=(0x[0-9a-f]+) code_pa=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_stack_pa=(0x[0-9a-f]+) seed=(\d+)",text))
+    if len(ready)!=2:raise Failure("Two owned runnable Threads were not constructed.")
+    records={}
+    for match in ready:
+        values=[int(v,0) for v in match.groups()];label,node,thread,space,root,bottom,top,*rest=values
+        if label in records or label not in (1,2) or values[-1]!=(35 if label==1 else 77) or bottom!=0xffffc00000000000+((thread&0xffffffff)-1)*16384+4096 or top-bottom!=8192:
+            raise Failure("Invalid per-Thread identity/guarded stack binding.")
+        records[label]=dict(zip(("label","node","thread","space","root","bottom","top","pa0","pa1","code","data","user_stack","seed"),values))
+    if set(records)!={1,2} or any(records[1][k]==records[2][k] for k in ("node","thread","space","root","bottom","top")):
+        raise Failure("Cooperative Threads accidentally share an identity/root/stack.")
+    if {records[1][k] for k in ("pa0","pa1","code","data","user_stack")} & {records[2][k] for k in ("pa0","pa1","code","data","user_stack")}:
+        raise Failure("Cooperative backing frames are shared across domains.")
+    selected=list(re.finditer(r"Switch selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) phase=(\d+) fresh=(true|false)\n",text))
+    both=re.search(r"Switch two runnable: A=(\d+) B=(\d+) queue=2 pins=verified",text)
+    if not both or tuple(int(v) for v in both.groups())!=(records[1]["thread"],records[2]["thread"]) or not max(r.end() for r in ready)<both.start()<selected[0].start():
+        raise Failure("Both Threads must be queued with retained resources before dispatch.")
+    fifo=[1,2];phases={1:0,2:0};expected=[];terminal={}
+    while fifo:
+        label=fifo.pop(0);phase=phases[label];phases[label]+=1
+        fault=phase==1 and ((label==1 and number in (1,3,4,5,6)) or (label==2 and number==2))
+        expected.append((label,phase,fault))
+        if fault or phase==3:terminal[label]=(phase,fault)
+        else:fifo.append(label)
+    if len(selected)!=len(expected):raise Failure("FIFO did not make the required genuine suspend/resume alternations.")
+    expected_cpu={i for i,(label,phase,_) in enumerate(expected,1) if not(number==6 and label==1 and phase==1)}
+    if set(observations)!=expected_cpu:raise Failure("Missing or spurious actual cooperative CPU episodes.")
+    frames={};outcomes={}
+    for index,(selected_run,wanted) in enumerate(zip(selected,expected)):
+        sequence,label,node,thread,space,root,phase=[int(v,0) for v in selected_run.groups()[:7]]
+        record=records[label];faulted=wanted[2];rejected=number==6 and label==1 and phase==1
+        if (sequence!=index+1 or (label,phase)!=wanted[:2] or selected_run[8]!=("true" if phase==0 else "false")
+                or (node,thread,space,root)!=tuple(record[k] for k in ("node","thread","space","root"))):
+            raise Failure("Wrong FIFO Thread/Node association or restart instead of resume.")
+        segment=text[selected_run.start():selected[index+1].start() if index+1<len(selected) else len(text)]
+        frame_pattern=r"Switch frame: event=(taken|saved) thread=(\d+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) flags=(0x[0-9a-f]+) regs=([^\n]+)\n"
+        parsed=[]
+        for entry in re.finditer(frame_pattern,segment):
+            values=[int(v,0) for v in entry.groups()[1:5]]+[int(v,0) for v in entry[6].split(',')]
+            if len(values)!=19:raise Failure("Incomplete saved CPU register record.")
+            parsed.append((entry[1],values))
+        if not parsed or parsed[0][0]!="taken" or parsed[0][1][0]!=thread:
+            raise Failure("No owned Thread context was consumed for dispatch.")
+        taken=parsed[0][1]
+        if phase==0:
+            if taken[1:]!=[USER_CODE,USER_RSP,2]+[0]*15:raise Failure("Invalid initial context.")
+        elif frames.get(thread)!=taken:
+            raise Failure("Previously saved full GPR/RIP/RSP/RFLAGS context was lost or mixed with another Thread.")
+        if rejected:
+            if (len(parsed)!=1 or "Switch native ready:" in segment or "Native MSRs verified:" in segment
+                    or not re.search(r"Switch rejected before resume: thread="+str(thread)+r" RIP=0x800000000000 reason=3 root="+hex(kernel_root),segment)):
+                raise Failure("Invalid saved return state reached activation/native entry.")
+        else:
+            actual=observations[sequence]
+            if (actual["label"],actual["phase"],actual["root"],actual["bottom"],actual["top"])!=(label,phase,root,record["bottom"],record["top"]):
+                raise Failure("CPU snapshots belong to the wrong saved context.")
+            expected_stages={"user"} if faulted else {"user","kernel"}
+            if set(actual["snapshots"])!=expected_stages:raise Failure("Missing direct CPL/stack/root observations.")
+            for offset,key in ((0,"pa0"),(4096,"pa1")):
+                if actual["snapshots"]["user"]["walks"][str(record["bottom"]+offset)]["physical"]!=record[key]:
+                    raise Failure("Thread kernel-stack backing changed across suspension.")
+            native_ready=re.search(r"Switch native ready: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) stack_bottom=(0x[0-9a-f]+) stack_top=(0x[0-9a-f]+) TSS_RSP0=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) fresh=(true|false)",segment)
+            if not native_ready or tuple(int(v,0) for v in native_ready.groups()[:9])!=(node,thread,space,root,record["bottom"],record["top"],record["top"],taken[1],taken[2]):
+                raise Failure("Native session/TSS/return contract was not freshly bound.")
+            msrs=re.search(r"Native MSRs verified: EFER=(0x[0-9a-f]+) STAR=(0x[0-9a-f]+) LSTAR=(0x[0-9a-f]+) FMASK=(0x[0-9a-f]+) SYSENTER=0",segment)
+            if not msrs or tuple(int(v,16) for v in msrs.groups())!=(0xd01,symbols["neu_abi_star"],symbols["neu_native_entry"],symbols["neu_abi_fmask"]):raise Failure("Stale cooperative MSR state.")
+            if not re.search(r"Switch common restored: thread="+str(thread)+r" root="+hex(kernel_root)+r" MSRs=restored guard=clear entry=clear stack_margin=512",segment):
+                raise Failure("Slice did not finish its kernel context before selection.")
+            native_terminal=re.search(r"Native terminal: kind=(\d+) reason=(\d+) status=(\d+) entries=(\d+) returns=(\d+) queries=(\d+) errors=(\d+) verified=true",segment)
+            expected_terminal=(32+number,8,0,0,0,0,0) if faulted else ((32+number,0,0,2,1,1,0) if phase==3 else ((32+number,100,0,2,1,1,0) if phase==0 else (32+number,100,0,1,0,0,0)))
+            if not native_terminal or tuple(int(v) for v in native_terminal.groups())!=expected_terminal:
+                raise Failure("Wrong yield/exit/syscall counts for suspended Thread.")
+        if not faulted and phase<3:
+            if len(parsed)!=2 or parsed[1][0]!="saved":raise Failure("Yield terminated or failed to save its Thread.")
+            saved=parsed[1][1];regs=saved[4:]
+            if (saved[0]!=thread or saved[1]!=switch_site(symbols,"neu_switch_resume") or saved[2]!=USER_RSP-32
+                    or saved[3]&~0x8d7 or regs[14]!=0 or regs[11]!=0 or regs[12]!=saved[1] or regs[4]!=saved[3]):
+                raise Failure("Yield saved an invalid complete success context.")
+            frames[thread]=saved
+            yielded=re.search(r"Switch yielded: label=(\d+) thread=(\d+) phase=(\d+) result=(\d+) steps=(\d+) queue=(\d+)",segment)
+            if not yielded or tuple(int(v) for v in yielded.groups())!=(label,thread,phase,record["seed"]+7*(phase+1),phase+1,2 if len(outcomes)==0 else 1):
+                raise Failure("Yield queue membership/result is inconsistent.")
+        else:
+            if len(parsed)!=1:raise Failure("Terminal Thread retained a resumable frame.")
+            steps=(1 if rejected else 2) if faulted else 4
+            outcome=re.search(r"Switch outcome: label=(\d+) thread=(\d+) reason=(normal|fault) result=(\d+) steps=(\d+) exited_dispatch=rejected",segment)
+            if not outcome or (int(outcome[1]),int(outcome[2]),outcome[3],int(outcome[4]),int(outcome[5]))!=(label,thread,"fault" if faulted else "normal",record["seed"]+7*steps,steps):
+                raise Failure("Wrong Node outcome or a terminal Thread remained dispatchable.")
+            if faulted and not rejected:
+                fault=re.search(r"Node user fault: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+)",segment)
+                if not fault:raise Failure("No actual scheduled user exception frame.")
+                values=[int(v,0) for v in fault.groups()]
+                vector,error,target,site_name={1:(6,0,0,"neu_switch_ud_site"),2:(6,0,0,"neu_switch_ud_site"),3:(14,4,0x406000,"neu_switch_cross_site"),4:(14,5,0xffffc00000001000,"neu_switch_stack_user_site"),5:(14,4,0xffffc00000000000,"neu_switch_stack_guard_site")}[number]
+                if (tuple(values[:7])!=(node,thread,space,root,vector,error,switch_site(symbols,site_name))
+                        or (vector==14 and values[7]!=target) or values[8:11]!=[0x3b,0x33,USER_RSP-24]
+                        or values[11]&0x3600 or not record["bottom"]<=values[12]<record["top"]):
+                    raise Failure("Fault did not use its correct Node/root/private kernel stack.")
+            reclaimed=re.search(r"Switch reclaimed: label="+str(label)+r" thread="+str(thread)+r" space="+str(space)+r" saved=false queued=false outcome=retained",segment)
+            if not reclaimed or reclaimed.start()<outcome.end():raise Failure("Premature or wrong-domain reclamation.")
+            other=2 if label==1 else 1
+            if other not in outcomes:
+                survivor=re.search(r"Switch survivor retained: label="+str(other)+r" thread="+str(records[other]["thread"])+r" root="+hex(records[other]["root"])+r" saved=true pinned=true",segment[reclaimed.end():])
+                if not survivor:raise Failure("Healthy suspended sibling did not survive early reclamation.")
+            outcomes[label]={"reason":outcome[3],"result":int(outcome[4]),"steps":steps}
+    if number==7 and "Switch construction rollback: stack_failpoints=5 context_rejected=true sibling_saved=unchanged" not in text:
+        raise Failure("Missing stack/context-construction rollback with a pinned sibling.")
+    if number==8:
+        stale=re.search(r"Switch stale identity rejected: old=(\d+) replacement=(\d+)",text)
+        if not stale or int(stale[1])!=records[1]["thread"] or int(stale[1])==int(stale[2]):raise Failure("Stale Thread generation selected a context.")
+    baseline=re.search(r"Switch accounting baseline: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    restored=re.search(r"Switch accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)",text)
+    final=re.search(r"Cooperative switch test passed: case=(\d+) dispatches=(\d+) queue=empty IF=0",text)
+    if not baseline or not restored or baseline.groups()!=restored.groups() or not final or tuple(int(v) for v in final.groups())!=(number,len(expected)):
+        raise Failure("Cooperative scheduler did not finish empty with exact resource accounting.")
+    for symbol in ("neu_native_busy","neu_native_selected_top","neu_native_saved_user_rsp","neu_user_saved_rsp"):
+        if debug_words(qmp,symbols[symbol],1)[0]!=0:raise Failure("Stale entry/continuation storage survived final cleanup.")
+    return {"case":number,"threads":records,"order":[[label,phase] for label,phase,_ in expected],"contexts":frames,"outcomes":outcomes,"observations":observations,"accounting":[int(v) for v in restored.groups()]}
+
+
 def native_register(registers, name):
     match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
     if not match:
@@ -901,6 +1128,7 @@ def run_case(case, esp, timeout):
                 native_observation = None
                 node_observations = {}
                 timer_observations = {}
+                switch_observations = {}
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -925,7 +1153,19 @@ def run_case(case, esp, timeout):
                             if sequence not in timer_observations:
                                 if qmp is None: qmp = QMP(endpoint, started + timeout)
                                 timer_observations[sequence] = observe_timer(qmp,serial,symbols,sequence,int(armed[3],16),started+timeout)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES else 0.05)
+                    if case in SWITCH_CASES:
+                        current=transcript(serial)
+                        selected_runs=list(re.finditer(r"Switch selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) phase=(\d+) fresh=(true|false)\n",current))
+                        for run_index,selected in enumerate(selected_runs):
+                            sequence,label,_,_,_,root,phase=[int(v,0) for v in selected.groups()[:7]]
+                            episode=current[selected.start():selected_runs[run_index+1].start() if run_index+1<len(selected_runs) else len(current)]
+                            ready=re.search(r"Switch native ready: node=\d+ thread=\d+ space=\d+ root=(0x[0-9a-f]+) stack_bottom=(0x[0-9a-f]+) stack_top=(0x[0-9a-f]+) TSS_RSP0=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) fresh=(true|false)\n",episode)
+                            if sequence not in switch_observations and ready:
+                                if qmp is None:qmp=QMP(endpoint,started+timeout)
+                                number=SWITCH_CASES[case]
+                                faulted=phase==1 and ((label==1 and number in (1,3,4,5)) or (label==2 and number==2))
+                                switch_observations[sequence]=observe_switch(qmp,serial,symbols,selected.start(),sequence,label,phase,root,int(ready[2],16),int(ready[3],16),started+timeout,faulted)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -973,10 +1213,11 @@ def run_case(case, esp, timeout):
                 if user and user["kernel_root"] != paging["root"]:
                     raise Failure("User teardown did not restore the original kernel root.")
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
+                switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(timer=timer)
+                result.update(timer=timer,switching=switching)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
@@ -1038,7 +1279,7 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
-            if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer"):
+            if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer", "switch"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])
                 report["host_tests"] = {"passed": True, "target": target}
