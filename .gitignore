@@ -1,1 +1,5 @@
 .DS_Store
+/.cache/
+/build/
+/target/
+__pycache__/

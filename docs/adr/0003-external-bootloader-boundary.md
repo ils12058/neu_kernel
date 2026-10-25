@@ -6,7 +6,7 @@
 - **Architecture:** [Section 2.2: scope exclusions](../Neu_Kernel_Architecture_v0.2.md#22-what-neu-will-not-build),
   [Section 4.4: bootloader boundary](../Neu_Kernel_Architecture_v0.2.md#44-bootloader-boundary),
   [Section 25: decision register](../Neu_Kernel_Architecture_v0.2.md#25-decision-register-seed-for-adrs).
-- **Related ADR:** [0004: proposed Limine integration](0004-limine-phase-0-integration.md).
+- **Related ADR:** [0004: Limine integration](0004-limine-phase-0-integration.md).
 
 ## Context
 
@@ -60,3 +60,6 @@ are not presented as part of this acceptance.
 - **2026-10-25:** Recorded the already chosen external-loader portion of
   `NEU-004` from architecture revision 0.2. Limine adoption details retain their
   separate proposal status; this acceptance does not claim a working boot path.
+- **2026-10-25, Phase 0 implementation:** ADR 0004's scoped Limine contract is
+  now accepted. This record continues to describe the external-loader boundary;
+  its original rationale and the earlier proposal history are retained.

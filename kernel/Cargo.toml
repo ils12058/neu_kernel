@@ -1,0 +1,16 @@
+[package]
+name = "neu-kernel"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "neu-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = []
+test-panic = []
+test-missing-memory-map = []

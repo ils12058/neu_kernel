@@ -1,0 +1,8 @@
+{
+  "version": "12.9.4",
+  "url": "https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.4/limine-binary.tar.gz",
+  "sha256": "847334bc4bc142de996fbd132806b89ed73ac9ab34dbc1e90cfebf1fcc68c2b1",
+  "efi_sha256": "8a7214bfd8b9a044b780f1e71b2752dc12ecc25c06b9cf39ac6a0a341c802282",
+  "base_revision": 6,
+  "protocol_reference": "https://github.com/Limine-Bootloader/limine-protocol/blob/3a0526b700e356f0eac1b71a77697b3fd1c707a3/PROTOCOL.md"
+}

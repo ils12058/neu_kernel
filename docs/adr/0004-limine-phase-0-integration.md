@@ -1,13 +1,17 @@
 # ADR 0004: Integrate Limine for Phase 0
 
 - **Date:** 2026-10-25
-- **Status:** Proposed — Limine-specific integration contract remains unresolved.
+- **Status:** Accepted — Phase 0 Limine integration contract only.
 - **Related NEU decisions:** `NEU-004` (the proposed Limine portion);
   `NEU-025 / BOOT` (the open integration plan; not resolved by this record).
 - **Architecture:** [Section 4.4: preferred loader and adapter](../Neu_Kernel_Architecture_v0.2.md#44-bootloader-boundary),
   [Section 22.3: preliminary integration objective](../Neu_Kernel_Architecture_v0.2.md#223-integration-objective-and-dependency-order-preliminary),
   [Section 25: decision register](../Neu_Kernel_Architecture_v0.2.md#25-decision-register-seed-for-adrs).
 - **Related ADR:** [0003: accepted external-bootloader boundary](0003-external-bootloader-boundary.md).
+
+The Context through Consequences sections preserve the original proposal. The
+accepted resolution and its evidence are appended below; the full
+`NEU-025 / BOOT` boot-to-first-Node design remains open.
 
 ## Context
 
@@ -69,8 +73,45 @@ themselves. This proposal does not settle the later boot-to-first-Node design in
   remain intact. Choosing an external loader does not ratify all bootstrap or
   subsystem proposals.
 
+## Accepted Phase 0 resolution — 2026-10-25
+
+The explicit Phase 0 implementation request selects Limine. Use **Limine
+12.9.4**, **protocol base revision 6**, and revision-0 firmware-type and memory-map
+requests. Pin the official binary archive and EFI executable by SHA-256 in
+[limine.lock.json](../../boot/limine.lock.json). A small internal Rust adapter
+implements only those C-layout prefixes, with compile-time layout checks; an
+additional Rust protocol crate is unnecessary for these two requests.
+
+Use a static, higher-half `x86_64-unknown-none` ELF and a kernel-owned 64 KiB
+stack. Retain the loader's page tables, GDT, and boot memory; no reclaim or memory
+allocator is part of this decision. Validate the base revision before response
+use, require UEFI64, and reject missing or malformed required boot information.
+
+The boot artifact is a prepared EFI directory containing `BOOTX64.EFI`,
+`limine.conf`, and the kernel ELF. QEMU presents a private copy through read-only
+virtual FAT and a virtio block device with explicit boot priority. This avoids
+adding ISO/FAT utilities to the inspected host. Firmware and Limine perform boot
+I/O; the kernel gains no filesystem or virtio driver requirement. A physical-disk
+installer or generally distributable disk image is outside this Phase 0 contract.
+
+Choose QMP inspection of the ordinary `cli`/`hlt` loop for smoke-test completion,
+rather than substituting a test-only guest exit for the halt being verified.
+Tests require serial evidence, two CPU-state observations, and host-controlled
+QEMU shutdown within a bounded workflow. This covers normal boot, intentional
+panic, and missing-memory-map rejection.
+
+[Implementation status](../IMPLEMENTATION_STATUS.md) records the exact versions,
+commands, firmware hashes, observed test results, trust assumptions, and remaining
+limitations. This acceptance resolves the Phase 0 part of `NEU-004`; architecture
+revision 0.2 remains an unchanged historical baseline with its earlier partial
+status. Later integration and subsystem proposals are not accepted by reference.
+
 ## History
 
 - **2026-10-25:** Recorded the Limine integration proposal from architecture
   revision 0.2 and the intended loader in the Phase 0 brief. Exact release and
   protocol choices remain unresolved; no implementation evidence is asserted.
+- **2026-10-25, Phase 0 implementation:** Accepted the scoped resolution above
+  under the explicit request to implement Limine bootstrap. All three QEMU smoke
+  scenarios passed on the documented environment. The original proposal remains
+  intact, and acceptance is distinct from that implementation evidence.
