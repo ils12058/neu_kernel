@@ -17,6 +17,29 @@ pub const fn version(major: u16, minor: u16, features: u32) -> u64 {
 }
 pub const ABI_INFO: u64 = version(ABI_MAJOR, ABI_MINOR, FEATURE_QUERY | FEATURE_EXIT);
 
+/// Experimental capability ABI. Legacy dispatch/query remains version 0.1.
+pub mod v02 {
+    pub const BOOTSTRAP_CAP_GET: u64 = 0x10;
+    pub const CAP_CLOSE: u64 = 0x11;
+    pub const ADDRESS_SPACE_INSPECT: u64 = 0x12;
+    pub const FEATURE_BOOTSTRAP: u32 = 4;
+    pub const FEATURE_CLOSE: u32 = 8;
+    pub const FEATURE_INSPECT: u32 = 16;
+    pub const INFO: u64 = super::version(
+        0,
+        2,
+        super::FEATURE_QUERY
+            | super::FEATURE_EXIT
+            | FEATURE_BOOTSTRAP
+            | FEATURE_CLOSE
+            | FEATURE_INSPECT,
+    );
+    pub const BAD_MAPPING: i64 = -24;
+    pub fn owns(number: u64) -> bool {
+        (BOOTSTRAP_CAP_GET..=ADDRESS_SPACE_INSPECT).contains(&number)
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
@@ -372,5 +395,45 @@ mod tests {
         ] {
             assert!(!valid_msrs(bad, 0xd00, entry));
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_abi_tests {
+    use super::*;
+    #[test]
+    fn capability_abi_version_numbers_and_feature_bits_are_explicit_and_separate() {
+        assert_eq!(ABI_INFO, 0x100000003);
+        assert_eq!(v02::INFO, 0x20000001f);
+        assert_eq!(
+            (
+                v02::BOOTSTRAP_CAP_GET,
+                v02::CAP_CLOSE,
+                v02::ADDRESS_SPACE_INSPECT
+            ),
+            (0x10, 0x11, 0x12)
+        );
+        assert!(v02::owns(0x12));
+        assert!(!v02::owns(0xfffffffffffffd00));
+    }
+    #[test]
+    fn legacy_abi_rejects_new_capability_operations_and_keeps_query_exit_unchanged() {
+        for number in [0x10, 0x11, 0x12] {
+            assert_eq!(
+                dispatch(number, [u64::MAX; 6]),
+                Outcome::Return {
+                    status: NOT_SUPPORTED,
+                    scalar: 0
+                }
+            );
+        }
+        assert_eq!(
+            dispatch(ABI_QUERY, [0; 6]),
+            Outcome::Return {
+                status: 0,
+                scalar: ABI_INFO
+            }
+        );
+        assert_eq!(dispatch(THREAD_EXIT, [2, 0, 0, 0, 0, 0]), Outcome::Exit(2));
     }
 }

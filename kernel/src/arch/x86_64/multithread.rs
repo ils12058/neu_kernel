@@ -16,13 +16,15 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const cfg!(feature="abi-02") as u8,abi_info=const if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
     static neu_multi_syscall_resume: u8;
     #[cfg(feature = "cap-test")]
     static neu_cap_syscall_resume: u8;
+    #[cfg(feature = "abi-02")]
+    static neu_as_syscall_resume: u8;
     static neu_multi_after_atomic: u8;
     static neu_multi_after_inc: u8;
 }
@@ -49,7 +51,11 @@ pub fn return_contract(root: u64, context: ThreadContext) -> ReturnContract {
             {
                 site(ptr::addr_of!(neu_cap_syscall_resume))
             }
-            #[cfg(not(feature = "cap-test"))]
+            #[cfg(feature = "abi-02")]
+            {
+                site(ptr::addr_of!(neu_as_syscall_resume))
+            }
+            #[cfg(not(any(feature = "cap-test", feature = "abi-02")))]
             {
                 site(ptr::addr_of!(neu_multi_syscall_resume))
             }
@@ -420,7 +426,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let (mut a, mut a1) = create(paging, &mut nodes, 1, 0)?;
     let (mut b, mut b1) = create(paging, &mut nodes, 3, 1)?;
     let actions = [
-        if cfg!(feature = "test-threads-a1-fault") || cfg!(feature = "test-capabilities-a-fault") {
+        if cfg!(feature = "test-threads-a1-fault")
+            || cfg!(feature = "test-capabilities-a-fault")
+            || cfg!(feature = "test-address-space-a-fault")
+        {
             1
         } else if cfg!(feature = "test-threads-a-cross") {
             2
@@ -429,14 +438,20 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         } else {
             0
         },
-        if cfg!(feature = "test-threads-a2-fault") || cfg!(feature = "test-capabilities-a2-fault") {
+        if cfg!(feature = "test-threads-a2-fault")
+            || cfg!(feature = "test-capabilities-a2-fault")
+            || cfg!(feature = "test-address-space-a2-fault")
+        {
             1
         } else if cfg!(feature = "test-threads-user-guard") {
             5
         } else {
             0
         },
-        if cfg!(feature = "test-threads-b-fault") || cfg!(feature = "test-capabilities-b-fault") {
+        if cfg!(feature = "test-threads-b-fault")
+            || cfg!(feature = "test-capabilities-b-fault")
+            || cfg!(feature = "test-address-space-b-fault")
+        {
             1
         } else if cfg!(feature = "test-threads-cross") {
             3
@@ -455,10 +470,15 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     super::capabilities::bootstrap(&mut nodes, a.id, b.id).map_err(|_| Error::Corrupt)?;
     #[cfg(feature = "cap-test")]
     let mut caps_ready = false;
+    #[cfg(feature = "abi-02")]
+    super::address_space::bootstrap(&mut nodes, paging, a.id, space(&a)?, b.id, space(&b)?)
+        .map_err(|_| Error::Corrupt)?;
     let mut members = [a1, a2, b1];
     let mut limited = [false; 3];
     let mut printed = 0;
     let mut dispatches = 0;
+    #[cfg(feature = "abi-02")]
+    let mut settled_slices = [0u8; 3];
     if queue.len() != 3
         || paging.member_pins(space(&a)?)? != 2
         || paging.member_pins(space(&b)?)? != 1
@@ -510,12 +530,22 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         #[cfg(feature = "cap-test")]
         super::capabilities::enter(check(nodes.take_authority(active))?)
             .map_err(|_| Error::Corrupt)?;
+        #[cfg(feature = "abi-02")]
+        super::address_space::enter(check(nodes.take_authority(active))?)
+            .map_err(|_| Error::Corrupt)?;
         let execution = native::execute_slice(paging, space(owner_node)?, dispatch, 96);
         #[cfg(feature = "cap-test")]
         check(
             nodes
                 .restore_authority(super::capabilities::leave(active).map_err(|_| Error::Corrupt)?),
         )?;
+        #[cfg(feature = "abi-02")]
+        {
+            check(nodes.restore_authority(
+                super::address_space::leave(active).map_err(|_| Error::Corrupt)?,
+            ))?;
+            super::address_space::reap(paging).map_err(|_| Error::Corrupt)?;
+        }
         let event = match execution {
             Ok(event) if !reject => event,
             Err(Error::Flags) if reject => {
@@ -552,6 +582,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     return Err(Error::Corrupt);
                 }
                 let count = committed(words[offset], Some(frame))?;
+                #[cfg(feature = "abi-02")]
+                if paging.member_cap_words(space(&a)?)?[0] == 3 {
+                    settled_slices[index] += 1;
+                }
                 serial::write(format_args!("[NEU] Multi progress: label={} captures={} stored={} committed={} boots={} total={}\n",members[index].label,members[index].preemptions,words[offset],count,words[offset+2],words[0])).map_err(|_|Error::Corrupt)?;
                 audit(paging, owner_node, &members)?;
                 #[cfg(feature = "cap-test")]
@@ -577,7 +611,11 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     {
                         caps_ready
                     }
-                    #[cfg(not(feature = "cap-test"))]
+                    #[cfg(feature = "abi-02")]
+                    {
+                        settled_slices[index] >= 3
+                    }
+                    #[cfg(not(any(feature = "cap-test", feature = "abi-02")))]
                     {
                         true
                     }
@@ -657,6 +695,9 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     #[cfg(feature = "cap-test")]
                     super::capabilities::cleanup(&mut nodes, domain.id)
                         .map_err(|_| Error::Corrupt)?;
+                    #[cfg(feature = "abi-02")]
+                    super::address_space::cleanup(&mut nodes, domain.id, paging)
+                        .map_err(|_| Error::Corrupt)?;
                     let s = domain.space.take().ok_or(Error::NotOwned)?;
                     let id = s.id();
                     paging.destroy_user(s)?;
@@ -717,6 +758,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     }
     #[cfg(feature = "cap-test")]
     super::capabilities::finish().map_err(|_| Error::Corrupt)?;
+    #[cfg(feature = "abi-02")]
+    super::address_space::finish().map_err(|_| Error::Corrupt)?;
     let captures = preemptive::stop(paging)?;
     if paging.stats() != before || paging.table_count() != tables {
         return Err(Error::Corrupt);

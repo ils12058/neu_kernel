@@ -179,3 +179,13 @@ handle; pins retain already authorized operations, and terminal Node cleanup
 releases remaining references. ABI 0.1 remains unchanged; private capability test
 operations are feature-gated. Public creation, transfer, derivation and revocation
 remain deferred. The historical scope and rationale above are preserved.
+
+### 2026-10-26 — Phase 5B extension
+
+[ADR 0016](0016-capability-abi-and-live-address-space-inspection.md) adds explicitly
+versioned capability ABI 0.2 in a separate configuration. Query=1, exit=2 and
+legacy ABI 0.1 behavior remain unchanged in earlier configurations. Private
+counter operations remain test-only; they are not promoted to public numbers.
+The [0.2 specification](../abi/experimental-v0.2.md) defines discovery, close and
+own-AddressSpace inspection. This extends the scoped decision; original rationale
+and historical implementation limits above remain intact.

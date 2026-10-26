@@ -612,7 +612,7 @@ pub(super) fn settle() -> Result<()> {
     result
 }
 
-#[cfg(feature = "cap-test")]
+#[cfg(any(feature = "cap-test", feature = "abi-02"))]
 pub(super) fn request_binding_valid(
     active: neu_kernel::node::ActiveContext,
     stack: neu_kernel::context::StackBinding,

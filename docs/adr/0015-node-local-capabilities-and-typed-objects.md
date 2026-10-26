@@ -92,3 +92,13 @@ MemoryObjects, IPC and a general userspace runtime remain separately scoped work
 - **2026-10-26:** Chosen for Phase 5A before implementation. Architecture v0.2 and
   earlier ADR rationale remain unchanged. Actual evidence and remaining limits
   belong in [implementation status](../IMPLEMENTATION_STATUS.md).
+
+### 2026-10-26 — Phase 5B extension
+
+[ADR 0016](0016-capability-abi-and-live-address-space-inspection.md) extends this
+foundation with a live AddressSpace object, distinct INSPECT authority, retained
+root references and scoped immutable PTE reads. Sealed original-handle discovery
+and close use a separate experimental ABI 0.2. TestCounter/TestFlag READ/WRITE,
+opaque generations and close-versus-revocation reasoning remain unchanged.
+The root token is reaped only after the native shared borrow and operation pins
+end. Transfer, derivation, attenuation and revocation are still deferred.

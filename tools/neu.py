@@ -60,6 +60,10 @@ CAP_CASES = ('capabilities','capabilities-xapic','capabilities-a-fault','capabil
 FEATURES.update({name:"test-"+name for name in CAP_CASES})
 FEATURES["native-cap-disabled"]="test-native-cap-disabled"
 NATIVE_CASES["native-cap-disabled"]=1
+AS_CASES=('address-space','address-space-xapic','address-space-a-fault','address-space-a2-fault','address-space-b-fault','address-space-rollback')
+FEATURES.update({name:'test-'+name for name in AS_CASES})
+FEATURES['native-abi02-disabled']='test-native-abi02-disabled'
+NATIVE_CASES['native-abi02-disabled']=1
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -159,7 +163,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -210,6 +214,9 @@ def elf_info(path):
         for name,opcode in (("neu_multi_atomic_site",b"\xf0\x48\x0f\xc1"),("neu_multi_syscall_site",b"\x0f\x05"),("neu_context_iret",b"\x48\xcf")):
             address=symbols[name];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
             if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+len(opcode)]!=opcode:raise Failure("Missing actual LOCK XADD/SYSCALL/IRETQ in the multiple-Thread image.")
+    if "neu_as_syscall_site" in symbols:
+        address=symbols["neu_as_syscall_site"];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
+        if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+2]!=b"\x0f\x05":raise Failure("ABI 0.2 fixture must use actual SYSCALL.")
     if "neu_cap_syscall_site" in symbols:
         address=symbols["neu_cap_syscall_site"];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
         if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+2]!=b"\x0f\x05":raise Failure("Capability requests must use an actual SYSCALL instruction.")
@@ -634,6 +641,15 @@ for name in CAP_CASES:
         if marker=='[NEU] Multi Thread ready: label=2':required.append('[NEU] Cap bootstrap:')
     EXPECT[name]=(required,forbidden)
 
+for name in AS_CASES:
+    base,forbidden=EXPECT['threads']
+    required=[]
+    for marker in base:
+        if marker=='[NEU] Preempt timer stopped:':required+=['[NEU] AS cleanup:','[NEU] AS accounting restored:']
+        required.append(marker)
+        if marker=='[NEU] Multi Thread ready: label=2':required.append('[NEU] AS bootstrap:')
+    EXPECT[name]=(required,forbidden)
+
 
 def switch_site(symbols,name):
     return USER_CODE+symbols[name]-symbols["neu_switch_payload"]
@@ -650,7 +666,14 @@ def debug_words(qmp,address,count,physical=False):
 def switch_walk(qmp,root,address):
     table=root;entries=[]
     for shift in (39,30,21,12):
-        value=debug_words(qmp,table+((address>>shift)&511)*8,1,True)[0]
+        snapshot=getattr(qmp,'_walk_snapshot',None)
+        if snapshot is None:
+            value=debug_words(qmp,table+((address>>shift)&511)*8,1,True)[0]
+        else:
+            # Exactly one stopped CPU: all walks in this observation read a
+            # coherent physical table-page snapshot. Discard before CONT.
+            if table not in snapshot:snapshot[table]=debug_words(qmp,table,512,True)
+            value=snapshot[table][(address>>shift)&511]
         entries.append(value)
         if value&1==0: return {"entries":entries,"present":False}
         if shift!=12 and value&128: raise Failure("Unexpected large switch-stack page.")
@@ -1086,7 +1109,103 @@ def observe_cap_request(qmp,cpu,symbols,record):
     return {'cpu':cpu,'words':words,'frame':frame,'walks':walks,'storage':storage,'storage_bytes':size}
 
 
+def observe_as_request(qmp,cpu,symbols,record):
+    reg=lambda k:native_register(cpu,k)
+    w=debug_words(qmp,symbols['neu_as_witness'],24)
+    if w[1:6]!=[record[k] for k in ('node','thread','space','root')]+[record['node']] or 'CPL=0' not in cpu or reg('CS')!=8 or reg('SS')!=0x10 or reg('CR3')!=record['root'] or reg('RFL')&0x77700 or not record['bottom']<=reg('RSP')<record['top']-160:raise Failure('ABI 0.2 lost trusted caller/root/privilege binding.')
+    if reg('CR0')&10!=10 or reg('CR4')&0x50600 or reg('EFER')&1!=1:raise Failure('ABI 0.2 exposed unsupported CPU state.')
+    tr=re.search(r'TR =0018 ([0-9a-fA-F]+)',cpu)
+    if not tr or debug_words(qmp,int(tr[1],16)+4,1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_selected_top'],1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_busy'],1)[0]!=1:raise Failure('ABI 0.2 lost selected TSS/entry stack.')
+    f=debug_words(qmp,w[21],20)
+    if w[20:22]!=[record['top'],record['top']-160] or w[22]&0x600 or w[23]!=1 or f[14]!=w[6] or f[8:10]!=w[7:9] or f[15:17]!=[w[18],0x3b] or f[18:]!=[w[19],0x33] or f[17]&0x202!=0x202 or w[18]!=multi_site(symbols,'neu_as_syscall_resume'):raise Failure('ABI 0.2 did not use actual Ring 3 SYSCALL frame.')
+    metadata=switch_walk(qmp,record['root'],symbols['neu_as_witness'])
+    if not metadata['present'] or any(e&4 for e in metadata['entries']) or metadata['entries'][-1]&((1<<63)|2)!=(1<<63)|2:raise Failure('ABI evidence storage is not supervisor RW/NX.')
+    walk=None
+    if w[6]==0x12 and w[9]==0:
+        if w[12:14]!=[3,16] or w[15]!=1 or w[16:18]!=[record['space'],record['root']]:raise Failure('Inspection did not pin the live typed AddressSpace.')
+        walk=switch_walk(qmp,record['root'],w[8]);actual=0
+        if walk['present']:
+            e=walk['entries'];actual=1|(2 if all(v&4 for v in e) else 0)|(4 if all(v&2 for v in e) else 0)|(8 if not any(v&(1<<63) for v in e) else 0)
+        if actual!=w[10]:raise Failure('Returned mapping attributes differ from independent live physical PTE walk.')
+    elif w[10]!=0:raise Failure('Rejected inspection disclosed a mapping result.')
+    return {'cpu':cpu,'words':w,'frame':f,'mapping_walk':walk,'metadata_walk':metadata}
+
+
+def check_address_space(case,text,symbols,members,state):
+    a=members['threads'][1]['node'];b=members['threads'][3]['node']
+    if f'AS bootstrap: A={a} B={b} grants=INSPECT,INSPECT,NONE,Flag.READ handles=4,4 objects=4 references=8 root_refs=2 ABI=0.2' not in text:raise Failure('Missing explicit separate bootstrap authority.')
+    rows=[list(map(lambda v:int(v,0),m.split(','))) for m in re.findall(r'AS record: words=([^\n]+)',text)]
+    if not rows or any(len(w)!=24 or w[0]!=i+1 for i,w in enumerate(rows)):raise Failure('Invalid structured ABI request ledger.')
+    tables={a:{},b:{}};objects={};grants={};errors=set();native=state['native'];closed=False;shared=False;post=False;different={};before_stack=False;post_b=False
+    for w in rows:
+        seq,node,thread,space,root,table,op,arg,va,status,result,obj,kind,rights,refs,pins,sid,realroot,rip,rsp,top,frame,flags,probe=w
+        status=status-(1<<64) if status>>63 else status
+        owner=next((r for r in members['threads'].values() if r['thread']==thread),None)
+        if owner is None or (node,space,root,table)!=(owner['node'],owner['space'],owner['root'],node) or top!=owner['top'] or frame!=top-160 or flags&0x600 or rip!=multi_site(symbols,'neu_as_syscall_resume'):raise Failure('ABI record has invalid active identity or frame.')
+        if op==0x10:
+            if status==0:
+                if arg>=4 or not result or result>>32!=1 or result&0xffffffff!=arg+1:raise Failure('Bootstrap did not return the existing bounded local grant.')
+                if node==a and arg==0 and closed:raise Failure('Discovery recreated closed authority.')
+                if (node,arg) in grants and grants[node,arg]!=result:raise Failure('Discovery changed existing authority.')
+                grants[node,arg]=result;tables[node][result]=arg
+            elif arg>=4 and status!=-16 or arg<4 and status!=-17:raise Failure('Bootstrap failure contract differs.')
+        elif op==0x11:
+            if status==0:
+                if arg not in tables[node]:raise Failure('Close succeeded without local authority.')
+                del tables[node][arg]
+                if node==a:closed=True
+            elif status!=-17:raise Failure('Double close did not reject a stale generation.')
+        elif op==0x12:
+            if status==0:
+                if arg not in tables[node] or tables[node][arg] not in (0,1) or kind!=3 or rights!=16 or pins!=1 or refs not in (2,3) or (sid,realroot)!=(space,root):raise Failure('Inspection succeeded without typed local INSPECT authority and live root pin.')
+                if obj in objects and objects[obj]!=(node,space,root):raise Failure('Equal local handles aliased foreign AddressSpace authority.')
+                objects[obj]=(node,space,root)
+                expected={0x400000:11,0x401000:3,0x402000:7,0x406000:3 if node==b else 0,0x410000:0 if node==b else 7,0x404000:7 if not post else 0}.get(va)
+                if va==0x404000 and result==0:
+                    # Actual mapping changed following precise Thread-stack retirement.
+                    post=True;expected=0
+                    if not before_stack or 'Multi Thread retired: label=1' not in text:raise Failure('No before/after live stack inspection.')
+                elif va==0x404000:before_stack=True
+                if expected is None or result!=expected:raise Failure('Wrong actual mapping result.')
+                if va==0x406000:different[node]=result
+                if owner['label']==2 and tables[node][arg]==0:shared=True
+                if owner['label']==3 and rsp==owner['initial_rsp']-80 and va==0x406000:
+                    if not closed or result!=3 or not probe:raise Failure('B did not retain independently observed authority after A closed its handle.')
+                    post_b=True
+                    if case in ('address-space-a-fault','address-space-a2-fault'):
+                        cleanup_position=text.find(f'AS cleanup: node={a} ')
+                        probe_position=text.find(f'AS probe: sequence={seq} node={b} ')
+                        if cleanup_position<0 or probe_position<cleanup_position:raise Failure('Healthy B did not inspect its live root after faulted A capability cleanup.')
+            else:
+                slot=arg&0xffffffff;generation=arg>>32
+                if slot==0 or slot>8 or generation==0:expected_status=-16
+                elif slot<=4 and (generation!=1 or (node,slot-1) in grants and grants[node,slot-1] not in tables[node]):expected_status=-17
+                elif slot>4:expected_status=-17 if case=='address-space-rollback' and node==a else -16
+                elif slot==4:expected_status=-19
+                elif slot==3:expected_status=-18
+                elif va%4096 or not 0x400000<=va<0x800000:expected_status=-2
+                else:raise Failure('A valid inspection was rejected without a policy reason.')
+                if status!=expected_status or result!=0:raise Failure('Rejected ABI request differed from independent handle/type/rights/range policy or disclosed mapping details.')
+        else:raise Failure('Private operation was published as ABI 0.2.')
+        if status<0:errors.add(status)
+        if probe:
+            if seq not in native or native[seq]['words']!=w:raise Failure('Missing matching paused QMP CPU/PTE observation for published probe.')
+    if not {-2,-16,-17,-18,-19}<=errors or not closed or not shared or different!={a:0,b:3} or len(objects)!=2:raise Failure('Incomplete real object authorization, shared authority or numeric-handle isolation.')
+    if case not in ('address-space-a-fault','address-space-a2-fault') and not post:raise Failure('No inspection after A1 exit and stack retirement.')
+    if case!='address-space-b-fault' and not post_b:raise Failure('Missing B inspection after A close/cleanup.')
+    cleanup=list(re.finditer(r'AS cleanup: node=(\d+) handles=(\d+) objects_before=(\d+) after=(\d+) references_before=(\d+) after=(\d+) pins=0 root_ref=released lease=none',text))
+    if len(cleanup)!=2 or {int(m[1]) for m in cleanup}!={a,b} or sum(int(m[2]) for m in cleanup)!=7 or tuple(map(int,cleanup[-1].groups()[3::2]))!=(0,0):raise Failure('AddressSpace cleanup leaked references or crossed Node ownership.')
+    for m in cleanup:
+        if text.index(f'Multi Node reclaimed: node={m[1]}')<m.end():raise Failure('Page tables reclaimed before capability root references.')
+    if f'AS accounting restored: objects=0 references=0 pins=0 root_refs=0 leases=0 requests={len(rows)}' not in text:raise Failure('Missing final object/reference/pin accounting.')
+    if 'RDX=0x20000001f' not in text or 'op=0xfffffffffffffd00' not in text:raise Failure('Missing ABI 0.2 feature query or private-operation rejection.')
+    if case=='address-space-rollback' and 'AS rollback: objects=full table=full manifest=duplicate references=restored root_refs=2' not in text:raise Failure('Missing actual bounded bootstrap rollback.')
+    return {'requests':rows,'native':native,'errors':sorted(errors),'post_a1_exit':post,'b_after_a_close_or_fault':post_b,'different_va_406000':different,'objects_final':0,'references_final':0,'root_refs_final':0,'pins_final':0}
+
+
 def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=None):
+    abi02=cap_state is not None and cap_state.get('abi02',False)
+    probe_prefix='neu_as' if abi02 else 'neu_cap'
     root,bottom,top,initial=tuple(record[k] for k in ('root','bottom','top','initial_rsp'))
     local_rsp=initial-64;user_base=initial&~4095;seed=record['seed'];label=record['label']
     result={'sequence':sequence,'label':label,'root':root,'bottom':bottom,'top':top,'initial_rsp':initial}
@@ -1102,18 +1221,19 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
             hint_rip=native_register(hint,'RIP');wanted=False
             if native_register(hint,'CR3')==root:
                 wanted=('restore' not in result and symbols['neu_preempt_restore_wait']<=hint_rip<symbols['neu_preempt_restore_wait_end']) or ('user' not in result and 'CPL=3' in hint and multi_site(symbols,'neu_multi_loop')<=hint_rip<multi_site(symbols,'neu_multi_loop_end') and native_register(hint,'RSP')==local_rsp) or ('irq' not in result and symbols['neu_preempt_irq_wait']<=hint_rip<symbols['neu_preempt_irq_wait_end'])
-                if symbols['neu_cap_request_wait']<=hint_rip<symbols['neu_cap_request_wait_end']:
-                    wanted=debug_words(qmp,symbols['neu_cap_witness'],1)[0] not in cap_state['native']
+                if symbols[probe_prefix+'_request_wait']<=hint_rip<symbols[probe_prefix+'_request_wait_end']:
+                    wanted=debug_words(qmp,symbols[probe_prefix+'_witness'],1)[0] not in cap_state['native']
             if not wanted:
                 time.sleep(0.001);continue
         qmp.call('stop')
+        qmp._walk_snapshot={}
         try:
             cpu=qmp.call('human-monitor-command',{'command-line':'info registers'});reg=lambda key:native_register(cpu,key)
             if reg('CR3')!=root:continue
             rip=reg('RIP');stage=None
-            if cap_state is not None and symbols['neu_cap_request_wait']<=rip<symbols['neu_cap_request_wait_end']:
-                seq=debug_words(qmp,symbols['neu_cap_witness'],1)[0]
-                if seq not in cap_state['native']:cap_state['native'][seq]=observe_cap_request(qmp,cpu,symbols,record)
+            if cap_state is not None and symbols[probe_prefix+'_request_wait']<=rip<symbols[probe_prefix+'_request_wait_end']:
+                seq=debug_words(qmp,symbols[probe_prefix+'_witness'],1)[0]
+                if seq not in cap_state['native']:cap_state['native'][seq]=(observe_as_request if abi02 else observe_cap_request)(qmp,cpu,symbols,record)
                 continue
             if symbols['neu_preempt_restore_wait']<=rip<symbols['neu_preempt_restore_wait_end'] and reg('RSP')==top-160:stage='restore'
             elif 'CPL=3' in cpu and multi_site(symbols,'neu_multi_loop')<=rip<multi_site(symbols,'neu_multi_loop_end') and reg('RSP')==local_rsp:stage='user'
@@ -1177,8 +1297,10 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
                 sample.update(raw_frame=raw,frame=frame,lapic=lapic,words=debug_words(qmp,0x402000,32),markers=debug_words(qmp,local_rsp,3))
                 if sample['markers']!=markers:raise Failure('IRQ used another member user stack.')
             result[stage]=sample
-            if (cap_state is None and all(key in result for key in ('restore','user','irq'))) or (cap_state is not None and record.get('peer') and stage=='irq'):return result
-        finally:qmp.call('cont')
+            if (cap_state is None and all(key in result for key in ('restore','user','irq'))) or (cap_state is not None and record.get('peer') and stage=='irq' and 'restore' in result):return result
+        finally:
+            qmp._walk_snapshot=None
+            qmp.call('cont')
         time.sleep(0.001)
     else:raise Failure('Timed out observing three-Thread preemption.')
     if 'restore' not in result:raise Failure('Missing actual member restore frame.')
@@ -1499,7 +1621,7 @@ def check_native(case, text, symbols, observed):
     contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
     canaries = re.findall(r"Native canaries: RBX=(0x[0-9a-f]+) RBP=(0x[0-9a-f]+) R12=(0x[0-9a-f]+) R13=(0x[0-9a-f]+) R14=(0x[0-9a-f]+) R15=(0x[0-9a-f]+)", text)
     query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
-    operations = [query, query, exit_op] if kind == 0 else ([query, (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
+    operations = [query, query, exit_op] if kind == 0 else ([query, (0x12 if case=="native-abi02-disabled" else (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1)), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
     arguments = [11, 11, 0] if kind == 0 else ([11, 11, 11, 0] if kind == 1 else ([11, 256, 11, 0] if kind == 2 else ([] if kind == 7 else [11])))
     if len(entries) != len(operations) or len(contexts) != len(entries) or len(canaries) != len(entries):
         raise Failure("Incorrect native entry/context count.")
@@ -1743,7 +1865,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -1760,7 +1882,8 @@ def run_case(case, esp, timeout):
                 switch_observations = {}
                 preempt_observations = {}
                 multi_observations = {}
-                cap_state={"native":{},"maps":{}} if case in CAP_CASES else None
+                cap_state={"native":{},"maps":{}} if case in CAP_CASES or case in AS_CASES else None
+                if case in AS_CASES:cap_state['abi02']=True
                 if cap_state is not None:result.update(capability_observations=cap_state["native"],member_observations=multi_observations)
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
@@ -1808,7 +1931,7 @@ def run_case(case, esp, timeout):
                             if sequence not in preempt_observations and ready:
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 preempt_observations[sequence]=observe_preempt(qmp,serial,symbols,selected.start(),sequence,label,root,int(ready[1],16),int(ready[2],16),started+timeout)
-                    if case in MULTI_CASES or case in CAP_CASES:
+                    if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES:
                         current=transcript(serial)
                         resource=re.findall(r"Multi Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) user_base=(0x[0-9a-f]+) initial_rsp=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_pa=(0x[0-9a-f]+) k0=(0x[0-9a-f]+) k1=(0x[0-9a-f]+) seed=(\d+)",current)
                         keys=('label','node','thread','space','root','user_base','initial_rsp','bottom','top','data_pa','user_pa','k0','k1','seed')
@@ -1819,7 +1942,7 @@ def run_case(case, esp, timeout):
                             if sequence not in multi_observations and re.search(r"Switch native ready:.*fresh=(true|false)\n",episode):
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,{**records[label],'peer':selected[8]=='true'},started+timeout,cap_state)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES else 0.05)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -1869,13 +1992,14 @@ def run_case(case, esp, timeout):
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
-                member_case={'capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES else case)
-                members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES) if case in MULTI_CASES or case in CAP_CASES else None
+                member_case={'capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES else case)
+                members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
                 capabilities=check_capabilities(case,text,symbols,members,cap_state) if case in CAP_CASES else None
-                result.update(timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
+                address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
+                result.update(address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result

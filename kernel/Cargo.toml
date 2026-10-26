@@ -118,3 +118,13 @@ test-capabilities-b-fault = ["cap-test"]
 test-capabilities-rollback = ["cap-test"]
 
 test-native-cap-disabled = ["native-test"]
+
+# Explicit experimental capability ABI image; private Phase 5A operations absent.
+abi-02 = ["multi-test"]
+test-address-space = ["abi-02"]
+test-address-space-xapic = ["abi-02"]
+test-address-space-a-fault = ["abi-02"]
+test-address-space-a2-fault = ["abi-02"]
+test-address-space-b-fault = ["abi-02"]
+test-address-space-rollback = ["abi-02"]
+test-native-abi02-disabled = ["native-test"]

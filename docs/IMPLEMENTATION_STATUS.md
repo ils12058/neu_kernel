@@ -1,5 +1,223 @@
 # Neu Kernel implementation status
 
+**Verified:** 2026-10-26. **Milestone:** K5 / Phase 5B — experimental capability ABI
+and real AddressSpace inspection. **129 host tests and 97 QEMU scenarios pass**,
+retaining every 113/90 baseline test, plus nine repeats and four independent
+clean-directory builds with QMP boots.
+Starting tree: clean `main` at `8c3872480a6368386791d86005ca550626817e1b`.
+All 113 baseline host tests were rerun before edits. The previous successful
+90-scenario QEMU report was retained as `build/phase5b-baseline-qemu.json`; it is
+historical evidence, not a fresh pre-edit run. Architecture v0.2 remains byte-for-
+byte unchanged (SHA-256 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`).
+Dependencies, Rust 1.95.0, Limine 12.9.4/base 6 and the existing QEMU 11.0.0
+TCG/q35, one CPU/512 MiB OVMF profile remain unchanged. No packages were installed.
+
+**Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
+
+## Phase 5B files and implemented contract
+
+Created:
+
+- `kernel/src/inspection.rs`: checked full execution scope and strict read-only
+  walk of the actual page tables; also exercised directly by host tests.
+- `kernel/src/arch/x86_64/address_space.rs` and `.S`: trusted grants, real object
+  references, scoped immutable native reader, ABI requests, Ring 3 discovery and
+  interleaving fixtures, actual operation pins, structured QMP witness records,
+  ordered Node cleanup and common-boundary reaping.
+- [ABI 0.2 specification](abi/experimental-v0.2.md): scalar registers, numbers,
+  statuses, feature/version discovery, bounds, grants, compatibility and limits.
+- [ADR 0016](adr/0016-capability-abi-and-live-address-space-inspection.md): rationale
+  for the ABI, bootstrap, scoped read-only view and separate root references.
+
+Modified:
+
+- `capability.rs` and tests: non-copyable real AddressSpace value owning SpaceRef,
+  distinct INSPECT rights, sealed original-handle manifest and deferred retirement.
+- `paging/mod.rs` and tests: non-copyable retained root identities, checked
+  accounting, destruction preflight and actual live-walk/negative tests.
+- `arch/x86_64/paging.rs`: immutable view of already verified own-root supervisor
+  aliases; shared borrow across execution, raw volatile table reads, common-root
+  retention/reaping, and destruction blocked while object references remain.
+  Full parent-reference validation gathers the identical counts in one traversal;
+  individual frame-release checks remain unchanged.
+- `native.rs`/`.S`, `multithread.rs`/`.S`, `preemptive.rs`, `cooperative.rs`: separately gated ABI
+  dispatch, checked publication, scoped reader, shared Node table leases, ordered
+  cleanup and legacy unsupported-operation fixture. The three-Thread restore
+  hold provides bounded visibility before timer arming. IRQ never reads this state.
+- `syscall.rs`, `lib.rs`, `main.rs`, architecture module list, Cargo features and
+  `tools/neu.py`: explicit version definitions, isolated images, host tests, QMP
+  physical PTE corroboration, structured request checks and retained old oracles.
+  Physical table snapshots exist only for one stopped CPU observation and are
+  discarded before CONT; restore observations remain mandatory.
+- README, ADR index and dated extensions to ADRs 0009/0015. Original rationale is
+  retained; no future transfer, factory or revocation proposal is marked implemented.
+
+Each Node still owns eight handle slots, and the object registry still has four
+slots. The ABI 0.2 profile uses two AddressSpace objects and two Flag test fixtures.
+Each AddressSpace holds its exact NodeId and a real generation-checked SpaceRef
+for the existing UserSpace root. It does not fabricate a permissions record,
+clone a root, or return an internal identity. Closing the object handle does not
+unmap memory. Counter READ/WRITE semantics remain available only in legacy
+private tests; INSPECT is a separate right. NONE is an explicit inert AS reference.
+
+Query=1 and exit=2 retain their behavior. `abi-02` images advertise experimental
+0.2/features 0x1f and expose 0x10 bootstrap_cap_get, 0x11 cap_close, and 0x12
+address_space_inspect. Existing images retain 0.1/features 3 and reject new
+numbers. Private fd00..fd05 test operations are absent from 0.2 images.
+
+## Bootstrap, lifetime and ownership audit
+
+Both Nodes receive index 0 own-AS INSPECT, index 1 independent own-AS INSPECT,
+index 2 own-AS NONE and index 3 own-Flag READ. Eight handles, four objects, eight
+object references and two retained roots remain after creator refs are released.
+The sealed manifest stores original handles only. Discovery neither increments
+references nor replaces a closed handle. A1/A2 use the same table; equal numeric
+handles in B resolve solely to B's own object. No public grant/factory exists.
+
+The native handler continues to avoid borrowing suspended mutable Nodes or
+Paging. The controller moves the actual table in a non-copyable lease and returns
+it before context changes. After `activate_user` verifies aliases, an immutable
+`LiveInspection` borrows Registry/table metadata for the entire native slice.
+Rust prohibits mutable Paging use during that borrow. The view's private scoped
+pointer addresses this immutable view, never Paging. Registration clears before
+the view/borrow ends and before common-root Paging mutation. Every callback
+validates full NodeId/ThreadId/SpaceId/root, active registry, current CR3,
+execution pins, retained root identity and owned table levels.
+
+No Rust shared/mutable references overlap for PTE storage: reads are bounded
+volatile accesses to verified hardware table aliases. Software structural edits
+are excluded for the slice; only hardware A/D writes may occur. IF=0/one CPU are
+additional execution preconditions, not a substitute for ownership/lifetimes.
+The static concrete backend has an exclusive atomic gate, no escaping State
+borrows and no IRQ/NMI access. There is no generalized unsafe Sync wrapper.
+
+Each object owns a non-copyable root reference separate from the existing two
+execution pins. Last handle/guard release logically retires the object but leaves
+its root token until common-boundary reaping after the immutable view ends. Root
+destruction refuses live references. Node termination returns leases, cancels
+execution references, retires per-Thread stacks, drains handles, reaps root tokens,
+then destroys the root and reclaims Node metadata. Normal A1 exit retains A2's
+Node/table/root. Trusted per-Thread stack removal can change mappings while an AS
+object survives; root lifetime is not a promise to freeze mappings forever.
+
+Each failed grant validates before slot/reference publication. Failed AS creation
+returns the original retained root token; rollback explicitly releases it. Existing
+generation exhaustion retires slots instead of wrapping. Close affects one
+handle, independent references survive, and active operation guards pin objects.
+Host tests cover last-reference close while pinned. In the supported kernel
+transactions another Thread cannot close concurrently with a pinned request.
+No cross-CPU mutation or revocation guarantee is claimed.
+
+## Phase 5B validation
+
+`make doctor`, `make check`, `make build` and `make test` passed. The full
+command ran 129 host tests and 97 QEMU scenarios. After adding a stronger healthy-B
+post-close/fault observation to the ABI 0.2 fixture, all six AddressSpace profiles
+were rebuilt and rerun, followed by nine repeats and four clean builds/boots.
+The legacy execution paths were unchanged by that fixture-only addition. All
+113 baseline host test names and all 90 preceding QEMU cases remain passing.
+Focused host filters passed 37 capability/ABI tests and five inspection tests.
+
+| Final AddressSpace profile | Requests | Paused native/PTE probes | Seconds |
+| --- | --- | --- | --- |
+| address-space | 42 | 10 | 8.030 |
+| address-space-xapic | 42 | 10 | 8.087 |
+| address-space-a-fault | 40 | 9 | 6.973 |
+| address-space-a2-fault | 40 | 9 | 7.271 |
+| address-space-b-fault | 40 | 9 | 7.420 |
+| address-space-rollback | 42 | 10 | 7.712 |
+
+The seventh new scenario, `native-abi02-disabled`, verifies a new operation is
+rejected through genuine native entry/return while query retains ABI 0.1.
+All three new numbers are also rejected by the legacy host dispatcher test.
+ABI 0.2 Ring 3 code verifies query `0x20000001f`, discovers grants, and confirms
+private fd00 is unsupported. Each native probe verifies actual CPL=0, the Ring 3
+SYSCALL opcode/frame, full caller/root identity, selected guarded stack, TSS RSP0,
+entry busy state and supervisor-only witness storage. Existing restore, user
+CPL=3, complete GPR/frame, LAPIC ISR/EOI, CR3, stack and terminal-halt checks remain.
+
+Independent QMP physical page-table walks corroborate live results: code=11,
+constants=3, data=7, A's 0x406000=0 and B's same VA=3. A2 observes A1's stack
+0x404000 changing from 7 to 0 after exact Thread retirement while its own Node,
+root and independent handle remain live. A2's new lookup and discovery of A1's
+closed primary grant fail. B's final pinned inspection succeeds after A's close,
+and after A's cleanup in both A-fault profiles. The B-fault profile instead
+proves surviving A2's inspection after unrelated B cleanup.
+
+Wrong rights/type, zero/forged/out-of-range/malformed/stale handles, invalid
+bootstrap indexes and invalid VAs return the independently expected errors with
+zero scalar. QMP captures representative invalid/stale/rights/type rejections.
+Host tests additionally cover expired/reused SpaceIds, missing pins, mixed
+Node/Thread/Space/root publication, AS-inappropriate READ/WRITE, slot reuse,
+closed bootstrap originals, last close while pinned, root retention and atomic
+capacity/failed-install rollback using the actual kernel methods. A valid
+unmapped page returns success/zero; malformed/reserved/huge table states are
+rejected by the same production walker in host tests. Such malformed hardware
+states are not deliberately installed into a live guest root.
+
+Normal and fault cleanup drains seven remaining handles after A's primary close,
+leaves zero objects/references/pins/root refs/leases, and restores exact per-image
+allocation/free/table baselines. Peak storage remains 16 data frames plus 33
+x2APIC or 42 xAPIC table frames (49/58 total); final allocation is seven pinned
+kernel tables. All runs use the unchanged 30-second deadline.
+
+The initial full run passed 84 cases before the historically tight legacy
+capabilities-xapic profile exceeded 30 seconds. It remains in
+`build/phase5b-full-initial.json` and `phase5b-xapic-initial-timeout.json`.
+Repeated parent-table scans were replaced by the identical parent-count invariant
+in one traversal; individual release checks remain. QMP table-page snapshots
+are confined to one stopped-CPU observation and discarded before CONT. The
+bounded restore hold uses the established three-Thread duration; a missing
+restore remains a failure. The full regression then passed, with legacy
+capabilities-xapic at 7.446 seconds, without relaxing timeout or CPU requirements.
+
+Evidence (ignored local build artifacts):
+
+- `build/phase5b-doctor.log`, `phase5b-check.log`, `phase5b-build.log`,
+  `phase5b-full-test.log`: command output, including the 129-test host run.
+- `build/phase5b-full-results.json`: complete 97-scenario command result.
+- `build/phase5b-focused.json` and `phase5b-focused.log`: six rebuilt final
+  AddressSpace profiles with the additional healthy-B evidence.
+- `build/phase5b-final-results.json` (also `build/test-results.json`): full
+  regression results combined with the final six profile reruns; provenance is
+  stated in its validation_note. Individual CPU/frame/PTE logs are in test-logs.
+- `build/phase5b-regression-audit.json`: baseline names/cases retained.
+- `build/phase5b-repeat/results.json`: three rounds each of normal, xAPIC and A2
+  fault (nine passes); every round performs fresh CPU/PTE observations.
+- `build/phase5b-cold/builds.json` and `qmp-results.json`: four independent empty
+  target directories for boot, AddressSpace, xAPIC and rollback, followed by QMP
+  boots of those exact artifacts. All four hashes match the corresponding final
+  normal builds. Scripts/logs are retained with the phase5b prefix.
+
+## Security limits and next milestone
+
+Own-Node AddressSpace only; one CPU, integer-only execution, no kernel preemption,
+4 KiB four-level mappings, page-aligned VAs within `[0x400000,0x800000)`, fixed
+bootstrap images/pools and a 96-request diagnostic budget (overflow returns -22
+before mutation). Effective flags only; valid unmapped pages return zero,
+and malformed/unsupported states fail. No physical address, CR3 or internal ID
+escapes through the ABI. The supervisor-only QMP witnesses intentionally contain
+internal identities for host verification and are not userspace outputs.
+
+Expired/reused SpaceId and corrupt publication negatives are host-side tests of
+the actual registry/scope methods; the guest is not made to dereference freed
+page tables for a supposed security demonstration. Root-destruction preflight
+prevents such a dangling object in the supported live path. This is QEMU evidence,
+not hardware qualification or a formal Rust memory-safety proof.
+
+Recommended K5C: a focused capability-backed Channel design/ADR with bounded
+endpoint lifetimes and scalar IPC before any cross-Node transfer. Decide message
+and authority semantics before adding transfer, derivation or revocation. Public
+mapping, MemoryObjects, factories, runtime/ELF loading, devices and SMP remain open.
+
+---
+
+## Historical Phase 5A evidence and earlier milestones
+
+The following records describe their stated milestones; current Phase 5B behavior
+is defined above and by the versioned ABI specification.
+
+
 **Verified:** 2026-10-26. **Milestone:** K5 / Phase 5A, Node-local capability
 and authorization foundation. **Result: 113 host tests and 90 QEMU
 scenarios pass**, plus nine repeats and four clean-build QMP boots; evidence and

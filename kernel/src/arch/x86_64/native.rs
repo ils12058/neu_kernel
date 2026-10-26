@@ -27,7 +27,7 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 pub const PRIVATE_VALUE: u64 = 0x5152535461626364;
-global_asm!(include_str!("native.S"),cap_disabled=const cfg!(feature="test-native-cap-disabled") as u8,cooperative=const cfg!(feature="switch-test") as u8,
+global_asm!(include_str!("native.S"),cap_disabled=const cfg!(feature="test-native-cap-disabled") as u8,abi02_disabled=const cfg!(feature="test-native-abi02-disabled") as u8,cooperative=const cfg!(feature="switch-test") as u8,
     kernel_wait=const if cfg!(feature="preempt-test") { 16u64 } else if cfg!(feature="switch-test") { 0x02000000u64 } else { 0x10000000u64 },private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
     kernel_ss=const abi::KERNEL_SS,star=const abi::STAR,fmask=const abi::ENTRY_MASK,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,unsupported=const abi::NOT_SUPPORTED,invalid=const abi::INVALID_ARGUMENT,
@@ -448,7 +448,27 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     } else {
         abi::dispatch(before.rax, before.arguments())
     };
-    #[cfg(not(feature = "cap-test"))]
+    #[cfg(feature = "abi-02")]
+    let dispatched = if abi::v02::owns(before.rax) {
+        let active = s
+            .binding
+            .unwrap_or_else(|| fatal("AddressSpace request without Node"));
+        if !super::preemptive::request_binding_valid(
+            active,
+            s.stack.unwrap_or_else(|| fatal("AddressSpace stack")),
+        ) {
+            fatal("AddressSpace caller publication");
+        }
+        super::address_space::request(active, frame, address, top)
+    } else if before.rax == abi::ABI_QUERY {
+        Outcome::Return {
+            status: 0,
+            scalar: abi::v02::INFO,
+        }
+    } else {
+        abi::dispatch(before.rax, before.arguments())
+    };
+    #[cfg(not(any(feature = "cap-test", feature = "abi-02")))]
     let dispatched = abi::dispatch(before.rax, before.arguments());
     match dispatched {
         Outcome::Exit(status) => {
@@ -538,24 +558,26 @@ pub(super) fn user_fault(frame: exceptions::ExceptionFrame, cr2: u64, handler_rs
 
 #[cfg(not(feature = "node-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
-    let kind =
-        if cfg!(feature = "test-native-unknown") || cfg!(feature = "test-native-cap-disabled") {
-            1
-        } else if cfg!(feature = "test-native-exit-invalid") {
-            2
-        } else if cfg!(feature = "test-native-return-rip") {
-            3
-        } else if cfg!(feature = "test-native-return-rsp") {
-            4
-        } else if cfg!(feature = "test-native-return-flags") {
-            5
-        } else if cfg!(feature = "test-native-return-selectors") {
-            6
-        } else if cfg!(feature = "test-native-disabled") {
-            7
-        } else {
-            0
-        };
+    let kind = if cfg!(feature = "test-native-unknown")
+        || cfg!(feature = "test-native-cap-disabled")
+        || cfg!(feature = "test-native-abi02-disabled")
+    {
+        1
+    } else if cfg!(feature = "test-native-exit-invalid") {
+        2
+    } else if cfg!(feature = "test-native-return-rip") {
+        3
+    } else if cfg!(feature = "test-native-return-rsp") {
+        4
+    } else if cfg!(feature = "test-native-return-flags") {
+        5
+    } else if cfg!(feature = "test-native-return-selectors") {
+        6
+    } else if cfg!(feature = "test-native-disabled") {
+        7
+    } else {
+        0
+    };
     let length =
         ptr::addr_of!(neu_native_payload_end) as usize - ptr::addr_of!(neu_native_payload) as usize;
     if length == 0 || length > PAGE as usize {
@@ -765,6 +787,16 @@ pub fn execute_slice(
     ACTIVE.store(true, Ordering::Relaxed);
     serial::write(format_args!("[NEU] Switch native ready: node={} thread={} space={} root={:#x} stack_bottom={:#x} stack_top={:#x} TSS_RSP0={:#x} RIP={:#x} RSP={:#x} fresh={}\n",binding.node.raw(),binding.thread.raw(),space.id().raw(),space.root,saved.stack.bottom,saved.stack.top,exceptions::rsp0(),saved.frame.context.rip,saved.frame.context.rsp,saved.fresh)).map_err(|_|Error::Corrupt)?;
     paging.activate_user(space)?;
+    #[cfg(feature = "abi-02")]
+    {
+        let common = paging.root();
+        let view = paging.inspection_view(space, binding)?;
+        super::address_space::with_reader(&view, || {
+            userspace::enter_context(&saved.frame, common, saved.stack.top)
+        })
+        .map_err(|_| Error::Corrupt)?;
+    }
+    #[cfg(not(feature = "abi-02"))]
     userspace::enter_context(&saved.frame, paging.root(), saved.stack.top);
     #[cfg(feature = "preempt-test")]
     super::interrupts::stop_user();

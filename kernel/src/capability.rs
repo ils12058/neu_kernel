@@ -8,6 +8,7 @@ pub const OBJECTS: usize = 4;
 pub enum ObjectType {
     Counter = 1,
     Flag = 2,
+    AddressSpace = 3,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rights(u8);
@@ -15,8 +16,10 @@ impl Rights {
     pub const READ: Self = Self(1);
     pub const WRITE: Self = Self(2);
     pub const READ_WRITE: Self = Self(3);
+    pub const INSPECT: Self = Self(16);
+    pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
-        if bits == 0 || bits & !3 != 0 {
+        if bits == 0 || bits & !0x13 != 0 {
             Err(Error::Rights)
         } else {
             Ok(Self(bits as u8))
@@ -26,13 +29,11 @@ impl Rights {
         self.0 as u64
     }
     fn valid(self, kind: ObjectType) -> bool {
-        self.0 != 0
-            && self.0
-                & !match kind {
-                    ObjectType::Counter => 3,
-                    ObjectType::Flag => 1,
-                }
-                == 0
+        match kind {
+            ObjectType::Counter => self.0 != 0 && self.0 & !3 == 0,
+            ObjectType::Flag => self.0 == 1,
+            ObjectType::AddressSpace => self.0 & !16 == 0,
+        }
     }
     fn contains(self, required: Self) -> bool {
         self.0 & required.0 == required.0
@@ -96,20 +97,23 @@ pub enum Error {
     InUse = -23,
 }
 pub type Result<T> = core::result::Result<T, Error>;
-#[derive(Clone, Copy)]
 enum Value {
     Counter(u64),
     Flag(bool),
+    AddressSpace {
+        owner: NodeId,
+        reference: crate::paging::SpaceRef,
+    },
 }
 impl Value {
-    fn kind(self) -> ObjectType {
+    fn kind(&self) -> ObjectType {
         match self {
             Self::Counter(_) => ObjectType::Counter,
             Self::Flag(_) => ObjectType::Flag,
+            Self::AddressSpace { .. } => ObjectType::AddressSpace,
         }
     }
 }
-#[derive(Clone, Copy)]
 struct Object {
     generation: u32,
     value: Option<Value>,
@@ -156,7 +160,7 @@ impl Default for Objects {
 impl Objects {
     pub const fn new() -> Self {
         Self {
-            slots: [Object::EMPTY; OBJECTS],
+            slots: [const { Object::EMPTY }; OBJECTS],
         }
     }
     pub fn counter(&mut self, value: u64) -> Result<ObjectRef> {
@@ -165,34 +169,75 @@ impl Objects {
     pub fn flag(&mut self, value: bool) -> Result<ObjectRef> {
         self.create(Value::Flag(value))
     }
-    fn create(&mut self, value: Value) -> Result<ObjectRef> {
-        let slot = self
-            .slots
+    fn free_slot(&self) -> Result<usize> {
+        self.slots
             .iter()
             .position(|s| s.value.is_none() && s.generation != u32::MAX)
-            .ok_or(Error::Capacity)?;
+            .ok_or(Error::Capacity)
+    }
+    fn create_at(&mut self, slot: usize, value: Value) -> ObjectRef {
         let generation = self.slots[slot].generation + 1;
+        let kind = value.kind();
         self.slots[slot] = Object {
             generation,
             value: Some(value),
             references: 1,
             pins: 0,
         };
-        Ok(ObjectRef {
+        ObjectRef {
             id: ObjectId {
                 slot,
                 generation,
-                kind: value.kind(),
+                kind,
             },
-        })
+        }
+    }
+    fn create(&mut self, value: Value) -> Result<ObjectRef> {
+        let slot = self.free_slot()?;
+        Ok(self.create_at(slot, value))
+    }
+    /// The object owns the real root reference. Failure returns it to the caller.
+    pub fn address_space(
+        &mut self,
+        owner: NodeId,
+        reference: crate::paging::SpaceRef,
+    ) -> core::result::Result<ObjectRef, (Error, crate::paging::SpaceRef)> {
+        let slot = match self.free_slot() {
+            Ok(slot) => slot,
+            Err(e) => return Err((e, reference)),
+        };
+        Ok(self.create_at(slot, Value::AddressSpace { owner, reference }))
+    }
+    pub fn reap_space(&mut self) -> Option<crate::paging::SpaceRef> {
+        let slot = self.slots.iter().position(|o| {
+            o.references == 0 && o.pins == 0 && matches!(o.value, Some(Value::AddressSpace { .. }))
+        })?;
+        match self.slots[slot].value.take()? {
+            Value::AddressSpace { reference, .. } => Some(reference),
+            _ => unreachable!(),
+        }
+    }
+    pub fn pending_spaces(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|o| {
+                o.references == 0
+                    && o.pins == 0
+                    && matches!(o.value, Some(Value::AddressSpace { .. }))
+            })
+            .count()
     }
     fn object(&self, id: ObjectId) -> Result<&Object> {
         self.slots
             .get(id.slot)
-            .filter(|s| s.generation == id.generation && s.value.is_some())
+            .filter(|s| {
+                s.generation == id.generation
+                    && s.value.is_some()
+                    && (s.references != 0 || s.pins != 0)
+            })
             .ok_or(Error::Object)
             .and_then(|s| {
-                if s.value.unwrap().kind() == id.kind {
+                if s.value.as_ref().unwrap().kind() == id.kind {
                     Ok(s)
                 } else {
                     Err(Error::Type)
@@ -209,9 +254,10 @@ impl Objects {
     }
     #[cfg(feature = "cap-test")]
     pub fn debug_value(&self, id: ObjectId) -> Result<u64> {
-        match self.object(id)?.value {
-            Some(Value::Counter(v)) => Ok(v),
-            Some(Value::Flag(v)) => Ok(v as u64),
+        match self.object(id)?.value.as_ref() {
+            Some(Value::Counter(v)) => Ok(*v),
+            Some(Value::Flag(v)) => Ok(*v as u64),
+            Some(Value::AddressSpace { .. }) => Err(Error::Type),
             None => Err(Error::Object),
         }
     }
@@ -221,6 +267,7 @@ impl Objects {
         match self.object(id)?.value.as_ref() {
             Some(Value::Counter(value)) => Ok(value as *const u64 as u64),
             Some(Value::Flag(value)) => Ok(value as *const bool as u64),
+            Some(Value::AddressSpace { .. }) => Err(Error::Type),
             None => Err(Error::Object),
         }
     }
@@ -243,7 +290,10 @@ impl Objects {
         Ok(())
     }
     fn collect(&mut self, slot: usize) {
-        if self.slots[slot].references == 0 && self.slots[slot].pins == 0 {
+        if self.slots[slot].references == 0
+            && self.slots[slot].pins == 0
+            && !matches!(self.slots[slot].value, Some(Value::AddressSpace { .. }))
+        {
             self.slots[slot].value = None;
         }
     }
@@ -298,6 +348,8 @@ pub struct Table {
     live: bool,
     id: TableId,
     slots: [Slot; HANDLES],
+    bootstrap: [Option<Handle>; 4],
+    sealed: bool,
 }
 impl Table {
     pub(crate) fn new(owner: NodeId) -> Self {
@@ -305,6 +357,8 @@ impl Table {
             live: true,
             id: TableId(owner),
             slots: [const { Slot::new() }; HANDLES],
+            bootstrap: [None; 4],
+            sealed: false,
         }
     }
     pub(crate) fn terminate(&mut self) {
@@ -370,6 +424,36 @@ impl Table {
         };
         Ok(Handle::new(slot, generation))
     }
+    pub fn install_bootstrap(
+        &mut self,
+        objects: &mut Objects,
+        reference: &ObjectRef,
+        rights: Rights,
+        index: usize,
+    ) -> Result<Handle> {
+        if self.sealed || index >= 4 || self.bootstrap[index].is_some() {
+            return Err(Error::InUse);
+        }
+        let handle = self.grant(objects, reference, rights)?;
+        self.bootstrap[index] = Some(handle);
+        Ok(handle)
+    }
+    pub fn seal_bootstrap(&mut self) {
+        self.sealed = true;
+    }
+    pub fn bootstrap_get(&self, objects: &Objects, caller: NodeId, index: u64) -> Result<Handle> {
+        self.owner(caller)?;
+        if !self.live {
+            return Err(Error::Owner);
+        }
+        if !self.sealed || index >= 4 {
+            return Err(Error::Handle);
+        }
+        let h = self.bootstrap[index as usize].ok_or(Error::Handle)?;
+        let entry = self.entry(caller, h)?;
+        objects.object(entry.target)?;
+        Ok(h)
+    }
     pub fn describe(&self, caller: NodeId, handle: Handle) -> Result<(ObjectId, Rights)> {
         let e = self.entry(caller, handle)?;
         Ok((e.target, e.rights))
@@ -390,7 +474,7 @@ impl Table {
         if e.kind != kind || e.target.kind != kind {
             return Err(Error::Type);
         }
-        if !required.valid(kind) || !e.rights.contains(required) {
+        if required.bits() == 0 || !required.valid(kind) || !e.rights.contains(required) {
             return Err(Error::Rights);
         }
         objects.pin(e.target)?;
@@ -447,10 +531,20 @@ impl Guard<'_> {
         if !self.rights.contains(Rights::READ) {
             return Err(Error::Rights);
         }
-        match self.objects.object(self.id)?.value {
-            Some(Value::Counter(v)) => Ok(v),
-            Some(Value::Flag(v)) => Ok(v as u64),
+        match self.objects.object(self.id)?.value.as_ref() {
+            Some(Value::Counter(v)) => Ok(*v),
+            Some(Value::Flag(v)) => Ok(*v as u64),
+            Some(Value::AddressSpace { .. }) => Err(Error::Type),
             None => Err(Error::Object),
+        }
+    }
+    pub fn address_space(&self) -> Result<(NodeId, &crate::paging::SpaceRef)> {
+        if !self.rights.contains(Rights::INSPECT) {
+            return Err(Error::Rights);
+        }
+        match self.objects.object(self.id)?.value.as_ref() {
+            Some(Value::AddressSpace { owner, reference }) => Ok((*owner, reference)),
+            _ => Err(Error::Type),
         }
     }
     pub fn write(&mut self, value: u64) -> Result<()> {

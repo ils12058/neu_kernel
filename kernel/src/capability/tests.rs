@@ -334,10 +334,10 @@ fn object_pool_exhaustion_does_not_publish_or_leak_an_object() {
         refs.push(o.counter(i as u64).unwrap());
     }
     let before = o.stats();
-    let generations = o.slots.map(|s| s.generation);
+    let generations = o.slots.each_ref().map(|s| s.generation);
     assert!(matches!(o.counter(999), Err(Error::Capacity)));
     assert_eq!(o.stats(), before);
-    assert_eq!(o.slots.map(|s| s.generation), generations);
+    assert_eq!(o.slots.each_ref().map(|s| s.generation), generations);
     for r in refs {
         o.release(r).unwrap();
     }
@@ -575,4 +575,267 @@ fn lease_rejects_mixed_node_thread_space_root_and_stack_bindings() {
     }
     let lease = n.take_authority(d.active).unwrap();
     n.restore_authority(lease).unwrap();
+}
+
+fn space_fixture() -> (Nodes, NodeId, Registry, crate::paging::SpaceId) {
+    let mut n = Nodes::new();
+    let a = n.create().unwrap();
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, 0x1000).unwrap();
+    (n, a, r, s)
+}
+#[test]
+fn address_space_objects_own_real_retained_space_generations_and_defer_release() {
+    let (mut n, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let reference = r.retain_space(s).unwrap();
+    let creator = o.address_space(a, reference).unwrap();
+    let id = creator.id();
+    let h = n
+        .authority_mut(a)
+        .unwrap()
+        .grant(&mut o, &creator, Rights::INSPECT)
+        .unwrap();
+    o.release(creator).unwrap();
+    {
+        let g = n
+            .authority(a)
+            .unwrap()
+            .lookup(&mut o, a, h, ObjectType::AddressSpace, Rights::INSPECT)
+            .unwrap();
+        let (owner, space) = g.address_space().unwrap();
+        assert_eq!(owner, a);
+        assert_eq!(space.id(), s);
+        assert_eq!(space.root(), 0x1000);
+        r.validate_space_ref(space).unwrap();
+    }
+    n.authority_mut(a).unwrap().close(&mut o, a, h).unwrap();
+    assert_eq!(o.info(id), Err(Error::Object));
+    assert_eq!(o.pending_spaces(), 1);
+    assert_eq!(r.can_destroy_space(s), Err(crate::paging::Error::InUse));
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(r.can_destroy_space(s), Ok(()));
+}
+#[test]
+fn inspect_right_is_distinct_and_inert_address_space_references_cannot_inspect() {
+    let (mut n, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let creator = o.address_space(a, r.retain_space(s).unwrap()).unwrap();
+    let t = n.authority_mut(a).unwrap();
+    for rights in [Rights::READ, Rights::WRITE, Rights::READ_WRITE] {
+        assert_eq!(t.grant(&mut o, &creator, rights), Err(Error::Rights));
+    }
+    let inert = t.grant(&mut o, &creator, Rights::NONE).unwrap();
+    assert!(matches!(
+        t.lookup(&mut o, a, inert, ObjectType::AddressSpace, Rights::INSPECT),
+        Err(Error::Rights)
+    ));
+    assert!(matches!(
+        t.lookup(&mut o, a, inert, ObjectType::AddressSpace, Rights::NONE),
+        Err(Error::Rights)
+    ));
+    let counter = o.counter(8).unwrap();
+    assert_eq!(
+        t.grant(&mut o, &counter, Rights::INSPECT),
+        Err(Error::Rights)
+    );
+    let h = t.grant(&mut o, &counter, Rights::READ).unwrap();
+    assert!(matches!(
+        t.lookup(&mut o, a, h, ObjectType::AddressSpace, Rights::INSPECT),
+        Err(Error::Type)
+    ));
+    t.drain(&mut o, a).unwrap();
+    o.release(counter).unwrap();
+    o.release(creator).unwrap();
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+    assert_eq!(o.stats(), Stats::default());
+}
+#[test]
+fn bootstrap_discovery_is_opaque_local_and_does_not_recreate_closed_authority() {
+    let (mut n, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let creator = o.address_space(a, r.retain_space(s).unwrap()).unwrap();
+    let t = n.authority_mut(a).unwrap();
+    let h = t
+        .install_bootstrap(&mut o, &creator, Rights::INSPECT, 0)
+        .unwrap();
+    let independent = t
+        .install_bootstrap(&mut o, &creator, Rights::INSPECT, 1)
+        .unwrap();
+    t.seal_bootstrap();
+    assert_eq!(t.bootstrap_get(&o, a, 0), Ok(h));
+    assert_eq!(t.bootstrap_get(&o, a, 1), Ok(independent));
+    t.close(&mut o, a, h).unwrap();
+    assert_eq!(t.bootstrap_get(&o, a, 0), Err(Error::Stale));
+    let replacement = t.grant(&mut o, &creator, Rights::INSPECT).unwrap();
+    assert_ne!(replacement, h);
+    assert_eq!(replacement.parts().unwrap().0, h.parts().unwrap().0);
+    assert_eq!(t.bootstrap_get(&o, a, 0), Err(Error::Stale));
+    assert_eq!(t.bootstrap_get(&o, a, 1), Ok(independent));
+    assert_eq!(t.bootstrap_get(&o, a, 4), Err(Error::Handle));
+    assert_eq!(
+        t.install_bootstrap(&mut o, &creator, Rights::INSPECT, 2),
+        Err(Error::InUse)
+    );
+    t.drain(&mut o, a).unwrap();
+    o.release(creator).unwrap();
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+}
+#[test]
+fn bootstrap_installation_failure_does_not_publish_a_manifest_entry_or_reference() {
+    let (mut n, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let creator = o.address_space(a, r.retain_space(s).unwrap()).unwrap();
+    let t = n.authority_mut(a).unwrap();
+    let before = o.stats();
+    assert_eq!(
+        t.install_bootstrap(&mut o, &creator, Rights::READ, 0),
+        Err(Error::Rights)
+    );
+    assert_eq!(o.stats(), before);
+    assert_eq!(t.slots[0].generation, 0);
+    assert!(t.bootstrap[0].is_none());
+    for _ in 0..HANDLES {
+        t.grant(&mut o, &creator, Rights::INSPECT).unwrap();
+    }
+    let before = o.stats();
+    assert_eq!(
+        t.install_bootstrap(&mut o, &creator, Rights::INSPECT, 0),
+        Err(Error::Capacity)
+    );
+    assert_eq!(o.stats(), before);
+    assert!(t.bootstrap[0].is_none());
+    t.drain(&mut o, a).unwrap();
+    o.release(creator).unwrap();
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+}
+#[test]
+fn failed_address_space_object_creation_returns_the_root_reference_for_rollback() {
+    let (_, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let mut refs = std::vec::Vec::new();
+    for _ in 0..OBJECTS {
+        refs.push(o.counter(7).unwrap());
+    }
+    let before = o.stats();
+    let (error, reference) = match o.address_space(a, r.retain_space(s).unwrap()) {
+        Err(error) => error,
+        Ok(_) => panic!("pool unexpectedly had capacity"),
+    };
+    assert_eq!(error, Error::Capacity);
+    assert_eq!(o.stats(), before);
+    r.release_space_ref(reference).unwrap();
+    assert_eq!(r.object_references(s), Ok(0));
+    for reference in refs {
+        o.release(reference).unwrap();
+    }
+}
+#[test]
+fn closing_last_address_space_handle_while_pinned_keeps_the_root_until_common_reap() {
+    let (mut n, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let creator = o.address_space(a, r.retain_space(s).unwrap()).unwrap();
+    let t = n.authority_mut(a).unwrap();
+    let h = t.grant(&mut o, &creator, Rights::INSPECT).unwrap();
+    o.release(creator).unwrap();
+    {
+        let mut g = t
+            .lookup(&mut o, a, h, ObjectType::AddressSpace, Rights::INSPECT)
+            .unwrap();
+        g.close_handle(t, h).unwrap();
+        assert_eq!((g.info().references, g.info().pins), (0, 1));
+        let (_, reference) = g.address_space().unwrap();
+        r.validate_space_ref(reference).unwrap();
+        assert!(g.objects.reap_space().is_none());
+        assert_eq!(r.can_destroy_space(s), Err(crate::paging::Error::InUse));
+    }
+    assert_eq!(o.pending_spaces(), 1);
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(r.can_destroy_space(s), Ok(()));
+}
+#[test]
+fn expired_or_reused_space_generation_is_rejected_despite_equal_root_numbers() {
+    let (_, a, mut r, s) = space_fixture();
+    let mut o = Objects::new();
+    let creator = o.address_space(a, r.retain_space(s).unwrap()).unwrap();
+    let mut t = Table::new(a);
+    let h = t.grant(&mut o, &creator, Rights::INSPECT).unwrap();
+    o.release(creator).unwrap();
+    let mut reused = Registry::new();
+    let old = reused.create_space().unwrap();
+    reused.bind_root(old, 0x1000).unwrap();
+    reused.clear_root(old, 0x1000).unwrap();
+    reused.retire_space(old).unwrap();
+    let fresh = reused.create_space().unwrap();
+    reused.bind_root(fresh, 0x1000).unwrap();
+    assert_ne!(old, fresh);
+    {
+        let g = t
+            .lookup(&mut o, a, h, ObjectType::AddressSpace, Rights::INSPECT)
+            .unwrap();
+        let (_, reference) = g.address_space().unwrap();
+        assert_eq!(reference.id(), old);
+        assert_eq!(
+            reused.validate_space_ref(reference),
+            Err(crate::paging::Error::NotOwned)
+        );
+    }
+    t.close(&mut o, a, h).unwrap();
+    r.release_space_ref(o.reap_space().unwrap()).unwrap();
+}
+#[test]
+fn immutable_inspection_binding_rejects_wrong_node_thread_space_root_and_missing_pins() {
+    let (mut n, mut r, mut q, ids) = runnable();
+    let d = q.next(&mut n).unwrap().unwrap();
+    let other = n.thread(ids[2]).unwrap();
+    let reference = r.retain_space(d.active.context.space).unwrap();
+    r.activate_space(reference.id()).unwrap();
+    assert!(!crate::inspection::scope_matches(
+        d.active,
+        d.active,
+        d.active.node,
+        &reference,
+        &r,
+        reference.root()
+    ));
+    r.deactivate_space(reference.id()).unwrap();
+    r.pin_space(reference.id()).unwrap();
+    r.activate_space(reference.id()).unwrap();
+    assert!(crate::inspection::scope_matches(
+        d.active,
+        d.active,
+        d.active.node,
+        &reference,
+        &r,
+        reference.root()
+    ));
+    let mut bad = [d.active; 4];
+    bad[0].node = other.node;
+    bad[1].thread = other.id;
+    bad[2].context.space = other.context.space;
+    bad[3].context.root = other.context.root;
+    for actual in bad {
+        assert!(!crate::inspection::scope_matches(
+            d.active,
+            actual,
+            d.active.node,
+            &reference,
+            &r,
+            reference.root()
+        ));
+    }
+    assert!(!crate::inspection::scope_matches(
+        d.active,
+        d.active,
+        other.node,
+        &reference,
+        &r,
+        reference.root()
+    ));
+    r.deactivate_space(reference.id()).unwrap();
+    r.unpin_space(reference.id()).unwrap();
+    r.release_space_ref(reference).unwrap();
 }

@@ -169,3 +169,14 @@ ADR 0015 implements the initial typed lookup/rights/close foundation, explicit
 bootstrap grants and safe reference lifetimes shared by a Node's Threads. It does
 not accept transfer, public derivation/attenuation, revocation or unrestricted
 factories. Earlier rationale remains in place with dated extensions.
+
+## Phase 5B record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0016: Capability ABI and live AddressSpace inspection](0016-capability-abi-and-live-address-space-inspection.md) | Accepted, experimental ABI 0.2 and own-Node read-only mappings | NEU-005/006/007/008/009; NEU-018/021/023/024 |
+
+ADR 0016 extends 0009/0015 with explicit capability discovery/close and a real
+AddressSpace INSPECT operation. Earlier ABI 0.1 configurations and private test
+operations remain separate. Transfer, general mapping authority and revocation
+remain future decisions. See the [versioned ABI specification](../abi/experimental-v0.2.md).
