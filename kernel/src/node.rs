@@ -3,7 +3,8 @@
 use crate::context::{Dispatch, SavedContext, StackBinding};
 use crate::paging::{SpaceId, canonical, physical};
 pub const MAX_NODES: usize = 2;
-pub const MAX_THREADS: usize = 2;
+pub const MAX_THREADS: usize = 3;
+pub const MAX_NODE_THREADS: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId {
     slot: usize,
@@ -67,6 +68,7 @@ pub enum ExitReason {
     Normal(u8),
     UserFault(Fault),
     ConstructionFailure,
+    Cancelled { by: ThreadId },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadContext {
@@ -238,6 +240,127 @@ impl Nodes {
         });
         Ok(id)
     }
+    /// Trusted internal member admission. This is not a creation syscall.
+    pub fn member_thread(&mut self, node: NodeId, context: ThreadContext) -> Result<ThreadId> {
+        let n = self.node(node)?;
+        if self.active.is_some()
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
+            || n.space != Some(context.space)
+        {
+            return Err(Error::Association);
+        }
+        let live: usize = self
+            .threads
+            .iter()
+            .flatten()
+            .filter(|t| {
+                t.node == node && !matches!(t.state, ThreadState::Exited | ThreadState::Reclaimed)
+            })
+            .count();
+        if live == 0 || live >= MAX_NODE_THREADS {
+            return Err(Error::Capacity);
+        }
+        if self.threads.iter().flatten().any(|t| {
+            t.node == node
+                && (t.context.root != context.root
+                    || (!matches!(t.state, ThreadState::Exited | ThreadState::Reclaimed)
+                        && t.context.rsp & !4095 == context.rsp & !4095))
+        }) {
+            return Err(Error::Association);
+        }
+        if physical(context.root, 52).is_err()
+            || context.root == 0
+            || !canonical(context.entry)
+            || !canonical(context.rsp)
+            || context.entry >= 0x800000000000
+            || context.rsp >= 0x800000000000
+            || context.rsp & 15 != 8
+        {
+            return Err(Error::State);
+        }
+        let slot = (0..MAX_THREADS)
+            .find(|&i| {
+                self.threads[i].is_none_or(|t| t.state == ThreadState::Reclaimed)
+                    && self.thread_generations[i] != u32::MAX
+            })
+            .ok_or(Error::Capacity)?;
+        self.thread_generations[slot] += 1;
+        let id = ThreadId {
+            slot,
+            generation: self.thread_generations[slot],
+        };
+        self.threads[slot] = Some(Thread {
+            id,
+            node,
+            state: ThreadState::Ready,
+            context,
+            outcome: None,
+            stack: None,
+            saved: None,
+            queued: false,
+        });
+        Ok(id)
+    }
+    pub fn abort_member(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        if self.active.is_some()
+            || t.state != ThreadState::Ready
+            || t.stack.is_some()
+            || t.saved.is_some()
+            || t.queued
+        {
+            return Err(Error::InUse);
+        }
+        t.state = ThreadState::Exited;
+        t.outcome = Some(ExitReason::ConstructionFailure);
+        self.threads[id.slot] = Some(t);
+        if !self.threads.iter().flatten().any(|other| {
+            other.node == t.node
+                && !matches!(other.state, ThreadState::Exited | ThreadState::Reclaimed)
+        }) {
+            let mut n = self.node(t.node)?;
+            n.state = NodeState::Exited;
+            n.outcome = t.outcome;
+            self.nodes[n.id.slot] = Some(n);
+        }
+        Ok(())
+    }
+    pub fn reclaim_thread(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        if self.active.is_some()
+            || t.state != ThreadState::Exited
+            || t.stack.is_some()
+            || t.saved.is_some()
+            || t.queued
+        {
+            return Err(Error::InUse);
+        }
+        t.state = ThreadState::Reclaimed;
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    pub fn stack_edit(&mut self, id: ThreadId) -> Result<StackEdit<'_>> {
+        let t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        if self.active.is_some()
+            || n.space != Some(t.context.space)
+            || t.saved.is_some()
+            || t.queued
+            || !matches!(t.state, ThreadState::Ready | ThreadState::Exited)
+            || (t.state == ThreadState::Ready && t.stack.is_some())
+        {
+            return Err(Error::InUse);
+        }
+        Ok(StackEdit {
+            model: self,
+            active: ActiveContext {
+                node: t.node,
+                thread: id,
+                context: t.context,
+            },
+            terminal: t.state == ThreadState::Exited,
+        })
+    }
     pub fn ready(&mut self, id: NodeId) -> Result<()> {
         let mut n = self.node(id)?;
         if n.state != NodeState::Configuring || n.space.is_none() {
@@ -265,7 +388,7 @@ impl Nodes {
             return Err(Error::InUse);
         }
         if t.state != ThreadState::Ready
-            || n.state != NodeState::Ready
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || n.space != Some(t.context.space)
         {
             return Err(Error::State);
@@ -297,14 +420,11 @@ impl Nodes {
         t.queued = false;
         self.threads[t.id.slot] = Some(t);
         if matches!(outcome, ExitReason::UserFault(_)) {
-            for other in self
-                .threads
-                .iter_mut()
-                .flatten()
-                .filter(|t| t.node == n.id && t.state != ThreadState::Reclaimed)
-            {
+            for other in self.threads.iter_mut().flatten().filter(|t| {
+                t.node == n.id && !matches!(t.state, ThreadState::Exited | ThreadState::Reclaimed)
+            }) {
                 other.state = ThreadState::Exited;
-                other.outcome = Some(outcome);
+                other.outcome = Some(ExitReason::Cancelled { by: active.thread });
                 other.saved = None;
                 other.queued = false;
             }
@@ -321,7 +441,7 @@ impl Nodes {
         });
         // A normal Thread exit ends its Node only when no live Threads remain.
         n.state = if live {
-            NodeState::Ready
+            NodeState::Active
         } else {
             NodeState::Exited
         };
@@ -341,7 +461,7 @@ impl Nodes {
             context: t.context,
         };
         if t.state != ThreadState::Ready
-            || n.state != NodeState::Ready
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || t.stack.is_some()
             || t.saved.is_some()
             || t.queued
@@ -366,7 +486,7 @@ impl Nodes {
         };
         if !matches!(t.state, ThreadState::Ready | ThreadState::Runnable)
             || t.queued
-            || n.state != NodeState::Ready
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || n.space != Some(t.context.space)
             || t.stack
                 .is_none_or(|stack| t.saved.is_none_or(|s| !s.valid(active, stack)))
@@ -392,7 +512,7 @@ impl Nodes {
         let saved = t.saved.ok_or(Error::State)?;
         if t.state != ThreadState::Runnable
             || !t.queued
-            || n.state != NodeState::Ready
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || n.space != Some(t.context.space)
             || t.stack.is_none_or(|stack| !saved.valid(active, stack))
         {
@@ -427,7 +547,7 @@ impl Nodes {
         }
         t.state = ThreadState::Runnable;
         t.saved = Some(saved);
-        n.state = NodeState::Ready;
+        n.state = NodeState::Active;
         self.threads[t.id.slot] = Some(t);
         self.nodes[n.id.slot] = Some(n);
         self.active = None;
@@ -502,6 +622,34 @@ impl Nodes {
         n.state = NodeState::Reclaimed;
         self.nodes[id.slot] = Some(n);
         Ok(())
+    }
+}
+
+/// Non-copyable proof: the model cannot be scheduled or mutated while an
+/// uninstalled/terminal Thread's stack transaction holds this exclusive borrow.
+pub struct StackEdit<'a> {
+    model: &'a mut Nodes,
+    active: ActiveContext,
+    terminal: bool,
+}
+impl StackEdit<'_> {
+    pub fn active(&self) -> ActiveContext {
+        self.active
+    }
+    pub fn terminal(&self) -> bool {
+        self.terminal
+    }
+    pub fn finish(self, release: crate::paging::StackRelease) -> Result<()> {
+        if !self.terminal || !release.matches(self.active) {
+            return Err(Error::State);
+        }
+        let mut t = self.model.thread(self.active.thread)?;
+        if t.state != ThreadState::Exited || t.saved.is_some() || t.queued {
+            return Err(Error::InUse);
+        }
+        t.stack = None;
+        self.model.threads[t.id.slot] = Some(t);
+        self.model.reclaim_thread(t.id)
     }
 }
 
@@ -701,7 +849,7 @@ mod tests {
         });
         let active = n.start(t).unwrap();
         n.complete(active, ExitReason::Normal(0)).unwrap();
-        assert_eq!(n.node(a).unwrap().state, NodeState::Ready);
+        assert_eq!(n.node(a).unwrap().state, NodeState::Active);
         assert_eq!(n.node(a).unwrap().outcome, None);
         let active = n.start(second).unwrap();
         n.complete(active, ExitReason::Normal(0)).unwrap();
@@ -738,5 +886,284 @@ mod tests {
         );
         assert!(exhausted.threads.iter().all(Option::is_none));
         assert_eq!(exhausted.node(node).unwrap().state, NodeState::Configuring);
+    }
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+    use crate::{
+        context::{SavedContext, StackBinding},
+        paging::{PAGE, Registry, thread_user_stack},
+        scheduler::Queue,
+        syscall::Frame,
+    };
+    fn initial(n: &mut Nodes, r: &mut Registry, root: u64, slot: usize) -> (NodeId, ThreadId) {
+        let s = r.create_space().unwrap();
+        r.bind_root(s, root).unwrap();
+        let id = n.create().unwrap();
+        n.configure(id).unwrap();
+        n.bind_space(id, s).unwrap();
+        let t = n
+            .initial_thread(
+                id,
+                ThreadContext {
+                    space: s,
+                    root,
+                    entry: 0x400000,
+                    rsp: thread_user_stack(slot) + PAGE - 8,
+                },
+            )
+            .unwrap();
+        n.ready(id).unwrap();
+        (id, t)
+    }
+    fn trio() -> (Nodes, Registry, Queue, [ThreadId; 3]) {
+        let mut n = Nodes::new();
+        let mut r = Registry::new();
+        let mut q = Queue::new();
+        let (a, a1) = initial(&mut n, &mut r, 0x1000, 0);
+        let (_, b) = initial(&mut n, &mut r, 0x2000, 1);
+        let mut c = n.thread(a1).unwrap().context;
+        c.rsp = thread_user_stack(2) + PAGE - 8;
+        let a2 = n.member_thread(a, c).unwrap();
+        for id in [a1, b, a2] {
+            let t = n.thread(id).unwrap();
+            let active = ActiveContext {
+                node: t.node,
+                thread: id,
+                context: t.context,
+            };
+            n.install_execution(
+                id,
+                SavedContext::initial_preemptible(active, StackBinding::new(active)),
+            )
+            .unwrap();
+            q.enqueue(&mut n, id).unwrap();
+        }
+        (n, r, q, [a1, a2, b])
+    }
+    fn interrupt(d: &crate::context::Dispatch, work: u64) -> SavedContext {
+        let mut f = d.saved.frame;
+        f.context.rip = 0x400100;
+        f.context.rsp = d.active.context.rsp - 64;
+        f.context.flags = 0x10297;
+        f.registers.rax = work;
+        f.registers.rdx = 0x402040;
+        f.registers.rcx = work + 100;
+        f.registers.r11 = 0x1122334455667788;
+        SavedContext::interrupted(d.active, d.saved.stack, f)
+    }
+    fn fault() -> Fault {
+        Fault {
+            source: FaultSource::Cpu,
+            vector: 6,
+            error: 0,
+            rip: 0x400321,
+            rsp: 0x404fb8,
+            cs: 0x3b,
+            ss: 0x33,
+            flags: 0x10202,
+            cr2: 0,
+        }
+    }
+    #[test]
+    fn three_member_fifo_preserves_independent_contexts_and_one_running_thread() {
+        let (mut n, _, mut q, ids) = trio();
+        let mut saved: [Option<Frame>; 3] = [None; 3];
+        for step in 0..18 {
+            let d = q.next(&mut n).unwrap().unwrap();
+            let expected = [ids[0], ids[2], ids[1]][step % 3];
+            assert_eq!(d.active.thread, expected);
+            assert_eq!(n.active(), Some(d.active));
+            assert!(q.next(&mut n).is_err());
+            let slot = d.active.thread.index();
+            if let Some(prior) = saved[slot] {
+                assert_eq!(d.saved.frame, prior);
+            }
+            let f = interrupt(&d, step as u64 + 1);
+            saved[slot] = Some(f.frame);
+            q.preempted(&mut n, f).unwrap();
+            assert!(n.active().is_none());
+            assert_eq!(q.len(), 3);
+            assert_eq!(n.node(d.active.node).unwrap().state, NodeState::Active);
+        }
+    }
+    #[test]
+    fn two_threads_share_exact_node_root_but_not_execution_or_stack_identity() {
+        let (n, _, _, ids) = trio();
+        let a = n.thread(ids[0]).unwrap();
+        let sibling = n.thread(ids[1]).unwrap();
+        let b = n.thread(ids[2]).unwrap();
+        assert_eq!(a.node, sibling.node);
+        assert_eq!(a.context.space, sibling.context.space);
+        assert_eq!(a.context.root, sibling.context.root);
+        assert_ne!(a.id, sibling.id);
+        assert_ne!(a.context.rsp, sibling.context.rsp);
+        assert_ne!(a.stack, sibling.stack);
+        assert_ne!(a.node, b.node);
+        assert_ne!(a.context.space, b.context.space);
+        assert_ne!(a.context.root, b.context.root);
+    }
+    #[test]
+    fn normal_exit_preserves_sibling_node_and_separate_thread_outcomes() {
+        let (mut n, _, mut q, ids) = trio();
+        let node = n.thread(ids[0]).unwrap().node;
+        let d = q.next(&mut n).unwrap().unwrap();
+        q.finish(&mut n, d.active, ExitReason::Normal(1)).unwrap();
+        assert_eq!(
+            n.thread(ids[0]).unwrap().outcome,
+            Some(ExitReason::Normal(1))
+        );
+        assert_eq!(n.node(node).unwrap().outcome, None);
+        assert_eq!(n.node(node).unwrap().state, NodeState::Active);
+        assert!(q.contains(ids[1]));
+        assert_eq!(n.reclaim_thread(ids[0]), Err(Error::InUse));
+        let b = q.next(&mut n).unwrap().unwrap();
+        q.finish(&mut n, b.active, ExitReason::Normal(3)).unwrap();
+        let a2 = q.next(&mut n).unwrap().unwrap();
+        q.finish(&mut n, a2.active, ExitReason::Normal(2)).unwrap();
+        assert_eq!(n.node(node).unwrap().outcome, Some(ExitReason::Normal(2)));
+        assert_eq!(n.node(node).unwrap().state, NodeState::Exited);
+        assert_eq!(
+            n.thread(ids[0]).unwrap().outcome,
+            Some(ExitReason::Normal(1))
+        );
+        assert!(q.next(&mut n).unwrap().is_none());
+    }
+    #[test]
+    fn node_fault_cancels_suspended_sibling_and_purges_only_its_fifo_entries() {
+        let (mut n, _, mut q, ids) = trio();
+        for work in 1..=3 {
+            let d = q.next(&mut n).unwrap().unwrap();
+            let f = interrupt(&d, work);
+            q.preempted(&mut n, f).unwrap();
+        }
+        let b_before = n.thread(ids[2]).unwrap().saved;
+        let d = q.next(&mut n).unwrap().unwrap();
+        assert_eq!(d.active.thread, ids[0]);
+        q.finish(&mut n, d.active, ExitReason::UserFault(fault()))
+            .unwrap();
+        let canceled = n.thread(ids[1]).unwrap();
+        assert_eq!(canceled.outcome, Some(ExitReason::Cancelled { by: ids[0] }));
+        assert_eq!(canceled.state, ThreadState::Exited);
+        assert!(canceled.saved.is_none() && !canceled.queued);
+        assert!(!q.contains(ids[1]));
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            n.node(d.active.node).unwrap().outcome,
+            Some(ExitReason::UserFault(fault()))
+        );
+        let healthy = q.next(&mut n).unwrap().unwrap();
+        assert_eq!(healthy.active.thread, ids[2]);
+        assert_eq!(Some(healthy.saved), b_before);
+    }
+    #[test]
+    fn later_node_fault_does_not_overwrite_an_already_normal_thread_result() {
+        let (mut n, _, mut q, ids) = trio();
+        let d = q.next(&mut n).unwrap().unwrap();
+        q.finish(&mut n, d.active, ExitReason::Normal(11)).unwrap();
+        let d = q.next(&mut n).unwrap().unwrap();
+        let f = interrupt(&d, 4);
+        q.preempted(&mut n, f).unwrap();
+        let d = q.next(&mut n).unwrap().unwrap();
+        assert_eq!(d.active.thread, ids[1]);
+        q.finish(&mut n, d.active, ExitReason::UserFault(fault()))
+            .unwrap();
+        assert_eq!(
+            n.thread(ids[0]).unwrap().outcome,
+            Some(ExitReason::Normal(11))
+        );
+        assert_eq!(
+            n.node(d.active.node).unwrap().outcome,
+            Some(ExitReason::UserFault(fault()))
+        );
+        assert!(q.contains(ids[2]));
+    }
+    #[test]
+    fn member_admission_rejects_wrong_root_space_duplicate_stack_and_capacity() {
+        let mut n = Nodes::new();
+        let mut r = Registry::new();
+        let (a, a1) = initial(&mut n, &mut r, 0x1000, 0);
+        let (b, b1) = initial(&mut n, &mut r, 0x2000, 1);
+        let good = ThreadContext {
+            rsp: thread_user_stack(2) + PAGE - 8,
+            ..n.thread(a1).unwrap().context
+        };
+        let mut bad = good;
+        bad.root = 0x3000;
+        assert_eq!(n.member_thread(a, bad), Err(Error::Association));
+        bad = good;
+        bad.space = n.thread(b1).unwrap().context.space;
+        assert_eq!(n.member_thread(a, bad), Err(Error::Association));
+        assert_eq!(
+            n.member_thread(a, n.thread(a1).unwrap().context),
+            Err(Error::Association)
+        );
+        let _ = n.member_thread(a, good).unwrap();
+        assert_eq!(n.member_thread(a, good), Err(Error::Capacity));
+        assert_eq!(
+            n.member_thread(
+                b,
+                ThreadContext {
+                    rsp: thread_user_stack(2) + PAGE - 8,
+                    ..n.thread(b1).unwrap().context
+                }
+            ),
+            Err(Error::Capacity)
+        );
+        assert_eq!((MAX_NODES, MAX_THREADS, MAX_NODE_THREADS), (2, 3, 2));
+    }
+    #[test]
+    fn stack_edit_refuses_queued_saved_and_running_contexts() {
+        let (mut n, _, mut q, ids) = trio();
+        for id in ids {
+            assert_eq!(n.stack_edit(id).err(), Some(Error::InUse));
+        }
+        let d = q.next(&mut n).unwrap().unwrap();
+        assert_eq!(n.stack_edit(d.active.thread).err(), Some(Error::InUse));
+        assert_eq!(n.reclaim_thread(d.active.thread), Err(Error::InUse));
+        let f = interrupt(&d, 8);
+        q.preempted(&mut n, f).unwrap();
+        assert_eq!(n.stack_edit(d.active.thread).err(), Some(Error::InUse));
+    }
+    #[test]
+    fn recycled_member_generation_rejects_old_admission_and_edit_authority() {
+        let mut n = Nodes::new();
+        let mut r = Registry::new();
+        let (a, a1) = initial(&mut n, &mut r, 0x1000, 0);
+        let context = ThreadContext {
+            rsp: thread_user_stack(1) + PAGE - 8,
+            ..n.thread(a1).unwrap().context
+        };
+        let old = n.member_thread(a, context).unwrap();
+        n.abort_member(old).unwrap();
+        n.reclaim_thread(old).unwrap();
+        let new = n.member_thread(a, context).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(old.index(), new.index());
+        let mut q = Queue::new();
+        assert_eq!(q.enqueue(&mut n, old), Err(Error::Identity));
+        assert_eq!(n.stack_edit(old).err(), Some(Error::Identity));
+        assert_eq!(n.thread(new).unwrap().state, ThreadState::Ready);
+    }
+    #[test]
+    fn same_root_does_not_validate_another_members_saved_rsp() {
+        let (n, _, _, ids) = trio();
+        let a = n.thread(ids[0]).unwrap();
+        let a2 = n.thread(ids[1]).unwrap();
+        let active = ActiveContext {
+            node: a2.node,
+            thread: a2.id,
+            context: a2.context,
+        };
+        let mut saved = SavedContext::initial_preemptible(active, a2.stack.unwrap());
+        saved.frame.context.rsp = a.context.rsp;
+        assert!(!saved.valid(active, a2.stack.unwrap()));
+        let mut mailbox = crate::preemption::Mailbox::new();
+        assert_eq!(
+            mailbox.arm(active, a.stack.unwrap(), true),
+            Err(crate::preemption::Error::Identity)
+        );
     }
 }

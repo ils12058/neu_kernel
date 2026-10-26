@@ -257,7 +257,7 @@ neu_irq_common:
     jne 8f
     mov qword ptr [rip + neu_preempt_irq_observed], 1
     # Observe real hardware frame and ISR before EOI; never change saved GPRs.
-    mov ecx, 0x04000000
+    mov ecx, {probe_wait}
 .global neu_preempt_irq_wait, neu_preempt_irq_wait_end
 neu_preempt_irq_wait:
     dec ecx

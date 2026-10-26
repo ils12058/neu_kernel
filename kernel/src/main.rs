@@ -74,7 +74,19 @@ const _: () = assert!(
         + cfg!(feature = "test-preempt-unexpected") as u8
         + cfg!(feature = "test-preempt-software") as u8
         + cfg!(feature = "test-preempt-origin") as u8
-        + cfg!(feature = "test-preempt-fpu") as u8)
+        + cfg!(feature = "test-preempt-fpu") as u8
+        + cfg!(feature = "test-threads") as u8
+        + cfg!(feature = "test-threads-xapic") as u8
+        + cfg!(feature = "test-threads-a1-fault") as u8
+        + cfg!(feature = "test-threads-a2-fault") as u8
+        + cfg!(feature = "test-threads-b-fault") as u8
+        + cfg!(feature = "test-threads-cross") as u8
+        + cfg!(feature = "test-threads-a-cross") as u8
+        + cfg!(feature = "test-threads-rollback") as u8
+        + cfg!(feature = "test-threads-stale") as u8
+        + cfg!(feature = "test-threads-stack") as u8
+        + cfg!(feature = "test-threads-user-guard") as u8
+        + cfg!(feature = "test-threads-return-stack") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -237,9 +249,16 @@ extern "C" fn neu_main() -> ! {
         arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: switching {error:?}\n"));
         arch::halt();
     }
-    #[cfg(feature = "preempt-test")]
+    #[cfg(all(feature = "preempt-test", not(feature = "multi-test")))]
     if let Err(error) = arch::preemptive::run(&mut paging) {
         arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: preemption {error:?}\n"));
+        arch::halt();
+    }
+    #[cfg(feature = "multi-test")]
+    if let Err(error) = arch::multithread::run(&mut paging) {
+        arch::serial::emergency(format_args!(
+            "[NEU] BOOT FAILURE: multiple Threads {error:?}\n"
+        ));
         arch::halt();
     }
     #[cfg(all(feature = "node-test", not(feature = "switch-test")))]

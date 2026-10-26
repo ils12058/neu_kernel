@@ -1,9 +1,11 @@
 //! One BSP, user-only preemption. IRQ code owns only copied publication/frame
 //! values and its mailbox; it never accesses the suspended controller's &muts.
+#[cfg(not(feature = "multi-test"))]
+use super::userspace;
 use super::{
     cooperative as bootstrap, exceptions, interrupts, native,
     paging::{self, Paging},
-    serial, userspace,
+    serial,
 };
 use core::{
     arch::{asm, global_asm},
@@ -12,26 +14,37 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use neu_kernel::{
-    context::{SavedContext, SliceEvent},
-    node::{ExitReason, Fault, FaultSource, Nodes},
-    paging::{Error, PAGE, Result},
+    context::SavedContext,
+    paging::{Error, Result},
     preemption::{Mailbox, Publication},
-    scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
+};
+#[cfg(not(feature = "multi-test"))]
+use neu_kernel::{
+    context::SliceEvent,
+    node::{ExitReason, Fault, FaultSource, Nodes},
+    paging::PAGE,
+    scheduler::Queue,
 };
 global_asm!(include_str!("preemptive.S"));
 unsafe extern "C" {
+    #[cfg(not(feature = "multi-test"))]
     static neu_preempt_payload: u8;
+    #[cfg(not(feature = "multi-test"))]
     static neu_preempt_payload_end: u8;
+    #[cfg(not(feature = "multi-test"))]
     static neu_preempt_syscall_resume: u8;
     static mut neu_preempt_irq_observed: u64;
+    #[cfg(not(feature = "multi-test"))]
     fn neu_preempt_kernel_origin();
     static __stack_bottom: u8;
     static __stack_top: u8;
 }
+#[cfg(not(feature = "multi-test"))]
 pub fn site(symbol: *const u8) -> u64 {
     userspace::CODE + symbol as u64 - ptr::addr_of!(neu_preempt_payload) as u64
 }
+#[cfg(not(feature = "multi-test"))]
 pub fn payload() -> &'static [u8] {
     let len = ptr::addr_of!(neu_preempt_payload_end) as usize
         - ptr::addr_of!(neu_preempt_payload) as usize;
@@ -39,6 +52,7 @@ pub fn payload() -> &'static [u8] {
     // SAFETY: Bounded immutable image bytes copied into private owned RX backing.
     unsafe { core::slice::from_raw_parts(ptr::addr_of!(neu_preempt_payload), len) }
 }
+#[cfg(not(feature = "multi-test"))]
 pub fn return_contract(root: u64) -> ReturnContract {
     ReturnContract {
         root,
@@ -48,6 +62,13 @@ pub fn return_contract(root: u64) -> ReturnContract {
         stack_end: userspace::STACK + PAGE,
         resumes: [site(ptr::addr_of!(neu_preempt_syscall_resume)); 2],
     }
+}
+#[cfg(feature = "multi-test")]
+pub fn return_contract(root: u64) -> ReturnContract {
+    let owner = mailbox()
+        .current()
+        .unwrap_or_else(|| reject(48, "missing member publication"));
+    super::multithread::return_contract(root, owner.active.context)
 }
 pub fn valid_user_frame(frame: Frame, root: u64) -> bool {
     let mut context = frame.context;
@@ -216,7 +237,7 @@ pub(super) fn interrupt(pointer: *const interrupts::Frame) {
     // stack bridge. IF remains clear; no Rust reference escapes this function.
     native::preempt(frame)
 }
-fn print_records(from: &mut u64) -> Result<()> {
+pub(super) fn print_records(from: &mut u64) -> Result<()> {
     let end = COUNT.load(Ordering::Acquire);
     while *from < end {
         let r = unsafe { ptr::read(RECORDS.0.get().cast::<Option<Record>>().add(*from as usize)) }
@@ -227,9 +248,11 @@ fn print_records(from: &mut u64) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(not(feature = "multi-test"))]
 fn check<T>(value: neu_kernel::node::Result<T>) -> Result<T> {
     value.map_err(|_| Error::Corrupt)
 }
+#[cfg(not(feature = "multi-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     if interrupts::flags() & 0x600 != 0 {
         return Err(Error::Flags);
@@ -526,4 +549,65 @@ pub(super) fn complete_boundary(root: u64) -> Result<()> {
     }
     BUSY.store(false, Ordering::Release);
     Ok(())
+}
+
+#[cfg(feature = "multi-test")]
+pub(super) fn start(paging: &mut Paging<'_, '_>) -> Result<()> {
+    let cr4: u64;
+    unsafe {
+        asm!("mov {}, cr4",out(reg) cr4,options(nomem,nostack,preserves_flags));
+    }
+    if cr4 & 0x50600 != 0 || interrupts::flags() & 0x600 != 0 {
+        return Err(Error::Flags);
+    }
+    interrupts::setup_user(paging).map_err(|_| Error::Corrupt)?;
+    ENABLED.store(true, Ordering::Release);
+    Ok(())
+}
+#[cfg(feature = "multi-test")]
+pub(super) fn arm(
+    active: neu_kernel::node::ActiveContext,
+    stack: neu_kernel::context::StackBinding,
+    peer: bool,
+) -> Result<Publication> {
+    let mut slot = mailbox();
+    let owner = slot.arm(active, stack, peer).map_err(|_| Error::InUse)?;
+    save(slot);
+    Ok(owner)
+}
+#[cfg(feature = "multi-test")]
+pub(super) fn consume(owner: Publication, frame: Frame) -> Result<SavedContext> {
+    let mut slot = mailbox();
+    let saved = slot.take(owner).map_err(|_| Error::Corrupt)?;
+    if saved.frame != frame || slot.take(owner) != Err(neu_kernel::preemption::Error::Identity) {
+        return Err(Error::Corrupt);
+    }
+    save(slot);
+    Ok(saved)
+}
+#[cfg(feature = "multi-test")]
+pub(super) fn terminal(owner: Publication) -> Result<()> {
+    let mut slot = mailbox();
+    slot.terminal(owner).map_err(|_| Error::Corrupt)?;
+    save(slot);
+    Ok(())
+}
+#[cfg(feature = "multi-test")]
+pub(super) fn stop(paging: &mut Paging<'_, '_>) -> Result<u64> {
+    if !mailbox().empty() || BUSY.load(Ordering::Acquire) {
+        return Err(Error::InUse);
+    }
+    ENABLED.store(false, Ordering::Release);
+    interrupts::shutdown_user(paging).map_err(|_| Error::Corrupt)?;
+    Ok(COUNT.load(Ordering::Acquire))
+}
+#[cfg(feature = "multi-test")]
+pub(super) fn settle() -> Result<()> {
+    // A terminal SYSCALL can leave a real timer pending while FMASK holds IF=0.
+    // Route only this bounded common-stack window through the legacy non-
+    // scheduling IRQ path; no Node/paging/scheduler borrow is accessed by it.
+    ENABLED.store(false, Ordering::Release);
+    let result = interrupts::settle_user_pending().map_err(|_| Error::Corrupt);
+    ENABLED.store(true, Ordering::Release);
+    result
 }

@@ -16,7 +16,7 @@ use core::{
 #[cfg(feature = "timer-test")]
 use neu_kernel::timer::Session;
 use neu_kernel::timer::{self as policy, Capabilities, Configuration, MAX_EVENTS, Mode};
-global_asm!(include_str!("interrupts.S"),preemptive=const cfg!(feature="preempt-test") as u8);
+global_asm!(include_str!("interrupts.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64});
 const APIC_BASE: u32 = 0x1b;
 const LVT: u32 = 0x320;
 const INITIAL: u32 = 0x380;
@@ -691,4 +691,32 @@ pub(super) fn shutdown_user(paging: &mut Paging<'_, '_>) -> Result<(), &'static 
 #[cfg(feature = "preempt-test")]
 pub(super) fn user_in_service(vector: u8) -> bool {
     bitmap(0x100, vector)
+}
+
+#[cfg(feature = "multi-test")]
+pub(super) fn settle_user_pending() -> Result<(), &'static str> {
+    if flags() & 0x600 != 0
+        || paging::current_root() != ROOT.load(Ordering::Acquire)
+        || !empty(0x100)
+    {
+        return Err("invalid deferred drain boundary");
+    }
+    if empty(0x200) {
+        return Ok(());
+    }
+    stop_user();
+    let before = TICKS.load(Ordering::Acquire);
+    PHASE.store(policy::DRAINING, Ordering::Release);
+    window(policy::DRAIN_TICKS)?;
+    PHASE.store(0, Ordering::Release);
+    let after = TICKS.load(Ordering::Acquire);
+    if !empty(0x100)
+        || !empty(0x200)
+        || after != before + 1
+        || EOIS.load(Ordering::Acquire) != after
+    {
+        return Err("deferred clockevent did not drain");
+    }
+    serial::write(format_args!("[NEU] Preempt deferred drained: before={} after={} eois={} root={:#x} IF=0 kernel_switch=false\n",before,after,EOIS.load(Ordering::Relaxed),paging::current_root())).map_err(|_|"deferred drain serial")?;
+    Ok(())
 }

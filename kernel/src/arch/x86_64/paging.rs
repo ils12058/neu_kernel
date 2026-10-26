@@ -833,8 +833,15 @@ pub struct UserSpace {
     tables: [bool; TABLES],
     frames: [Option<FrameId>; 4],
     private: Option<FrameId>,
+    user_stack_base: u64,
+    #[cfg(feature = "multi-test")]
+    extra_user: Option<FrameId>,
+    #[cfg(feature = "multi-test")]
+    user_owners: [Option<neu_kernel::node::ThreadId>; neu_kernel::node::MAX_THREADS],
     #[cfg(feature = "switch-test")]
-    stack: Option<OwnedStack>,
+    stacks: [Option<OwnedStack>; neu_kernel::node::MAX_THREADS],
+    #[cfg(feature = "switch-test")]
+    stack_tables: [bool; TABLES],
 }
 #[cfg(feature = "user-test")]
 impl UserSpace {
@@ -877,8 +884,15 @@ impl Paging<'_, '_> {
             tables: [false; TABLES],
             frames: [None; 4],
             private: None,
+            user_stack_base: STACK,
+            #[cfg(feature = "multi-test")]
+            extra_user: None,
+            #[cfg(feature = "multi-test")]
+            user_owners: [None; neu_kernel::node::MAX_THREADS],
             #[cfg(feature = "switch-test")]
-            stack: None,
+            stacks: core::array::from_fn(|_| None),
+            #[cfg(feature = "switch-test")]
+            stack_tables: [false; TABLES],
         };
         self.memory.budget = budget;
         let result = (|| {
@@ -1030,11 +1044,18 @@ impl Paging<'_, '_> {
             (CODE, Permissions::RX),
             (CONSTANTS, Permissions::R),
             (DATA, Permissions::RW),
-            (STACK, Permissions::RW),
+            (space.user_stack_base, Permissions::RW),
         ]
         .into_iter()
         .enumerate()
         {
+            #[cfg(feature = "multi-test")]
+            if index == 3 && space.frames[index].is_none() {
+                if tree.translate(&self.memory, address)?.is_some() {
+                    return Err(Error::Flags);
+                }
+                continue;
+            }
             let frame = space.frames[index].ok_or(Error::NotOwned)?;
             let record = self.registry.mapping_for(space.id, address)?;
             let actual = tree
@@ -1047,6 +1068,15 @@ impl Paging<'_, '_> {
                 || !actual.user
                 || actual.page_size != PAGE
             {
+                return Err(Error::Flags);
+            }
+        }
+        #[cfg(feature = "multi-test")]
+        if let Some(frame) = space.extra_user {
+            self.verify_user_stack_leaf(space, frame, logic::thread_user_stack(2))?;
+        }
+        for guard in [space.user_stack_base - PAGE, space.user_stack_base + PAGE] {
+            if tree.translate(&self.memory, guard)?.is_some() {
                 return Err(Error::Flags);
             }
         }
@@ -1065,7 +1095,7 @@ impl Paging<'_, '_> {
         for slot in 0..TABLES {
             let actual = tree.translate(&self.memory, WINDOW + slot as u64 * PAGE)?;
             #[cfg(feature = "switch-test")]
-            let stack_table = space.stack.as_ref().is_some_and(|s| s.tables[slot]);
+            let stack_table = space.stack_tables[slot];
             #[cfg(not(feature = "switch-test"))]
             let stack_table = false;
             if space.tables[slot] && !stack_table {
@@ -1158,13 +1188,17 @@ impl Paging<'_, '_> {
         self.registry.physical(mapping.frame)
     }
     pub fn destroy_user(&mut self, space: UserSpace) -> Result<()> {
-        use super::userspace::{CODE, CONSTANTS, DATA, STACK, UNMAPPED};
+        use super::userspace::{CODE, CONSTANTS, DATA, UNMAPPED};
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
         self.registry.can_allocate(space.id)?; // also refuses active/pinned roots
         #[cfg(feature = "switch-test")]
-        if space.stack.is_some() {
+        if space.stacks.iter().any(Option::is_some) {
+            return Err(Error::InUse);
+        }
+        #[cfg(feature = "multi-test")]
+        if space.extra_user.is_some() || space.user_owners.iter().any(Option::is_some) {
             return Err(Error::InUse);
         }
         let before = self.stats();
@@ -1178,10 +1212,14 @@ impl Paging<'_, '_> {
             }
         }
         load_root(self.tree.root);
-        for address in [CODE, CONSTANTS, DATA, STACK, UNMAPPED] {
+        for address in [CODE, CONSTANTS, DATA, space.user_stack_base, UNMAPPED] {
             if self.registry.mapping_for(space.id, address).is_ok() {
                 self.registry.remove_for(space.id, address)?;
             }
+        }
+        #[cfg(feature = "multi-test")]
+        if self.registry.mapping_for(space.id, 0x410000).is_ok() {
+            self.registry.remove_for(space.id, 0x410000)?;
         }
         for slot in (0..TABLES).rev() {
             if space.tables[slot] {
@@ -1263,10 +1301,12 @@ impl Paging<'_, '_> {
 struct OwnedStack {
     binding: neu_kernel::context::StackBinding,
     frames: [Option<FrameId>; logic::KSTACK_PAGES],
-    tables: [bool; TABLES],
+    #[cfg(feature = "multi-test")]
+    pinned: bool,
 }
 #[cfg(feature = "switch-test")]
 impl Paging<'_, '_> {
+    #[cfg(not(feature = "multi-test"))]
     pub fn prepare_thread_stack(
         &mut self,
         space: &mut UserSpace,
@@ -1275,7 +1315,10 @@ impl Paging<'_, '_> {
     ) -> Result<neu_kernel::context::StackBinding> {
         use neu_kernel::context::StackBinding;
         if current_root() != self.tree.root
-            || space.stack.is_some()
+            || space
+                .stacks
+                .get(active.thread.index())
+                .is_none_or(Option::is_some)
             || active.context.root != space.root
             || active.context.space != space.id
         {
@@ -1292,7 +1335,8 @@ impl Paging<'_, '_> {
         let mut stack = OwnedStack {
             binding,
             frames: [None; logic::KSTACK_PAGES],
-            tables: [false; TABLES],
+            #[cfg(feature = "multi-test")]
+            pinned: false,
         };
         let mut remaining = budget;
         let result = (|| {
@@ -1324,11 +1368,12 @@ impl Paging<'_, '_> {
             )
         })();
         self.memory.budget = None;
-        stack.tables = core::array::from_fn(|i| !old[i] && self.memory.tables[i].physical != 0);
-        for i in 0..TABLES {
-            space.tables[i] |= stack.tables[i];
+        for (i, was_owned) in old.iter().enumerate() {
+            let added = !*was_owned && self.memory.tables[i].physical != 0;
+            space.tables[i] |= added;
+            space.stack_tables[i] |= added;
         }
-        space.stack = Some(stack);
+        space.stacks[active.thread.index()] = Some(stack);
         if let Err(error) = result {
             self.destroy_thread_stack(space, active.thread)?;
             if self.stats() != before || self.table_count() != tables {
@@ -1345,7 +1390,11 @@ impl Paging<'_, '_> {
         binding: neu_kernel::context::StackBinding,
     ) -> Result<()> {
         self.verify_user(space)?;
-        let stack = space.stack.as_ref().ok_or(Error::NotOwned)?;
+        let stack = space
+            .stacks
+            .get(binding.thread.index())
+            .and_then(Option::as_ref)
+            .ok_or(Error::NotOwned)?;
         if stack.binding != binding || binding.space != space.id || binding.root != space.root {
             return Err(Error::NotOwned);
         }
@@ -1373,20 +1422,30 @@ impl Paging<'_, '_> {
                 return Err(Error::Flags);
             }
         }
-        let other =
-            logic::KSTACK_BASE + (1 - binding.thread.index()) as u64 * logic::KSTACK_STRIDE + PAGE;
-        for offset in [0, PAGE] {
-            if tree.translate(&self.memory, other + offset)?.is_some() {
-                return Err(Error::Flags);
+        for slot in 0..neu_kernel::node::MAX_THREADS {
+            let base = logic::KSTACK_BASE + slot as u64 * logic::KSTACK_STRIDE + PAGE;
+            if space.stacks[slot].is_none() {
+                for offset in [0, PAGE] {
+                    if tree.translate(&self.memory, base + offset)?.is_some() {
+                        return Err(Error::Flags);
+                    }
+                }
             }
         }
         Ok(())
     }
+    #[cfg(not(feature = "multi-test"))]
     pub fn pin_context(&mut self, space: &UserSpace) -> Result<()> {
-        let stack = space.stack.as_ref().ok_or(Error::NotOwned)?;
+        let stack = space
+            .stacks
+            .iter()
+            .flatten()
+            .next()
+            .ok_or(Error::NotOwned)?;
         self.verify_thread_stack(space, stack.binding)?;
         self.registry.pin_space(space.id)
     }
+    #[cfg(not(feature = "multi-test"))]
     pub fn unpin_context(&mut self, space: &UserSpace) -> Result<()> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -1399,6 +1458,7 @@ impl Paging<'_, '_> {
         }
         self.registry.can_allocate(space.id)
     }
+    #[cfg(not(feature = "multi-test"))]
     pub fn destroy_thread_stack(
         &mut self,
         space: &mut UserSpace,
@@ -1406,13 +1466,14 @@ impl Paging<'_, '_> {
     ) -> Result<()> {
         self.context_reclaimable(space)?;
         if space
-            .stack
-            .as_ref()
+            .stacks
+            .get(owner.index())
+            .and_then(Option::as_ref)
             .is_none_or(|s| s.binding.thread != owner)
         {
             return Err(Error::NotOwned);
         }
-        let stack = space.stack.take().ok_or(Error::NotOwned)?;
+        let stack = space.stacks[owner.index()].take().ok_or(Error::NotOwned)?;
         let tree = PageTree {
             root: space.root,
             bits: self.tree.bits,
@@ -1434,18 +1495,29 @@ impl Paging<'_, '_> {
         }
         for slot in 0..TABLES {
             space.tables[slot] &= self.memory.tables[slot].physical != 0;
+            space.stack_tables[slot] &= self.memory.tables[slot].physical != 0;
         }
         self.verify_user(space)?;
         self.verify()
     }
-    pub fn stack_high_water(&mut self, space: &UserSpace) -> Result<()> {
-        let frame =
-            space.stack.as_ref().ok_or(Error::NotOwned)?.frames[0].ok_or(Error::NotOwned)?;
-        if !self.with_frame(frame, |bytes| bytes[..512].iter().all(|byte| *byte == 0xa5))? {
+    pub fn thread_stack_high_water(
+        &mut self,
+        space: &UserSpace,
+        owner: neu_kernel::node::ThreadId,
+    ) -> Result<()> {
+        let s = space
+            .stacks
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .filter(|s| s.binding.thread == owner)
+            .ok_or(Error::NotOwned)?;
+        let frame = s.frames[0].ok_or(Error::NotOwned)?;
+        if !self.with_frame(frame, |bytes| bytes[..512].iter().all(|b| *b == 0xa5))? {
             return Err(Error::Corrupt);
         }
         Ok(())
     }
+    #[cfg(not(feature = "multi-test"))]
     pub fn user_words(&mut self, space: &UserSpace) -> Result<[u64; 3]> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -1460,12 +1532,413 @@ impl Paging<'_, '_> {
 
 #[cfg(feature = "preempt-test")]
 impl Paging<'_, '_> {
+    #[cfg(not(feature = "multi-test"))]
     pub fn user_limit(&mut self, space: &UserSpace, limit: u64) -> Result<()> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
         self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
             bytes[24..32].copy_from_slice(&limit.to_le_bytes())
+        })
+    }
+}
+
+#[cfg(feature = "multi-test")]
+impl Paging<'_, '_> {
+    fn member_boundary(&self, space: &UserSpace) -> Result<()> {
+        if current_root() != self.tree.root
+            || super::interrupts::flags() & 0x200 != 0
+            || self.registry.root(space.id)? != space.root
+        {
+            return Err(Error::InUse);
+        }
+        Ok(())
+    }
+    pub fn relocate_user_stack(&mut self, space: &mut UserSpace, base: u64) -> Result<()> {
+        self.member_boundary(space)?;
+        self.registry.can_allocate(space.id)?;
+        if ![logic::thread_user_stack(0), logic::thread_user_stack(1)].contains(&base)
+            || space.user_owners.iter().any(Option::is_some)
+        {
+            return Err(Error::Address);
+        }
+        if base == space.user_stack_base {
+            return Ok(());
+        }
+        let frame = space.frames[3].ok_or(Error::NotOwned)?;
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        tree.unmap(&mut self.memory, space.user_stack_base)?;
+        self.registry.remove_for(space.id, space.user_stack_base)?;
+        logic::map_user_frames_for(
+            &tree,
+            &mut self.memory,
+            &mut self.registry,
+            space.id,
+            base,
+            &[frame],
+            Permissions::RW,
+        )?;
+        space.user_stack_base = base;
+        self.verify_user(space)
+    }
+    pub fn map_shared_probe(&mut self, space: &UserSpace) -> Result<()> {
+        self.member_boundary(space)?;
+        logic::map_user_frames_for(
+            &PageTree {
+                root: space.root,
+                bits: self.tree.bits,
+            },
+            &mut self.memory,
+            &mut self.registry,
+            space.id,
+            0x410000,
+            &[space.frames[2].ok_or(Error::NotOwned)?],
+            Permissions::RW,
+        )
+    }
+    fn verify_user_stack_leaf(&self, space: &UserSpace, frame: FrameId, base: u64) -> Result<()> {
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        let leaf = tree
+            .translate(&self.memory, base)?
+            .ok_or(Error::NotMapped)?;
+        if leaf.physical != self.registry.physical(frame)?
+            || !leaf.user
+            || leaf.permissions != Permissions::RW
+            || leaf.page_size != PAGE
+            || self.registry.owner(frame)? != space.id
+            || self.registry.mapping_for(space.id, base)?.frame != frame
+        {
+            return Err(Error::Flags);
+        }
+        for guard in [base - PAGE, base + PAGE] {
+            if tree.translate(&self.memory, guard)?.is_some() {
+                return Err(Error::Flags);
+            }
+        }
+        Ok(())
+    }
+    fn allocate_member_frame(
+        &mut self,
+        edit: &neu_kernel::node::StackEdit<'_>,
+        kind: logic::StackKind,
+        budget: &mut Option<usize>,
+    ) -> Result<FrameId> {
+        if current_root() != self.tree.root {
+            return Err(Error::InUse);
+        }
+        if let Some(left) = budget {
+            if *left == 0 {
+                return Err(Error::Exhausted);
+            }
+            *left -= 1;
+        }
+        let pa = self
+            .memory
+            .frames
+            .allocate()
+            .map_err(|_| Error::Exhausted)?;
+        let frame = match self.registry.insert_stack_frame(edit, pa, kind) {
+            Ok(frame) => frame,
+            Err(Error::InUse) => return Err(Error::Corrupt),
+            Err(error) => {
+                self.memory.frames.free(pa).map_err(|_| Error::Corrupt)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.memory.zero(pa) {
+            self.free_member_frame(edit, frame)?;
+            return Err(error);
+        }
+        self.registry.initialize(frame)?;
+        Ok(frame)
+    }
+    fn free_member_frame(
+        &mut self,
+        edit: &neu_kernel::node::StackEdit<'_>,
+        frame: FrameId,
+    ) -> Result<()> {
+        let pa = self.registry.releasable_stack_frame(edit, frame)?;
+        self.memory.frames.free(pa).map_err(|_| Error::Corrupt)?;
+        self.registry.retire_stack_frame(edit, frame)
+    }
+    /// params are scalar fixture tag/seed/state offset/action, never kernel IDs.
+    pub fn prepare_member(
+        &mut self,
+        space: &mut UserSpace,
+        edit: &neu_kernel::node::StackEdit<'_>,
+        params: [u64; 4],
+        budget: Option<usize>,
+    ) -> Result<neu_kernel::context::StackBinding> {
+        self.member_boundary(space)?;
+        let a = edit.active();
+        let slot = a.thread.index();
+        if edit.terminal()
+            || a.context.space != space.id
+            || a.context.root != space.root
+            || slot >= neu_kernel::node::MAX_THREADS
+            || a.context.rsp != logic::thread_user_stack(slot) + PAGE - 8
+            || space.stacks[slot].is_some()
+            || space.user_owners[slot].is_some()
+        {
+            return Err(Error::NotOwned);
+        }
+        let user_base = logic::thread_user_stack(slot);
+        if user_base != space.user_stack_base && slot != 2 {
+            return Err(Error::Address);
+        }
+        let mut remaining = budget;
+        let before = self.stats();
+        let tables = self.table_count();
+        let old = self.memory.tables.map(|t| t.physical != 0);
+        let primary = user_base == space.user_stack_base;
+        let old_user = if primary {
+            space.frames[3]
+        } else {
+            space.extra_user
+        };
+        let user = if let Some(frame) = old_user {
+            self.registry.adopt_user_stack(edit, frame)?;
+            frame
+        } else {
+            let frame = self.allocate_member_frame(edit, logic::StackKind::User, &mut remaining)?;
+            if primary {
+                space.frames[3] = Some(frame);
+            } else {
+                space.extra_user = Some(frame);
+            }
+            frame
+        };
+        space.user_owners[slot] = Some(a.thread);
+        let binding = neu_kernel::context::StackBinding::new(a);
+        space.stacks[slot] = Some(OwnedStack {
+            binding,
+            frames: [None; logic::KSTACK_PAGES],
+            pinned: false,
+        });
+        let result = (|| {
+            if old_user.is_none() {
+                logic::map_thread_stack_frames(
+                    &PageTree {
+                        root: space.root,
+                        bits: self.tree.bits,
+                    },
+                    &mut self.memory,
+                    &mut self.registry,
+                    edit,
+                    user_base,
+                    &[user],
+                    logic::StackKind::User,
+                )?;
+            }
+            self.with_frame_mut(user, |bytes| {
+                for (index, value) in params.iter().enumerate() {
+                    bytes[4088 - index * 8..4096 - index * 8].copy_from_slice(&value.to_le_bytes());
+                }
+            })?;
+            for index in 0..logic::KSTACK_PAGES {
+                let frame =
+                    self.allocate_member_frame(edit, logic::StackKind::Kernel, &mut remaining)?;
+                space.stacks[slot].as_mut().ok_or(Error::Corrupt)?.frames[index] = Some(frame);
+                self.with_frame_mut(frame, |bytes| bytes.fill(0xa5))?;
+            }
+            let frames = space.stacks[slot]
+                .as_ref()
+                .ok_or(Error::Corrupt)?
+                .frames
+                .map(|f| f.unwrap());
+            logic::map_thread_stack_frames(
+                &PageTree {
+                    root: space.root,
+                    bits: self.tree.bits,
+                },
+                &mut self.memory,
+                &mut self.registry,
+                edit,
+                binding.bottom,
+                &frames,
+                logic::StackKind::Kernel,
+            )?;
+            if budget == Some(3) {
+                return Err(Error::Exhausted);
+            } // Post-map rollback hook.
+            Ok(())
+        })();
+        for (i, was_owned) in old.iter().enumerate() {
+            let added = !*was_owned && self.memory.tables[i].physical != 0;
+            space.tables[i] |= added;
+            space.stack_tables[i] |= added;
+        }
+        if let Err(error) = result {
+            self.destroy_member(space, edit)?;
+            // New-member failure never consumes the primary stack of a live owner.
+            if old_user.is_none() && (self.stats() != before || self.table_count() != tables) {
+                return Err(Error::Corrupt);
+            }
+            return Err(error);
+        }
+        self.verify_member(space, a, binding)?;
+        Ok(binding)
+    }
+    pub fn verify_member(
+        &self,
+        space: &UserSpace,
+        active: neu_kernel::node::ActiveContext,
+        binding: neu_kernel::context::StackBinding,
+    ) -> Result<()> {
+        self.member_boundary(space)?;
+        let slot = active.thread.index();
+        let base = logic::thread_user_stack(slot);
+        if slot >= neu_kernel::node::MAX_THREADS
+            || space.user_owners[slot] != Some(active.thread)
+            || active.context.rsp != base + PAGE - 8
+            || active.context.space != space.id
+            || active.context.root != space.root
+            || !binding.valid(active)
+        {
+            return Err(Error::NotOwned);
+        }
+        let frame = if base == space.user_stack_base {
+            space.frames[3]
+        } else {
+            space.extra_user
+        }
+        .ok_or(Error::NotOwned)?;
+        self.verify_user_stack_leaf(space, frame, base)?;
+        self.verify_thread_stack(space, binding)
+    }
+    pub fn pin_member(
+        &mut self,
+        space: &mut UserSpace,
+        owner: neu_kernel::node::ThreadId,
+    ) -> Result<()> {
+        self.member_boundary(space)?;
+        let stack = space
+            .stacks
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .filter(|s| s.binding.thread == owner && !s.pinned)
+            .ok_or(Error::InUse)?;
+        self.verify_thread_stack(space, stack.binding)?;
+        if space.user_owners[owner.index()] != Some(owner) {
+            return Err(Error::NotOwned);
+        }
+        self.registry.pin_space(space.id)?;
+        space.stacks[owner.index()].as_mut().unwrap().pinned = true;
+        Ok(())
+    }
+    pub fn destroy_member(
+        &mut self,
+        space: &mut UserSpace,
+        edit: &neu_kernel::node::StackEdit<'_>,
+    ) -> Result<logic::StackRelease> {
+        self.member_boundary(space)?;
+        let a = edit.active();
+        let slot = a.thread.index();
+        if a.context.space != space.id
+            || a.context.root != space.root
+            || space.user_owners.get(slot) != Some(&Some(a.thread))
+        {
+            return Err(Error::NotOwned);
+        }
+        let stack = space.stacks[slot]
+            .as_ref()
+            .filter(|s| s.binding.thread == a.thread)
+            .ok_or(Error::NotOwned)?;
+        if stack.pinned {
+            if !edit.terminal() {
+                return Err(Error::InUse);
+            }
+            self.registry.unpin_space(space.id)?;
+        }
+        let stack = space.stacks[slot].take().ok_or(Error::NotOwned)?;
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        for index in 0..logic::KSTACK_PAGES {
+            let va = stack.binding.bottom + index as u64 * PAGE;
+            if tree.translate(&self.memory, va)?.is_some() {
+                if self.registry.mapping_for(space.id, va)?.frame
+                    != stack.frames[index].ok_or(Error::Corrupt)?
+                {
+                    return Err(Error::Corrupt);
+                }
+                tree.unmap(&mut self.memory, va)?;
+                self.registry.remove_stack_mapping(edit, va)?;
+            }
+        }
+        for frame in stack.frames.into_iter().flatten() {
+            self.free_member_frame(edit, frame)?;
+        }
+        let base = logic::thread_user_stack(slot);
+        let frame = if base == space.user_stack_base {
+            space.frames[3].take()
+        } else {
+            space.extra_user.take()
+        }
+        .ok_or(Error::NotOwned)?;
+        if tree.translate(&self.memory, base)?.is_some() {
+            if self.registry.mapping_for(space.id, base)?.frame != frame {
+                return Err(Error::Corrupt);
+            }
+            tree.unmap(&mut self.memory, base)?;
+            self.registry.remove_stack_mapping(edit, base)?;
+        }
+        self.free_member_frame(edit, frame)?;
+        space.user_owners[slot] = None;
+        for slot in 0..TABLES {
+            space.tables[slot] &= self.memory.tables[slot].physical != 0;
+            space.stack_tables[slot] &= self.memory.tables[slot].physical != 0;
+        }
+        self.verify_user(space)?;
+        self.verify()?;
+        self.registry.finish_stack_edit(edit)
+    }
+    pub fn member_pins(&self, space: &UserSpace) -> Result<u8> {
+        self.registry.pins(space.id)
+    }
+    pub fn member_words(&mut self, space: &UserSpace) -> Result<[u64; 32]> {
+        self.member_boundary(space)?;
+        self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            core::array::from_fn(|i| {
+                u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+            })
+        })
+    }
+    pub fn member_limit(&mut self, space: &UserSpace, label: u64, limit: u64) -> Result<()> {
+        self.member_boundary(space)?;
+        if !(1..=4).contains(&label) {
+            return Err(Error::Address);
+        }
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            let at = (64 + (label - 1) * 32 + 8) as usize;
+            bytes[at..at + 8].copy_from_slice(&limit.to_le_bytes());
+        })
+    }
+    pub fn member_init_state(&mut self, space: &UserSpace, label: u64) -> Result<()> {
+        self.member_boundary(space)?;
+        if !(1..=4).contains(&label) {
+            return Err(Error::Address);
+        }
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            let at = (64 + (label - 1) * 32) as usize;
+            bytes[at..at + 32].fill(0);
+            bytes[at + 8..at + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        })
+    }
+}
+#[cfg(feature = "multi-test")]
+impl Paging<'_, '_> {
+    pub fn member_done_flag(&mut self, space: &UserSpace) -> Result<()> {
+        self.member_boundary(space)?;
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            bytes[32..40].copy_from_slice(&1u64.to_le_bytes())
         })
     }
 }

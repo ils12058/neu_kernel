@@ -41,7 +41,7 @@ neu_enter_context:
     lea rsp, [r13 - 160]
 .if {preemptive}
     # Test observation occurs before arming, with the immutable user frame intact.
-    mov ecx, 0x04000000
+    mov ecx, {probe_wait}
 .global neu_preempt_restore_wait, neu_preempt_restore_wait_end
 neu_preempt_restore_wait:
     dec ecx

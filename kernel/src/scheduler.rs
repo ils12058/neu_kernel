@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(m.thread(b).unwrap().saved, before);
         assert_eq!(
             m.node(m.thread(b).unwrap().node).unwrap().state,
-            NodeState::Ready
+            NodeState::Active
         );
         let resumed = q.next(&mut m).unwrap().unwrap();
         assert_eq!(resumed.active.thread, b);
@@ -319,10 +319,10 @@ mod tests {
         assert_ne!(a, replacement);
         assert_eq!(q.enqueue(&mut m, a), Err(node::Error::Identity));
         assert!(q.contains(b));
-        q.entries = [Some(a), Some(b)];
+        q.entries = [Some(a), Some(b), None];
         q.len = 2;
         assert_eq!(q.next(&mut m).err(), Some(node::Error::Identity));
-        assert_eq!(q.entries, [Some(a), Some(b)]);
+        assert_eq!(q.entries, [Some(a), Some(b), None]);
         assert_eq!(m.thread(b).unwrap().state, ThreadState::Runnable);
     }
     #[test]

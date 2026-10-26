@@ -903,3 +903,374 @@ fn supervisor_stack_arena_guards_owner_checks_and_rollback_are_enforced() {
     r.retire(b).unwrap();
     assert_eq!(memory.pages.len(), count);
 }
+
+struct MemberFixture {
+    nodes: crate::node::Nodes,
+    registry: Registry,
+    memory: Model,
+    tree: PageTree,
+    queue: crate::scheduler::Queue,
+    active: [crate::node::ActiveContext; 2],
+    frames: [[FrameId; 3]; 2],
+    data: FrameId,
+}
+fn member_fixture() -> MemberFixture {
+    use crate::{
+        context::{SavedContext, StackBinding},
+        node::{ActiveContext, Nodes, ThreadContext},
+        scheduler::Queue,
+    };
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let mut registry = Registry::new();
+    let space = registry.create_space().unwrap();
+    registry.bind_root(space, tree.root).unwrap();
+    let mut nodes = Nodes::new();
+    let node = nodes.create().unwrap();
+    nodes.configure(node).unwrap();
+    nodes.bind_space(node, space).unwrap();
+    let first = nodes
+        .initial_thread(
+            node,
+            ThreadContext {
+                space,
+                root: tree.root,
+                entry: 0x400000,
+                rsp: thread_user_stack(0) + PAGE - 8,
+            },
+        )
+        .unwrap();
+    nodes.ready(node).unwrap();
+    let second = nodes
+        .member_thread(
+            node,
+            ThreadContext {
+                space,
+                root: tree.root,
+                entry: 0x400000,
+                rsp: thread_user_stack(1) + PAGE - 8,
+            },
+        )
+        .unwrap();
+    let data = registry.insert_for(space, 0x900000).unwrap();
+    registry.initialize(data).unwrap();
+    map_user_frames_for(
+        &tree,
+        &mut memory,
+        &mut registry,
+        space,
+        0x402000,
+        &[data],
+        Permissions::RW,
+    )
+    .unwrap();
+    let mut queue = Queue::new();
+    let mut active = Vec::new();
+    let mut all_frames = Vec::new();
+    for (index, id) in [first, second].into_iter().enumerate() {
+        let t = nodes.thread(id).unwrap();
+        let a = ActiveContext {
+            node,
+            thread: id,
+            context: t.context,
+        };
+        let stack = StackBinding::new(a);
+        let frames = {
+            let edit = nodes.stack_edit(id).unwrap();
+            let pa = 0x100000 + index as u64 * 0x10000;
+            let u = registry
+                .insert_stack_frame(&edit, pa, StackKind::User)
+                .unwrap();
+            let k0 = registry
+                .insert_stack_frame(&edit, pa + PAGE, StackKind::Kernel)
+                .unwrap();
+            let k1 = registry
+                .insert_stack_frame(&edit, pa + 2 * PAGE, StackKind::Kernel)
+                .unwrap();
+            for f in [u, k0, k1] {
+                registry.initialize(f).unwrap();
+            }
+            map_thread_stack_frames(
+                &tree,
+                &mut memory,
+                &mut registry,
+                &edit,
+                thread_user_stack(index),
+                &[u],
+                StackKind::User,
+            )
+            .unwrap();
+            map_thread_stack_frames(
+                &tree,
+                &mut memory,
+                &mut registry,
+                &edit,
+                stack.bottom,
+                &[k0, k1],
+                StackKind::Kernel,
+            )
+            .unwrap();
+            [u, k0, k1]
+        };
+        nodes
+            .install_execution(id, SavedContext::initial_preemptible(a, stack))
+            .unwrap();
+        registry.pin_space(space).unwrap();
+        queue.enqueue(&mut nodes, id).unwrap();
+        active.push(a);
+        all_frames.push(frames);
+    }
+    MemberFixture {
+        nodes,
+        registry,
+        memory,
+        tree,
+        queue,
+        active: active.try_into().unwrap(),
+        frames: all_frames.try_into().unwrap(),
+        data,
+    }
+}
+fn retire_fixture_first(f: &mut MemberFixture) {
+    let d = f.queue.next(&mut f.nodes).unwrap().unwrap();
+    assert_eq!(d.active, f.active[0]);
+    f.queue
+        .finish(&mut f.nodes, d.active, crate::node::ExitReason::Normal(1))
+        .unwrap();
+    let edit = f.nodes.stack_edit(d.active.thread).unwrap();
+    assert!(matches!(
+        f.registry.finish_stack_edit(&edit),
+        Err(Error::InUse)
+    ));
+    f.registry.unpin_space(d.active.context.space).unwrap();
+    for (va, id) in [
+        (thread_user_stack(0), f.frames[0][0]),
+        (KSTACK_BASE + PAGE, f.frames[0][1]),
+        (KSTACK_BASE + 2 * PAGE, f.frames[0][2]),
+    ] {
+        f.tree.unmap(&mut f.memory, va).unwrap();
+        assert_eq!(f.registry.remove_stack_mapping(&edit, va).unwrap(), id);
+        f.registry.retire_stack_frame(&edit, id).unwrap();
+    }
+    let receipt = f.registry.finish_stack_edit(&edit).unwrap();
+    edit.finish(receipt).unwrap();
+}
+#[test]
+fn scoped_stack_retirement_keeps_sibling_pin_tables_and_mappings_live() {
+    let mut f = member_fixture();
+    let space = f.active[0].context.space;
+    let before_tables = f.memory.pages.len();
+    let sibling = f.nodes.thread(f.active[1].thread).unwrap().saved;
+    assert_eq!(f.registry.pins(space).unwrap(), 2);
+    assert_eq!(
+        f.registry.remove_for(space, thread_user_stack(0)),
+        Err(Error::InUse)
+    );
+    assert_eq!(f.registry.releasable(f.frames[0][0]), Err(Error::InUse));
+    retire_fixture_first(&mut f);
+    assert_eq!(f.registry.pins(space).unwrap(), 1);
+    assert_eq!(f.memory.pages.len(), before_tables);
+    assert_eq!(f.nodes.thread(f.active[1].thread).unwrap().saved, sibling);
+    assert_eq!(
+        f.tree
+            .translate(&f.memory, thread_user_stack(1))
+            .unwrap()
+            .unwrap()
+            .physical,
+        f.registry.physical(f.frames[1][0]).unwrap()
+    );
+    assert_eq!(f.registry.clear_root(space, f.tree.root), Err(Error::InUse));
+    assert_eq!(f.registry.physical(f.frames[0][0]), Err(Error::NotOwned));
+    assert_eq!(
+        f.nodes.node(f.active[0].node).unwrap().state,
+        crate::node::NodeState::Active
+    );
+}
+#[test]
+fn stack_edit_cannot_release_sibling_or_node_shared_data() {
+    let mut f = member_fixture();
+    let d = f.queue.next(&mut f.nodes).unwrap().unwrap();
+    f.queue
+        .finish(&mut f.nodes, d.active, crate::node::ExitReason::Normal(0))
+        .unwrap();
+    let edit = f.nodes.stack_edit(d.active.thread).unwrap();
+    assert_eq!(
+        f.registry.remove_stack_mapping(&edit, thread_user_stack(1)),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        f.registry.releasable_stack_frame(&edit, f.frames[1][0]),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        f.registry.remove_stack_mapping(&edit, 0x402000),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        f.registry.retire_stack_frame(&edit, f.data),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(f.registry.pins(d.active.context.space).unwrap(), 2);
+    assert!(f.tree.translate(&f.memory, 0x402000).unwrap().is_some());
+}
+#[test]
+fn scoped_mapping_mid_failure_rolls_back_without_touching_pinned_sibling() {
+    let mut f = member_fixture();
+    retire_fixture_first(&mut f);
+    let context = f.active[0].context;
+    let fresh = f.nodes.member_thread(f.active[0].node, context).unwrap();
+    let edit = f.nodes.stack_edit(fresh).unwrap();
+    let k0 = f
+        .registry
+        .insert_stack_frame(&edit, 0x100000, StackKind::Kernel)
+        .unwrap();
+    let k1 = f
+        .registry
+        .insert_stack_frame(&edit, 0x101000, StackKind::Kernel)
+        .unwrap();
+    for id in [k0, k1] {
+        f.registry.initialize(id).unwrap();
+    }
+    let base = KSTACK_BASE + PAGE;
+    f.tree
+        .map(&mut f.memory, base + PAGE, 0x800000, Permissions::RW)
+        .unwrap();
+    let tables = f.memory.pages.len();
+    assert_eq!(
+        map_thread_stack_frames(
+            &f.tree,
+            &mut f.memory,
+            &mut f.registry,
+            &edit,
+            base,
+            &[k0, k1],
+            StackKind::Kernel
+        ),
+        Err(Error::AlreadyMapped)
+    );
+    assert!(f.tree.translate(&f.memory, base).unwrap().is_none());
+    assert_eq!(f.memory.pages.len(), tables);
+    assert_eq!(
+        f.registry.mapping_for(context.space, base).err(),
+        Some(Error::NotMapped)
+    );
+    assert_eq!(f.registry.pins(context.space).unwrap(), 1);
+    assert!(
+        f.tree
+            .translate(&f.memory, thread_user_stack(1))
+            .unwrap()
+            .is_some()
+    );
+    f.tree.unmap(&mut f.memory, base + PAGE).unwrap();
+    for id in [k0, k1] {
+        f.registry.retire_stack_frame(&edit, id).unwrap();
+    }
+    assert!(f.registry.finish_stack_edit(&edit).is_ok());
+}
+#[test]
+fn thread_stack_frame_class_and_duplicate_backing_are_checked() {
+    let mut f = member_fixture();
+    retire_fixture_first(&mut f);
+    let fresh = f
+        .nodes
+        .member_thread(f.active[0].node, f.active[0].context)
+        .unwrap();
+    let edit = f.nodes.stack_edit(fresh).unwrap();
+    let k = f
+        .registry
+        .insert_stack_frame(&edit, 0x100000, StackKind::Kernel)
+        .unwrap();
+    f.registry.initialize(k).unwrap();
+    assert_eq!(
+        map_thread_stack_frames(
+            &f.tree,
+            &mut f.memory,
+            &mut f.registry,
+            &edit,
+            thread_user_stack(0),
+            &[k],
+            StackKind::User
+        ),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        map_thread_stack_frames(
+            &f.tree,
+            &mut f.memory,
+            &mut f.registry,
+            &edit,
+            KSTACK_BASE + PAGE,
+            &[k, k],
+            StackKind::Kernel
+        ),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        map_thread_stack_frames(
+            &f.tree,
+            &mut f.memory,
+            &mut f.registry,
+            &edit,
+            thread_user_stack(1),
+            &[f.frames[1][0]],
+            StackKind::User
+        ),
+        Err(Error::Address)
+    );
+    assert!(
+        f.tree
+            .translate(&f.memory, thread_user_stack(0))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.registry.pins(f.active[0].context.space).unwrap(), 1);
+}
+#[test]
+fn recycled_thread_and_frame_generations_cannot_authorize_old_stack_resources() {
+    let mut f = member_fixture();
+    let old = f.active[0].thread;
+    let old_frame = f.frames[0][0];
+    retire_fixture_first(&mut f);
+    let fresh = f
+        .nodes
+        .member_thread(f.active[0].node, f.active[0].context)
+        .unwrap();
+    assert_ne!(old, fresh);
+    assert_eq!(old.index(), fresh.index());
+    assert_eq!(
+        f.nodes.stack_edit(old).err(),
+        Some(crate::node::Error::Identity)
+    );
+    let edit = f.nodes.stack_edit(fresh).unwrap();
+    let frame = f
+        .registry
+        .insert_stack_frame(&edit, 0x100000, StackKind::User)
+        .unwrap();
+    assert_ne!(old_frame, frame);
+    assert_eq!(
+        f.registry.releasable_stack_frame(&edit, old_frame),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        f.registry.releasable_stack_frame(&edit, frame).unwrap(),
+        0x100000
+    );
+    assert!(matches!(
+        f.registry.finish_stack_edit(&edit),
+        Err(Error::InUse)
+    ));
+}
+#[test]
+fn three_thread_stack_arena_has_bounded_distinct_guarded_ranges() {
+    for slot in 0..3 {
+        let base = KSTACK_BASE + slot as u64 * KSTACK_STRIDE + PAGE;
+        assert_eq!(stack_range(base, 2), Ok(()));
+        assert_eq!(stack_range(base - PAGE, 2), Err(Error::Address));
+        assert_eq!(thread_user_stack(slot), 0x404000 + slot as u64 * 0x4000);
+    }
+    assert_eq!(
+        stack_range(KSTACK_BASE + 3 * KSTACK_STRIDE + PAGE, 2),
+        Err(Error::Address)
+    );
+    assert_eq!((DATA_FRAMES, MAPPINGS), (16, 64));
+}

@@ -429,7 +429,9 @@ pub fn configure_thread_stack(
         || stack.top - stack.bottom != 8192
         || !stack.top.is_multiple_of(4096)
         || stack.bottom < neu_kernel::paging::KSTACK_BASE
-        || stack.top > neu_kernel::paging::KSTACK_BASE + 2 * neu_kernel::paging::KSTACK_STRIDE
+        || stack.top
+            > neu_kernel::paging::KSTACK_BASE
+                + neu_kernel::node::MAX_THREADS as u64 * neu_kernel::paging::KSTACK_STRIDE
     {
         return Err(neu_kernel::paging::Error::Flags);
     }

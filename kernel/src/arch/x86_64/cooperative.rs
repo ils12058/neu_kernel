@@ -1,9 +1,10 @@
 //! Trusted cooperative bootstrap controller; every slice finishes its kernel
 //! boundary before FIFO selection, and all execution/switching retains IF=0.
+use super::{native, serial};
+#[cfg(not(feature = "multi-test"))]
 use super::{
-    native,
     paging::{Paging, UserSpace},
-    serial, userspace,
+    userspace,
 };
 use core::arch::global_asm;
 #[cfg(not(feature = "preempt-test"))]
@@ -14,11 +15,16 @@ use neu_kernel::{
     node::{Fault, FaultSource},
     syscall::ReturnContract,
 };
+#[cfg(not(feature = "multi-test"))]
 use neu_kernel::{
     context::{SavedContext, StackBinding},
-    node::{self, ActiveContext, ExitReason, NodeId, Nodes, ThreadContext, ThreadId},
+    node::{self, ActiveContext, ExitReason, NodeId, Nodes, ThreadContext},
+    scheduler::Queue,
+};
+use neu_kernel::{
+    node::ThreadId,
     paging::{self as logic, Error, PAGE, Result},
-    scheduler::{Queue, TEST_YIELD},
+    scheduler::TEST_YIELD,
     syscall::{self as abi, Frame},
 };
 const CANARIES: [u64; 6] = [
@@ -30,7 +36,7 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 const MARKERS: [u64; 3] = [0x11225566778899aa, 0xaabbccddeeff1234, 0x1234567887654321];
-global_asm!(include_str!("cooperative.S"),preemptive=const cfg!(feature="preempt-test") as u8,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
+global_asm!(include_str!("cooperative.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64},query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,yield_op=const TEST_YIELD,private_value=const native::PRIVATE_VALUE,
     stack_bottom=const logic::KSTACK_BASE+PAGE,stack_guard=const logic::KSTACK_BASE,
     canary_bx=const CANARIES[0],canary_bp=const CANARIES[1],canary_12=const CANARIES[2],
@@ -47,10 +53,12 @@ unsafe extern "C" {
     static neu_switch_stack_guard_site: u8;
 }
 #[cfg(not(feature = "preempt-test"))]
+#[cfg(not(feature = "multi-test"))]
 fn site(symbol: *const u8) -> u64 {
     userspace::CODE + symbol as u64 - ptr::addr_of!(neu_switch_payload) as u64
 }
 #[cfg(not(feature = "preempt-test"))]
+#[cfg(not(feature = "multi-test"))]
 fn payload() -> &'static [u8] {
     let length =
         ptr::addr_of!(neu_switch_payload_end) as usize - ptr::addr_of!(neu_switch_payload) as usize;
@@ -59,6 +67,7 @@ fn payload() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(ptr::addr_of!(neu_switch_payload), length) }
 }
 #[cfg(not(feature = "preempt-test"))]
+#[cfg(not(feature = "multi-test"))]
 pub fn return_contract(root: u64) -> ReturnContract {
     ReturnContract {
         root,
@@ -69,6 +78,7 @@ pub fn return_contract(root: u64) -> ReturnContract {
         resumes: [site(ptr::addr_of!(neu_switch_resume)); 2],
     }
 }
+#[cfg(not(feature = "multi-test"))]
 fn execution_payload() -> &'static [u8] {
     #[cfg(feature = "preempt-test")]
     {
@@ -79,6 +89,7 @@ fn execution_payload() -> &'static [u8] {
         payload()
     }
 }
+#[cfg(not(feature = "multi-test"))]
 fn initial_context(active: ActiveContext, stack: StackBinding) -> SavedContext {
     #[cfg(feature = "preempt-test")]
     {
@@ -89,9 +100,11 @@ fn initial_context(active: ActiveContext, stack: StackBinding) -> SavedContext {
         SavedContext::initial(active, stack)
     }
 }
+#[cfg(not(feature = "multi-test"))]
 fn policy<T>(result: node::Result<T>) -> Result<T> {
     result.map_err(|_| Error::Corrupt)
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) struct Domain {
     pub label: u64,
     pub node: NodeId,
@@ -105,9 +118,11 @@ pub(super) struct Domain {
     pub outcome: Option<ExitReason>,
     pub seed: u64,
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn space(domain: &Domain) -> Result<&UserSpace> {
     domain.space.as_ref().ok_or(Error::NotOwned)
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn build(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
@@ -162,6 +177,7 @@ pub(super) fn build(
         seed,
     })
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn install(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
@@ -204,6 +220,7 @@ pub(super) fn frame_log(event: &str, thread: ThreadId, frame: Frame) -> Result<(
     }
     serial::write(format_args!("\n")).map_err(|_| Error::Corrupt)
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn survivor(
     paging: &mut Paging<'_, '_>,
     model: &Nodes,
@@ -232,6 +249,7 @@ pub(super) fn survivor(
     ))
     .map_err(|_| Error::Corrupt)
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn reclaim(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
@@ -256,6 +274,7 @@ pub(super) fn reclaim(
     }
     serial::write(format_args!("[NEU] Switch reclaimed: label={} thread={} space={} saved=false queued=false outcome=retained\n",domain.label,domain.thread.raw(),id.raw())).map_err(|_|Error::Corrupt)
 }
+#[cfg(not(feature = "multi-test"))]
 pub(super) fn stale_audit(
     paging: &mut Paging<'_, '_>,
     model: &mut Nodes,
@@ -291,6 +310,7 @@ pub(super) fn stale_audit(
     .map_err(|_| Error::Corrupt)
 }
 #[cfg(not(feature = "preempt-test"))]
+#[cfg(not(feature = "multi-test"))]
 fn verify_outcome(domain: &Domain, case: u64, reason: ExitReason, words: [u64; 3]) -> Result<()> {
     let faulted = (domain.label == 1 && matches!(case, 1 | 3 | 4 | 5 | 6))
         || (domain.label == 2 && case == 2);
@@ -360,6 +380,7 @@ fn verify_outcome(domain: &Domain, case: u64, reason: ExitReason, words: [u64; 3
     Ok(())
 }
 #[cfg(not(feature = "preempt-test"))]
+#[cfg(not(feature = "multi-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let flags: u64;
     unsafe {

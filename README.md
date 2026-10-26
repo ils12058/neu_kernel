@@ -5,28 +5,30 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K4 / Phase 4C adds single-CPU timer-driven **userspace preemption**. Two CPU-bound
-Ring 3 Threads run without yielding or making syscalls during the demonstrated
-alternations. The LAPIC captures their actual interrupted registers/RIP/stack;
-an acknowledged, uniquely owned handoff reaches the common kernel stack before
-FIFO selection. Each Thread retains a private guarded 8 KiB entry stack and a
-pinned, independently owned Node address space.
+K4 / Phase 4D adds multiple independently preemptible Threads in one Node.
+Node A's A1/A2 share a SpaceId, CR3, RX code and writable data frame; B1 runs in
+an isolated Node B. All three retain distinct guarded user/entry stacks and
+complete saved integer contexts. Real LAPIC interrupts drive the ThreadId FIFO.
+A normal exit releases only that Thread's stacks; the last live Thread ends its
+Node. A supported unrecoverable Node fault cancels its live siblings.
 
-The suite now contains **72 host tests and 71 QEMU scenarios**, including all
-previous 64/56 regressions. New cases cover x2APIC and UC-mapped xAPIC, exact
-context restoration, independent computation, syscall compatibility, faults in
-both directions, isolation, invalid publications, handoff misuse, stale IDs and
-controlled negative IRQ delivery. See [implementation status](docs/IMPLEMENTATION_STATUS.md)
-for actual verification results, CPU observations and limits.
+The suite contains **87 host tests and 83 QEMU scenarios**, retaining all previous
+72/71 regressions. Twelve new scenarios cover shared atomic computation,
+x2APIC/xAPIC, early exit, faults in either A member or B, isolation, guards,
+construction rollback, stale identities and selected-Thread return validation.
+See [implementation status](docs/IMPLEMENTATION_STATUS.md) for actual verification,
+CPU observations, resource accounting and limits.
 
-The provisional calibrated clockevent is 10 ms; QEMU evidence establishes
-progress and context preservation, not exact timing or hard real time. Selected
-userspace runs with IF=1; native entry, scheduler/resource updates and switching
-retain IF=0. General kernel preemption, SMP, multiple Threads per Node and public
-capability/factory interfaces remain unimplemented. ABI 0.1 query/exit and the
-original cooperative test-only yield remain unchanged.
+The provisional calibrated clockevent remains 10 ms. QEMU observations establish
+progress and preserved contexts, not exact timing or per-Node fairness. FIFO
+schedules Threads; two runnable members can give a Node more aggregate CPU time.
+Selected userspace runs with IF=1; native entry and scheduler/resource transactions
+retain IF=0. The fixed profile supports two Nodes, three Threads, at most two live
+members per Node, and integer-only execution. Same-Node user stacks share a
+protection domain. General kernel preemption, SMP, TLS/SIMD, public creation,
+capabilities/factories and IPC remain deferred. Experimental ABI 0.1 is unchanged.
 
-[ADR 0013](docs/adr/0013-single-cpu-user-preemption.md) records the scoped decision.
+[ADR 0014](docs/adr/0014-multiple-threads-in-one-node.md) records the scoped decision.
 Architecture v0.2 and previous ADR rationale remain historical baselines. The
 validated environment remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF,
 Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon.
@@ -52,7 +54,11 @@ disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
 QEMU. `make test` runs host memory/paging/lifecycle/ABI/timer tests, observes each
 guest's expected result, active CR3 and halt through QMP, then shuts QEMU down
-itself. Run `python3 tools/neu.py test --case preempt` for hardware scheduling,
+itself. Run `python3 tools/neu.py test --case threads` for shared-Node scheduling,
+`--case threads-xapic` for its controller fallback, `--case threads-a2-fault`
+for Node-wide sibling cancellation, `--case threads-rollback` for partial member
+construction, or `--case threads-stale` for generation reuse.
+Run `python3 tools/neu.py test --case preempt` for the retained two-Thread profile,
 `--case preempt-xapic` for its controller fallback, `--case preempt-native` for
 IF-enabled native entry, or `--case preempt-a-fault` for fault containment.
 Run `python3 tools/neu.py test --case switch` for cooperative switching,

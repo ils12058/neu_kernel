@@ -8,6 +8,8 @@ pub mod cooperative;
 pub mod exceptions;
 #[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub mod interrupts;
+#[cfg(feature = "multi-test")]
+pub mod multithread;
 #[cfg(feature = "native-test")]
 pub mod native;
 #[cfg(all(feature = "node-test", not(feature = "switch-test")))]

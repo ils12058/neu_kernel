@@ -143,3 +143,17 @@ a single-use acknowledged handoff and IF=1 user execution. Earlier cooperative
 and kernel-timer profiles remain supported. General kernel preemption, SMP,
 multithreaded Nodes, public scheduling/object interfaces and the complete
 scheduling proposal remain outside its accepted scope.
+
+
+## Phase 4D record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0014: Multiple Threads in one Node](0014-multiple-threads-in-one-node.md) | Accepted, internal two-Node / three-Thread profile | NEU-005/006/008/011; NEU-017/018; NEU-020 per-Thread FIFO; NEU-021/023/024 scoped safety, containment and tests |
+
+ADR 0014 extends the earlier one-initial-Thread bootstrap policy with shared
+Node roots, independent Thread stack lifetimes, early Thread exit and Node-wide
+fault cancellation. It revises the scoped pinned-stack mutation rule with an
+exclusive inactive-Thread edit proof and a checked cleanup receipt. Public
+creation, capability authority, SMP and full scheduling proposals remain open.
+Earlier ADR rationale is preserved through dated extensions.

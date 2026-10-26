@@ -104,3 +104,16 @@ general kernel preemption require separate decisions.
 
 References: [Intel system programming](https://cdrdv2-public.intel.com/819714/253668-sdm-vol-3a.pdf),
 [freestanding Rust target](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html).
+
+
+### 2026-10-26 — Phase 4D extension
+
+[ADR 0014](0014-multiple-threads-in-one-node.md) extends the trusted bootstrap to
+three Threads across two Nodes, with two members sharing one Node root. It
+replaces the one-initial-Thread restriction for that profile, separates persistent
+Node Active state from CPU Thread selection, and scopes pinned stack edits to an
+inactive uninstalled/terminal Thread's full identity. Normal exit retains healthy
+siblings; an unrecoverable Node fault cancels its live members before shared
+teardown. Per-Thread FIFO and the user-only timer/common-stack boundary remain.
+Earlier rationale and execution profiles are retained; public authority, general
+kernel preemption, SMP and extended CPU state are still deferred.

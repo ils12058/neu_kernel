@@ -628,7 +628,7 @@ pub fn execute_node(
         || binding.context.space != space.id()
         || binding.context.root != space.root
         || binding.context.entry != userspace::CODE
-        || binding.context.rsp != userspace::USER_RSP
+        || (!cfg!(feature = "multi-test") && binding.context.rsp != userspace::USER_RSP)
     {
         return Err(Error::NotOwned);
     }
@@ -693,7 +693,7 @@ pub fn execute_slice(
         || binding.context.space != space.id()
         || binding.context.root != space.root
         || binding.context.entry != userspace::CODE
-        || binding.context.rsp != userspace::USER_RSP
+        || (!cfg!(feature = "multi-test") && binding.context.rsp != userspace::USER_RSP)
         || !saved.valid(binding, saved.stack)
         || (!saved.fresh
             && !saved.interrupted
@@ -718,6 +718,8 @@ pub fn execute_slice(
         return Err(Error::Flags);
     }
     paging.verify_thread_stack(space, saved.stack)?;
+    #[cfg(feature = "multi-test")]
+    paging.verify_member(space, binding, saved.stack)?;
     // SAFETY: No user/entry runs, IF=0. Root and stack binding were verified above.
     unsafe {
         if ptr::read_volatile(ptr::addr_of!(neu_native_busy)) != 0 {
@@ -769,7 +771,7 @@ pub fn execute_slice(
     {
         return Err(Error::Corrupt);
     }
-    paging.stack_high_water(space)?;
+    paging.thread_stack_high_water(space, binding.thread)?;
     save(Session::default());
     serial::write(format_args!("[NEU] Switch common restored: thread={} root={:#x} MSRs=restored guard=clear entry=clear stack_margin=512\n",binding.thread.raw(),paging.root())).map_err(|_|Error::Corrupt)?;
     ended.event.ok_or(Error::Corrupt)

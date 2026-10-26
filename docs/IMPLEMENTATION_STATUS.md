@@ -1,6 +1,308 @@
 # Neu Kernel implementation status
 
-**Verified:** 2026-10-26. **Milestone:** K4 / Phase 4C, single-CPU timer-driven
+**Verified:** 2026-10-26. **Milestone:** K4 / Phase 4D, multiple preemptible
+Threads in one Node, trusted bootstrap on one CPU. **Result: 87 host tests and
+83 QEMU scenarios pass**, including all previous 72/71 regressions. The implementation and
+verification below apply to the bounded QEMU profile, not hosted CI or physical
+hardware. The starting tree was clean on `main` at
+[`51b9e30`](https://github.com/ils12058/neu_kernel/commit/51b9e30c41aeefa5a38fc6cb03131293c5516f1b).
+All **72 host / 71 QEMU** baseline tests were rerun before implementation
+(`build/phase4d-baseline.log`). Architecture v0.2 remains byte-for-byte unchanged:
+SHA-256 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`.
+No dependencies, boot protocol, linker, Rust pin, loader or firmware changed.
+
+## Phase 4D files and ownership model
+
+Created `kernel/src/arch/x86_64/multithread.rs` and `multithread.S` for trusted
+member construction, real shared-data computation, independent outcomes,
+rollback/reuse and timer-driven execution. [ADR 0014](adr/0014-multiple-threads-in-one-node.md)
+records why one Node root and separate Thread lifetimes were chosen.
+
+Modified:
+
+- `kernel/src/node.rs` and `scheduler.rs`: three generation-checked Thread slots,
+  bounded member admission, persistent Node Active state, independent Thread
+  reclamation, fault cancellation and FIFO purge. Nine new host tests exercise
+  multiple-member lifecycle, capacity, identity, outcomes and edit boundaries.
+- `kernel/src/paging/mod.rs` and `paging/tests.rs`: tagged Thread stack backing,
+  scoped edits to otherwise pinned spaces and a checked release receipt; six new
+  host tests cover ownership, permissions, duplicate/stale release, rollback,
+  active/pinned references and shared-table lifetime.
+- `kernel/src/arch/x86_64/paging.rs`: dynamic primary user stack location, a second
+  member stack, three entry-stack slots, Node-owned dynamic table masks, guarded
+  construction/rollback and exact per-Thread teardown.
+- `kernel/src/arch/x86_64/native.rs` and `preemptive.rs`: selected Thread user-stack
+  validation, existing single-use IRQ handoff, per-Thread high-water checks and
+  common-stack handling of a pending one-shot before another dispatch.
+- `kernel/src/arch/x86_64/cooperative.rs`, `cooperative.S`, `interrupts.rs`,
+  `interrupts.S`, `exceptions.rs`, `nodes.rs`, `mod.rs`, `kernel/src/main.rs` and
+  `kernel/Cargo.toml`: shared bridge/controller helpers, arena bounds and twelve
+  isolated new test configurations. Earlier fixture behavior remains supported.
+- `tools/neu.py`: actual three-member CPU/IRQ/PTE/TSS/stack observations, independent
+  FIFO and atomic-progress reconciliation, fault and exact cleanup checks.
+- `README.md`, this status, ADR index and dated extensions to ADRs 0010–0013.
+
+A Node owns its SpaceId/root, image, data and page-table hierarchy. A Thread owns
+its user stack, guarded supervisor entry stack, complete saved integer context
+and exactly one Node association. Node Ready means configured but not yet run;
+once run, Active persists while any live member remains. The model's separate
+CPU binding identifies the sole Running Thread. A suspended or queued Node does
+not return to Ready. The two earlier host assertions that expected Ready after
+suspension now assert Active; their admission/context checks remain.
+
+A normal `thread_exit` records only its caller's `Normal(status)`. A1 exits with
+status 1, A2 with 2 and B1 with 3. A1's early exit leaves A2's saved frame, root pin,
+code/data and stacks intact. A2 subsequently checks a shared completion flag. The
+last live member's normal exit sets the Node outcome. A supported unrecoverable
+fault records the offending Thread's actual exception metadata and the Node
+fault, sets its live siblings to `Cancelled { by: ThreadId }`, clears their saved
+records and removes them from the FIFO. Previously terminal outcomes remain.
+Resources and outcome retention have separate lifetimes; metadata reuse advances
+the generation and refuses stale identities. None of this exposes public creation
+or treats same-Node Threads as separate authority domains.
+
+## Phase 4D shared root, stacks and capacity
+
+A1 and A2 have the same NodeId, SpaceId, root and RX/constant/RW data backing.
+B1's identical numeric code/data VAs resolve to private backing in another root.
+Node A additionally maps `0x410000` to its own data frame; that alias is absent in
+B. B owns a private read-only sentinel at `0x406000`, absent in A. This supports
+fault probes in both directions without cross-Node shared memory.
+
+| Member / slot | Node | User stack page | Initial RSP | Supervisor stack, exclusive end |
+| --- | --- | --- | --- | --- |
+| A1 / 0 | A | `0x404000` | `0x404ff8` | `0xffffc00000001000..0xffffc00000003000` |
+| B1 / 1 | B | `0x408000` | `0x408ff8` | `0xffffc00000005000..0xffffc00000007000` |
+| A2 / 2 | A | `0x40c000` | `0x40cff8` | `0xffffc00000009000..0xffffc0000000b000` |
+
+Each stack has absent 4 KiB low/high guards. User pages are RW/NX with U/S;
+8 KiB entry stacks are supervisor RW/NX. User loop RSP is initial RSP minus 64;
+the syscall wrapper adds its eight-byte CALL offset. Initial ABI alignment is
+preserved. Each Thread checks three independent stack markers and full-width
+integer canaries. Same-Node siblings can access each other's user pages: these
+are distinct allocated stack ranges in one protection domain. Both A entry stacks
+are supervisor-mapped in Root A; B's stack is mapped only in Root B. The common
+kernel root maps none of these private stacks.
+
+| Bound | Phase 4D value / reason |
+| --- | --- |
+| Nodes / live spaces | 2 / 2, unchanged |
+| Threads / live members per Node | 3 / 2; the only metadata/arena expansion |
+| Data-frame owners | 16, unchanged: A image/constants/data + two user stacks = 5; B image/constants/data + user stack + sentinel = 5; six entry-stack pages = 6 |
+| Controlled mappings | 64, unchanged; Node A data alias adds a reference, not a frame owner |
+| Table frames | 64, unchanged; observed live totals are 33 with x2APIC and 42 with private xAPIC UC views |
+| Root pins | At most 2 per root, unchanged; A has 2 and B 1 before execution |
+
+The x2APIC profile peaks at 49 allocated frames (33 tables + 16 data); xAPIC
+peaks at 58 (42 + 16). The normal common baseline is seven allocated table frames.
+No heap, broad pool expansion, public ResourcePool or MemoryObject is added.
+Data-owner exhaustion is intentional at the three-member peak. Slot reuse is
+performed after A1's stack release, while A2 remains pinned.
+
+Each installed resumable Thread retains a pin while queued, running, saved or
+in the IRQ handoff. Ordinary pinned-root mapping/frame/root mutations still fail.
+A non-copyable `StackEdit` holds an exclusive model borrow and can be minted only
+for an inactive uninstalled or terminal Thread, without queued/saved references.
+The paging backend additionally requires common CR3 and IF=0. It checks the full
+Thread generation, SpaceId/root, stack class and fixed slot range. It cannot use
+this exception to edit shared image/data or another member's backing. Healthy
+sibling pins remain held throughout construction, rollback and early cleanup.
+
+After terminal IRQ/native/handoff completion, remove only the terminating Thread's
+two entry-stack pages and user-stack page, release its own pin and free empty
+page-table branches. Tables belong to the Node hierarchy, including shared stack
+branches; they do not disappear with the first creator. A persistent dynamic
+stack-table mask keeps these frames out of user workspace aliases after early
+teardown. A `StackRelease` receipt is issued only when that generation has no
+scoped mappings or tagged backing; consuming it permits metadata reclamation.
+The final live member's cleanup then releases shared backing/root and Node state.
+Active roots, retained continuations, pin under/overflow, duplicate release and
+stale-generation stack edits remain rejected. Flush/invalidation precedes reuse.
+
+## Phase 4D timer execution and atomic computation
+
+The unchanged FIFO admits **A1, B1, A2** before any execution. Labels identify
+fixture parameters, not kernel identities or a Node scheduling rule. Each hardware
+capture preserves all fifteen GPRs and RIP/RSP/RFLAGS/CS/SS by value. The IRQ
+acknowledges vector 48, clears its ISR bit, publishes one exact-owner handoff and
+abandons its private-stack call chain. Common stack/root restoration and handoff
+consumption precede any model/allocator/FIFO mutation. No suspended Rust stack
+frame survives a switch. TSS.RSP0/native stack publication follows the selected
+Thread even when the next Thread uses the same CR3. Return validation uses that
+Thread's user range; an A2 context using A1's valid user page is rejected before
+native setup or root activation.
+
+The clockevent remains the calibrated provisional 10 ms LAPIC one-shot, armed at
+the final user-entry boundary. Userspace requires IF=1; native entry through FMASK
+and every scheduler/resource transaction retain IF=0. A lone runnable member
+receives real IRQs and resumes directly without FIFO switching. Empty FIFO is a
+controlled completion/halt, not an implemented idle/wait policy.
+
+A first integration run exposed an expired timer pending after terminal SYSCALL
+processing. Masking/stopping a source does not erase IRR. Phase 4D now settles a
+pending event on the common stack through the existing bounded kernel-only IRQ
+window before another user arm. That path acknowledges at most one stopped-source
+event and never schedules the interrupted kernel frame. ISR/IRR, tick/EOI counts,
+root and IF are checked. Final shutdown still masks/stops, drains if necessary,
+disables APIC software delivery and clears native/IRQ mailbox state.
+
+A1/A2 execute aligned `LOCK XADD` against one Node A data frame. Per-member stored
+progress and six callee-preserved canaries are independent; additional volatile
+GPR and stack witnesses are checked in real CPU/IRQ samples. B computes against
+its private frame. There are no yield/syscall instructions in the measured work
+loop. Query/exit occur only at the terminal boundary; ABI 0.1 remains query=1,
+exit=2 and feature information `0x100000003`.
+
+An IRQ can arrive after the atomic increment but before the separate per-Thread
+progress store. The fixture therefore reconciles the saved RIP/RAX: at
+`neu_multi_after_atomic`, successful count is stored+1; at `neu_multi_after_inc`,
+RAX is stored+1; otherwise the stored count is authoritative. Cancellation and
+rejected returns retain these pending completions before clearing saved state.
+QMP independently recomputes the shared sum from actual memory and active/saved
+frames, including a canceled sibling's last observed IRQ memory. It does not
+pretend that the atomic increment plus following instructions form one atomic
+transaction. This proves this bounded shared-memory fixture, not a general
+synchronization library or cross-Node sharing mechanism.
+
+FIFO fairness is per Thread. A Node with two eligible Threads can receive more
+aggregate execution than a Node with one. No per-Node budget, priority, clocksource,
+accurate CPU accounting or hard-real-time guarantee is claimed.
+
+## Phase 4D QMP evidence and focused cases
+
+The initial focused pass completed all twelve new scenarios. The observer stops
+actual QEMU execution at selected restore, CPL=3 work-loop and hardware IRQ probes.
+It reads CR3, all GPRs, selectors/flags, physical page-table walks, TSS.RSP0,
+selected entry-stack storage, stack markers, Node data and LAPIC ISR before EOI.
+The final oracle independently replays the Thread FIFO, matches consumed and
+restored frames to the prior hardware frame, checks shared atomic totals, verifies
+retired stack leaves disappear while sibling mappings remain, and checks terminal
+pin/resource/controller accounting. An expected serial banner alone cannot pass.
+
+A representative `threads` focused run recorded these **actual resumed CPL=3**
+samples; all three had RIP `0x4000e1`, the loop's conditional branch, and matching
+hardware IRQ/resume frames. Initial RIP was `0x400000`; contexts were not restarted.
+
+| Dispatch | Member | CR3 | User RSP | Actual TSS.RSP0 | Data VA `0x402000` physical frame | Own stored progress | Node shared count |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | A1 | `0xc000` | `0x404fb8` | `0xffffc00000003000` | `0xa000` | 2153161 | 4334557 |
+| 5 | B1 | `0x1b000` | `0x408fb8` | `0xffffc00000007000` | `0x18000` | 2143492 | 2143492 |
+| 6 | A2 | `0xc000` | `0x40cfb8` | `0xffffc0000000b000` | `0xa000` | 2202409 | 6562728 |
+
+The same run made 18 selections and 15 copied preemptive handoffs (A1=4, A2=5,
+B1=6), with 18 user timer IRQs/18 EOIs, including three no-peer direct returns.
+A1 normally ended first with 8916497 increments; A2 ended later with 11877148.
+Their shared total was **20793645**. B1's independent total was **21224118**.
+All three returned statuses 1/2/3 respectively. Final accounting was exactly the
+per-run baseline: allocated=7, free=118272, tables=7. Root addresses, work totals,
+IRQs and elapsed durations are observations, not stable ABI constants or timing
+promises. Free counts can differ across feature images; each case checks its own
+baseline rather than another image's number.
+
+| Added case | Checked outcome / boundary |
+| --- | --- |
+| `threads` | Three live identities before execution; shared A root/data, B isolation, real IRQ alternation, early A1 exit, later A2/B1 normal completion |
+| `threads-xapic` | Same profile with x2APIC hidden; supervisor UC LAPIC PTEs in each root and real MMIO-controller IRQs |
+| `threads-a1-fault` | Actual A1 #UD; saved A2 canceled, B1 completes |
+| `threads-a2-fault` | Actual A2 #UD; saved A1 canceled, B1 completes |
+| `threads-b-fault` | B1 #UD while both A members live; A1/A2 continue normally |
+| `threads-cross` | B1 reads A-only `0x410000`: #PF error 4; both A members survive |
+| `threads-a-cross` | A1 reads B-only `0x406000`: #PF error 4; A2 canceled, B1 survives |
+| `threads-rollback` | Four A2 resource failpoints and invalid context; exact frames/tables/pins restored while A1/B1 stay queued with unchanged contexts |
+| `threads-stale` | Early A1 retirement, real same-slot generation reuse/stack construction while A2 remains pinned; old admission rejected; replacement rollback exact |
+| `threads-stack` | A1 user access to A2's supervisor stack: #PF error 5; A Node canceled, B1 survives |
+| `threads-user-guard` | A2 reads its absent low guard `0x40b000`: #PF error 4; A1 canceled, B1 survives |
+| `threads-return-stack` | A2 saved RSP changed to A1's valid user page; rejected before native/root activation, A1 canceled, B1 survives |
+
+The return-stack case is an explicit trusted corruption injection, not a hardware
+exception. Slot-reuse replacements are constructed internally and never executed;
+stale identities cannot authorize the replacement. The fault cases preserve
+copied per-Thread and Node outcomes while invalidating resumable references.
+All new cases also exercise the final lone Thread's hardware IRQ return and
+empty-queue completion.
+
+The first B-fault integration attempt completed without a no-peer timer event:
+the remaining finite workload could finish within one quantum. The fixture now
+extends the final runnable member's limit before dispatch so each new case must
+observe a real no-peer interrupt. This changes test work, not FIFO policy or the
+10 ms clockevent. Early harness syntax/serialization issues were corrected before
+the focused acceptance pass; failed attempts are retained in local development
+logs. Timeout, reset, triple fault, early QEMU exit, fake IRQ and cooperative-yield
+paths remain rejected as successful preemption evidence.
+
+## Phase 4D full validation results
+
+The final `make test` pass completed **87 host tests and 83 QEMU scenarios** at
+the unchanged 30-second per-guest deadline. All original 72 host test names and
+71 scenario feature bindings remain present; the earlier QMP observation/check
+functions are unchanged. The complete original baseline was also rerun before
+production edits. No acceptance criterion remains open within this profile.
+
+| Check | Actual result |
+| --- | --- |
+| `make doctor` | Pass; Rust/Cargo 1.95.0, Python 3.14.7, QEMU 11.0.0 and the existing firmware hashes |
+| `make check` | Pass; formatting and Clippy with warnings denied for all 83 kernel configurations and the host library |
+| Python harness | `python3 -m py_compile tools/neu.py` passes |
+| `make build` | Pass; ordinary EFI artifact, ELF64/x86-64, four LOAD segments |
+| Host tests | **87 pass**: 72 retained + nine member/model tests + six scoped-stack paging tests |
+| QEMU full suite | **83 pass**: 71 retained + all twelve new focused scenarios; clean QMP exit and validated kernel halt in every case |
+| Initial focused pass | All twelve added cases pass with actual restore/user/IRQ observations |
+| Clean-directory compilation | Four independent empty target directories: `boot`, `threads`, `threads-xapic`, `threads-rollback`; all pass ELF validation |
+| Repeated scheduling | **9 pass**: three rounds each of `threads`, `threads-xapic` and `threads-a2-fault`, without rebuilding or changing the 30-second deadline |
+| Clean-image QMP boots | **4 pass**: independently built `boot`, `threads`, `threads-xapic` and `threads-rollback` images |
+
+In the full run, normal x2APIC/xAPIC guests made 18 selections each and 15 copied
+handoffs (A1=4/A2=5/B1=6). Their total timer ticks/EOIs were 18/18 and 18/18;
+the xAPIC run included one separately counted kernel drain. The new basic run
+observed 33 table + 16 data frames = **49** allocated; xAPIC observed 42 + 16 =
+**58**. Both restored allocated=7/free=118270/tables=7. Rollback/stale feature images
+restored their own different free-count baselines exactly. All twelve cases
+finished without active/saved/queued members, private stacks, native entry state,
+IRQ mailbox ownership or live Node roots. LAPIC ISR/IRR were empty, timer counts
+zero, vector masked and software delivery disabled before the controlled IF=0
+halt. The longest full-suite guest was `threads-xapic`, **26.571 s**.
+
+The three repeat durations were 17.561/18.522/18.541 s for `threads`,
+26.639/24.959/24.989 s for `threads-xapic` and 16.675/15.852/16.668 s for
+`threads-a2-fault`. Tick/drain counts varied while exact acknowledgments, context
+ownership, shared sums and per-image cleanup remained valid. Every clean-built
+image also passed the same CPU/controller/accounting oracle. No repeats required
+a relaxed timeout or a source change.
+
+Commands and local evidence:
+
+```sh
+make doctor
+make check
+make build
+make test
+python3 tools/neu.py test --case threads
+python3 tools/neu.py test --case threads-xapic
+python3 tools/neu.py test --case threads-a2-fault
+python3 tools/neu.py test --case threads-rollback
+python3 tools/neu.py test --case threads-stale
+```
+
+`build/phase4d-doctor.log`, `phase4d-check.log`, `phase4d-build.log` and
+`phase4d-test.log` retain command output. `build/test-results.json` contains the
+full 83-case report; `build/test-logs/<case>.json` contains the actual CPU/register,
+PTE, stack, data and controller observations. `build/phase4d-focused.json` retains
+the earlier twelve-case pass. Clean-build output is in `build/phase4d-cold.log`
+and `build/phase4d-cold/builds.json`. Repeat results and isolated per-round
+observations are under `build/phase4d-repeat/`; clean-image QMP results are in
+`build/phase4d-cold/qmp-results.json`. The local driver scripts
+`build/phase4d-repeat.py`, `phase4d-cold.py` and `phase4d-cold-qmp.py` record the
+exact supplemental procedures. These are ignored local build artifacts;
+rerunning the commands produces current observations, not immutable CI evidence.
+
+## Retained Phase 4C and earlier references
+
+The following sections retain earlier fixture details and measurements. Where
+those profiles use one Thread per Node, fixed `0x404000` stacks or two-Thread
+capacities, they describe that earlier execution profile; the current shared-Node
+layout and lifecycle are specified above.
+
+**Phase 4C historical verification:** 2026-10-26. **Milestone:** K4 / Phase 4C, single-CPU timer-driven
 userspace preemption. **Result:** all supplied acceptance criteria pass within
 the documented QEMU profile: **72 host tests and 71 QEMU scenarios**, preserving
 all previous 64/56 regressions.
@@ -432,7 +734,7 @@ preserved-register convention. It carries no Thread/Node/stack selector argument
 unchanged. The core dispatcher still returns NOT_SUPPORTED for this private
 number; a public yield number/feature requires another compatibility decision.
 
-## Private entry stacks, pins and switching order
+## Retained Phase 4B entry stacks, pins and switching order
 
 Each Thread owns two allocated backing pages (8 KiB) through its Node's existing
 SpaceId, mapped supervisor RW/NX only in that Node's root. The fixed arena is:
@@ -679,7 +981,7 @@ records the earlier prerequisites now extended by
 
 ## Internal Node and Thread model
 
-`node::Nodes` has separate two-slot Node and Thread arrays. `NodeId` and
+`node::Nodes` has separate two-slot Node and three-slot Thread arrays. `NodeId` and
 `ThreadId` are distinct Rust types with independent slot/generation validation;
 their diagnostic integer encodings may coincide across types. A Node records its
 state, address-space identity and optional outcome. A Thread records its own
@@ -693,19 +995,20 @@ governance remains incomplete.
 
 | Object | Lifecycle and terminal rule |
 | --- | --- |
-| Node | Created → Configuring → Ready ↔ Active → Exited → Reclaimed. Construction failure can exit Created/Configuring. |
-| Thread | Configuring → Ready → Runnable ↔ Running → Exited → Reclaimed; earlier run-once fixtures go directly from Ready to Running. One initial Thread per Node is current bootstrap policy. |
+| Node | Created → Configuring → Ready → Active → Exited → Reclaimed; Active persists across member suspension. Construction failure can exit Created/Configuring. |
+| Thread | Configuring → Ready → Runnable ↔ Running → Exited → Reclaimed; earlier run-once fixtures go directly from Ready to Running. Phase 4D admits two live members per Node within three total Thread slots; earlier fixtures retain one initial Thread. |
 | Normal exit | Ends the bound Thread. Node exits only after its final live associated Thread ends; a model test checks that rule independently of bootstrap policy. |
 | User fault | Ends only that Node's associations, copies actual fault metadata, returns to the trusted controller without resuming the Thread. |
 | Construction failure | Separate `ConstructionFailure` outcome; owned paging resources roll back before model reclamation. |
 | Reclamation | Requires Exited, no active/live/queued/saved context, released kernel stack and released address-space association. Outcomes remain until metadata-slot reuse. |
 
-`ExitReason` separates `Normal(u8)`, `UserFault(Fault)` and
-`ConstructionFailure`. `Fault` distinguishes actual CPU exceptions from rejected
+`ExitReason` separates `Normal(u8)`, `UserFault(Fault)`,
+`Cancelled { by: ThreadId }` and `ConstructionFailure`. `Fault` distinguishes actual CPU exceptions from rejected
 return state and copies vector, error, RIP, RSP, CS, SS, RFLAGS and CR2. No
 user-memory diagnostic structure is dereferenced. Generation exhaustion refuses
 reuse rather than wrapping. FIFO policy is implemented separately; this remains
-a small internal model without a public object API or multithreaded Nodes.
+a small internal model without a public object API. The Phase 4D member and
+stack-edit transactions are detailed above.
 
 ## Experimental Neu syscall contract
 
@@ -812,7 +1115,7 @@ The native configuration leaves the Phase 2A completion gate DPL=0. Original
 `test-user*` images still enable their DPL=3 `int 0x80` gate and keep SCE disabled.
 Ordinary builds launch no user fixture and install no native syscall service.
 
-## Address-space ownership and cleanup
+## Address-space ownership and retained earlier layouts
 
 `SpaceId` is a generation-checked identity for one of two live user scopes.
 Mappings are indexed by `(SpaceId, VA)`, not a global VA. Each user frame has
@@ -1114,13 +1417,14 @@ attempted for them.
 Kernel and user TLS/GS state, FPU/SIMD context, SMP/per-CPU entry, interrupts outside the explicit timer/user windows,
 general kernel preemption, adversarial entry fuzzing, hardware faults and physical machines
 remain unsupported or unverified. Fatal paths use no kernel GS-relative/TLS
-state; a future per-CPU design must revisit this assumption. There is no CPU-time
-isolation: another infinite user loop could occupy the CPU until host timeout.
+state; a future per-CPU design must revisit this assumption. There are no CPU budgets
+or per-Node CPU-time isolation. An infinite user loop remains eligible indefinitely;
+other runnable Threads can still progress, and the test deadline bounds completion.
 Speculative/microarchitectural side channels and arbitrary privileged corruption
 are outside the demonstrated boundary.
 
 The two-Node implementation remains trusted bootstrap machinery. Node-local
-capabilities, public factories/ResourcePools, multiple runnable Threads per Node,
+capabilities, public Node/Thread creation or factories/ResourcePools,
 general kernel preemption, Channels/IPC, shared MemoryObjects, pointer-copy APIs, full ELF
 loading, a userspace runtime, filesystem/network/drivers and POSIX/Linux
 compatibility remain unimplemented. Construction/teardown assumes one trusted
@@ -1129,18 +1433,21 @@ must revisit synchronization, references, cancellation and lifetime publication.
 
 ## Architecture relationship and recommended next milestone
 
-[ADR 0013](adr/0013-single-cpu-user-preemption.md) accepts the bounded single-CPU
-user-preemption subset. Previous ADR rationale and all earlier execution profiles
-remain intact. Architecture v0.2 and its decision-register statuses are unchanged;
-this does not ratify every scheduling/object proposal. Public ABI 0.1 is unchanged.
+[ADR 0014](adr/0014-multiple-threads-in-one-node.md) accepts this bounded extension
+to [ADR 0013](adr/0013-single-cpu-user-preemption.md). Earlier ADR rationale and
+execution profiles are preserved. Architecture v0.2 and all decision-register
+statuses remain unchanged. This accepts neither every scheduling proposal nor
+public capability/object authority. ABI 0.1 remains unchanged.
 
-Recommended next milestone: **K4 / Phase 4D, internal multiple Threads per Node**.
-Define shared-root/reference lifetimes, multiple private entry stacks under one
-root, last-live-Thread Node termination and fault/exit policy with interleaved
-preemptive tests before exposing public creation. Retain non-preemptible kernel
-transactions until synchronization is defined. SMP/per-CPU state, wait queues,
-capabilities/factories, extended-state support and general kernel preemption
-remain separately scoped work. No future ADR placeholder is generated here.
+The recommended path into **K5** is a separately scoped capability and object
+lifecycle foundation: implement Node-local handle tables, typed rights, close and
+kernel-validated authorization, with invalid/wrong-type/stale/unauthorized negative
+tests. Define NodeFactory/ResourcePool ownership before exposing creation operations. Carry
+these root pins, generation checks, cancellation and rollback rules into that
+authority model. Record significant new or revised decisions in an ADR. Keep
+kernel transactions non-preemptible until synchronization is defined. Wait queues,
+priorities/budgets, SMP/per-CPU state, TLS/extended state, IPC and ELF/runtime support
+remain distinct work; no future ADR placeholders are generated.
 
 ## Primary references
 

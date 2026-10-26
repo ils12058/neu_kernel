@@ -174,3 +174,16 @@ common-stack boundary. Native kernel execution and resource/scheduler mutation
 remain IF=0. Earlier fixtures retain their original behavior; the accepted ABI,
 protection-domain and ownership directions remain unchanged. This extension does
 not add general kernel preemption, SMP or public object/scheduler interfaces.
+
+
+### 2026-10-26 — Phase 4D extension
+
+[ADR 0014](0014-multiple-threads-in-one-node.md) extends the trusted bootstrap to
+three Threads across two Nodes, with two members sharing one Node root. It
+replaces the one-initial-Thread restriction for that profile, separates persistent
+Node Active state from CPU Thread selection, and scopes pinned stack edits to an
+inactive uninstalled/terminal Thread's full identity. Normal exit retains healthy
+siblings; an unrecoverable Node fault cancels its live members before shared
+teardown. Per-Thread FIFO and the user-only timer/common-stack boundary remain.
+Earlier rationale and execution profiles are retained; public authority, general
+kernel preemption, SMP and extended CPU state are still deferred.

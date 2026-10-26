@@ -104,11 +104,22 @@ pub const KSTACK_PAGES: usize = 2;
 pub fn stack_range(base: u64, pages: usize) -> Result<()> {
     page_address(base)?;
     if pages != KSTACK_PAGES
-        || ![KSTACK_BASE + PAGE, KSTACK_BASE + KSTACK_STRIDE + PAGE].contains(&base)
+        || !(0..crate::node::MAX_THREADS)
+            .any(|slot| base == KSTACK_BASE + slot as u64 * KSTACK_STRIDE + PAGE)
     {
         return Err(Error::Address);
     }
     Ok(())
+}
+pub const USER_STACK_BASE: u64 = 0x404000;
+pub const USER_STACK_STRIDE: u64 = 4 * PAGE;
+pub fn thread_user_stack(slot: usize) -> u64 {
+    USER_STACK_BASE + slot as u64 * USER_STACK_STRIDE
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackKind {
+    User,
+    Kernel,
 }
 pub fn table_entry(address: u64, bits: u8) -> Result<u64> {
     physical(address, bits)?;
@@ -411,6 +422,7 @@ struct Frame {
     live: bool,
     initialized: bool,
     owner: SpaceId,
+    stack_owner: Option<(crate::node::ThreadId, StackKind)>,
 }
 #[derive(Clone, Copy)]
 pub struct Mapping {
@@ -419,6 +431,16 @@ pub struct Mapping {
     pub frame: FrameId,
     pub permissions: Permissions,
     live: bool,
+}
+/// Completion receipt is minted only after this generation has no tagged
+/// backing or scoped mappings. Architecture code cannot forge its fields.
+pub struct StackRelease {
+    active: crate::node::ActiveContext,
+}
+impl StackRelease {
+    pub(crate) fn matches(&self, active: crate::node::ActiveContext) -> bool {
+        self.active == active
+    }
 }
 pub struct Registry {
     frames: [Frame; DATA_FRAMES],
@@ -440,6 +462,7 @@ impl Registry {
                 live: false,
                 initialized: false,
                 owner: SpaceId::KERNEL,
+                stack_owner: None,
             }; DATA_FRAMES],
             mappings: [Mapping {
                 space: SpaceId::KERNEL,
@@ -518,6 +541,159 @@ impl Registry {
         self.spaces[id.slot].pins -= 1;
         Ok(())
     }
+    pub fn pins(&self, id: SpaceId) -> Result<u8> {
+        Ok(self.space(id)?.pins)
+    }
+    fn stack_edit_valid(&self, edit: &crate::node::StackEdit<'_>) -> Result<()> {
+        let active = edit.active();
+        if self.active.is_some()
+            || active.thread.index() >= crate::node::MAX_THREADS
+            || active.context.rsp != thread_user_stack(active.thread.index()) + PAGE - 8
+            || self.root(active.context.space)? != active.context.root
+        {
+            return Err(Error::InUse);
+        }
+        Ok(())
+    }
+    pub fn insert_stack_frame(
+        &mut self,
+        edit: &crate::node::StackEdit<'_>,
+        address: u64,
+        kind: StackKind,
+    ) -> Result<FrameId> {
+        self.stack_edit_valid(edit)?;
+        if edit.terminal() {
+            return Err(Error::InUse);
+        }
+        physical(address, 52)?;
+        if self.frames.iter().any(|f| f.live && f.physical == address) {
+            return Err(Error::InUse);
+        }
+        let slot = self
+            .frames
+            .iter()
+            .position(|f| !f.live && f.generation != u64::MAX)
+            .ok_or(Error::Capacity)?;
+        let generation = self.frames[slot].generation + 1;
+        self.frames[slot] = Frame {
+            physical: address,
+            generation,
+            live: true,
+            initialized: false,
+            owner: edit.active().context.space,
+            stack_owner: Some((edit.active().thread, kind)),
+        };
+        Ok(FrameId { slot, generation })
+    }
+    pub fn adopt_user_stack(
+        &mut self,
+        edit: &crate::node::StackEdit<'_>,
+        id: FrameId,
+    ) -> Result<()> {
+        self.stack_edit_valid(edit)?;
+        let a = edit.active();
+        let f = self.frame(id)?;
+        if edit.terminal()
+            || f.owner != a.context.space
+            || f.stack_owner.is_some()
+            || self
+                .mappings
+                .iter()
+                .filter(|m| m.live && m.frame == id)
+                .count()
+                != 1
+            || self
+                .mapping_for(a.context.space, thread_user_stack(a.thread.index()))?
+                .frame
+                != id
+        {
+            return Err(Error::NotOwned);
+        }
+        self.frames[id.slot].stack_owner = Some((a.thread, StackKind::User));
+        Ok(())
+    }
+    fn stack_frame_valid(
+        &self,
+        edit: &crate::node::StackEdit<'_>,
+        id: FrameId,
+    ) -> Result<StackKind> {
+        self.stack_edit_valid(edit)?;
+        let f = self.frame(id)?;
+        let a = edit.active();
+        match f.stack_owner {
+            Some((owner, kind)) if owner == a.thread && f.owner == a.context.space => Ok(kind),
+            _ => Err(Error::NotOwned),
+        }
+    }
+    pub fn remove_stack_mapping(
+        &mut self,
+        edit: &crate::node::StackEdit<'_>,
+        address: u64,
+    ) -> Result<FrameId> {
+        let a = edit.active();
+        let m = self.mapping_for(a.context.space, address)?;
+        let kind = self.stack_frame_valid(edit, m.frame)?;
+        let base = match kind {
+            StackKind::User => thread_user_stack(a.thread.index()),
+            StackKind::Kernel => KSTACK_BASE + a.thread.index() as u64 * KSTACK_STRIDE + PAGE,
+        };
+        let size = match kind {
+            StackKind::User => PAGE,
+            StackKind::Kernel => KSTACK_PAGES as u64 * PAGE,
+        };
+        if !(base..base + size).contains(&address) {
+            return Err(Error::Address);
+        }
+        let slot = self
+            .mappings
+            .iter()
+            .position(|record| {
+                record.live && record.space == a.context.space && record.address == address
+            })
+            .ok_or(Error::NotMapped)?;
+        self.mappings[slot].live = false;
+        Ok(m.frame)
+    }
+    pub fn releasable_stack_frame(
+        &self,
+        edit: &crate::node::StackEdit<'_>,
+        id: FrameId,
+    ) -> Result<u64> {
+        self.stack_frame_valid(edit, id)?;
+        if self.mappings.iter().any(|m| m.live && m.frame == id) {
+            return Err(Error::InUse);
+        }
+        Ok(self.frame(id)?.physical)
+    }
+    pub fn retire_stack_frame(
+        &mut self,
+        edit: &crate::node::StackEdit<'_>,
+        id: FrameId,
+    ) -> Result<()> {
+        self.releasable_stack_frame(edit, id)?;
+        self.frames[id.slot].live = false;
+        Ok(())
+    }
+    pub fn finish_stack_edit(&self, edit: &crate::node::StackEdit<'_>) -> Result<StackRelease> {
+        self.stack_edit_valid(edit)?;
+        let a = edit.active();
+        let user = thread_user_stack(a.thread.index());
+        let kernel = KSTACK_BASE + a.thread.index() as u64 * KSTACK_STRIDE + PAGE;
+        if self
+            .frames
+            .iter()
+            .any(|f| f.live && f.stack_owner.is_some_and(|(owner, _)| owner == a.thread))
+            || self.mappings.iter().any(|m| {
+                m.live
+                    && m.space == a.context.space
+                    && (m.address == user
+                        || (kernel..kernel + KSTACK_PAGES as u64 * PAGE).contains(&m.address))
+            })
+        {
+            return Err(Error::InUse);
+        }
+        Ok(StackRelease { active: a })
+    }
     pub fn bind_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
         self.space(id)?;
         physical(root, 52)?;
@@ -594,6 +770,7 @@ impl Registry {
             live: true,
             initialized: false,
             owner,
+            stack_owner: None,
         };
         Ok(FrameId { slot, generation })
     }
@@ -658,6 +835,7 @@ impl Registry {
                 space: SpaceId::KERNEL,
                 user: true,
                 stack: false,
+                thread: None,
             },
             base,
             frames,
@@ -671,7 +849,22 @@ impl Registry {
         frames: &[FrameId],
         permissions: Permissions,
     ) -> Result<()> {
-        self.can_allocate(target.space)?;
+        if let Some(owner) = target.thread {
+            self.space(target.space)?;
+            if self.active.is_some() || permissions != Permissions::RW {
+                return Err(Error::InUse);
+            }
+            let expected = if target.user {
+                thread_user_stack(owner.index())
+            } else {
+                KSTACK_BASE + owner.index() as u64 * KSTACK_STRIDE + PAGE
+            };
+            if base != expected || frames.len() != if target.user { 1 } else { KSTACK_PAGES } {
+                return Err(Error::Address);
+            }
+        } else {
+            self.can_allocate(target.space)?;
+        }
         if target.stack {
             stack_range(base, frames.len())?;
         } else if target.user {
@@ -685,7 +878,20 @@ impl Registry {
         }
         for (index, id) in frames.iter().copied().enumerate() {
             let frame = self.frame(id)?;
-            if frame.owner != target.space {
+            if frame.owner != target.space
+                || target.thread.is_some_and(|owner| {
+                    frame.stack_owner
+                        != Some((
+                            owner,
+                            if target.user {
+                                StackKind::User
+                            } else {
+                                StackKind::Kernel
+                            },
+                        ))
+                        || frames[..index].contains(&id)
+                })
+            {
                 return Err(Error::NotOwned);
             }
             if !frame.initialized {
@@ -725,6 +931,7 @@ impl Registry {
                 space: SpaceId::KERNEL,
                 user: true,
                 stack: false,
+                thread: None,
             },
             base,
             frames,
@@ -789,12 +996,14 @@ struct Target {
     space: SpaceId,
     user: bool,
     stack: bool,
+    thread: Option<crate::node::ThreadId>,
 }
 impl Target {
     const KERNEL: Self = Self {
         space: SpaceId::KERNEL,
         user: false,
         stack: false,
+        thread: None,
     };
 }
 
@@ -859,6 +1068,7 @@ pub fn map_user_frames_for(
             space,
             user: true,
             stack: false,
+            thread: None,
         },
     )
 }
@@ -884,6 +1094,35 @@ pub fn map_stack_frames_for(
             space,
             user: false,
             stack: true,
+            thread: None,
+        },
+    )
+}
+pub fn map_thread_stack_frames(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    edit: &crate::node::StackEdit<'_>,
+    base: u64,
+    frames: &[FrameId],
+    kind: StackKind,
+) -> Result<()> {
+    registry.stack_edit_valid(edit)?;
+    if edit.terminal() || tree.root != edit.active().context.root {
+        return Err(Error::InUse);
+    }
+    map_frames_kind(
+        tree,
+        memory,
+        registry,
+        base,
+        frames,
+        Permissions::RW,
+        Target {
+            space: edit.active().context.space,
+            user: kind == StackKind::User,
+            stack: kind == StackKind::Kernel,
+            thread: Some(edit.active().thread),
         },
     )
 }

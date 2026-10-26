@@ -174,7 +174,9 @@ fn execute(paging: &mut Paging<'_, '_>, model: &mut Nodes, node: &Bootstrap) -> 
             ))
             .map_err(|_| Error::Corrupt)?;
         }
-        ExitReason::ConstructionFailure => return Err(Error::Corrupt),
+        ExitReason::ConstructionFailure | ExitReason::Cancelled { .. } => {
+            return Err(Error::Corrupt);
+        }
     }
     if node.label == 2 && paging.private_value(s)? != Some(native::PRIVATE_VALUE) {
         return Err(Error::Corrupt);
