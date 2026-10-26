@@ -86,7 +86,14 @@ const _: () = assert!(
         + cfg!(feature = "test-threads-stale") as u8
         + cfg!(feature = "test-threads-stack") as u8
         + cfg!(feature = "test-threads-user-guard") as u8
-        + cfg!(feature = "test-threads-return-stack") as u8)
+        + cfg!(feature = "test-threads-return-stack") as u8
+        + cfg!(feature = "test-capabilities") as u8
+        + cfg!(feature = "test-capabilities-xapic") as u8
+        + cfg!(feature = "test-capabilities-a-fault") as u8
+        + cfg!(feature = "test-capabilities-a2-fault") as u8
+        + cfg!(feature = "test-capabilities-b-fault") as u8
+        + cfg!(feature = "test-capabilities-rollback") as u8
+        + cfg!(feature = "test-native-cap-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

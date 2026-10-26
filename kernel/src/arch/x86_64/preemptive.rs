@@ -611,3 +611,15 @@ pub(super) fn settle() -> Result<()> {
     ENABLED.store(true, Ordering::Release);
     result
 }
+
+#[cfg(feature = "cap-test")]
+pub(super) fn request_binding_valid(
+    active: neu_kernel::node::ActiveContext,
+    stack: neu_kernel::context::StackBinding,
+) -> bool {
+    enabled()
+        && !BUSY.load(Ordering::Acquire)
+        && mailbox()
+            .current()
+            .is_some_and(|p| p.active == active && p.stack == stack)
+}

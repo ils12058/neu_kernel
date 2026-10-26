@@ -27,7 +27,7 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 pub const PRIVATE_VALUE: u64 = 0x5152535461626364;
-global_asm!(include_str!("native.S"),cooperative=const cfg!(feature="switch-test") as u8,
+global_asm!(include_str!("native.S"),cap_disabled=const cfg!(feature="test-native-cap-disabled") as u8,cooperative=const cfg!(feature="switch-test") as u8,
     kernel_wait=const if cfg!(feature="preempt-test") { 16u64 } else if cfg!(feature="switch-test") { 0x02000000u64 } else { 0x10000000u64 },private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
     kernel_ss=const abi::KERNEL_SS,star=const abi::STAR,fmask=const abi::ENTRY_MASK,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,unsupported=const abi::NOT_SUPPORTED,invalid=const abi::INVALID_ARGUMENT,
@@ -431,7 +431,26 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
         serial::write(format_args!("[NEU] Switch yield saved: node={} thread={} space={} root={:#x} RIP={:#x} RSP={:#x} flags={:#x}\n",binding.node.raw(),binding.thread.raw(),binding.context.space.raw(),root,frame.context.rip,frame.context.rsp,frame.context.flags)).unwrap_or_else(|_|super::halt());
         terminal_exit(s, 100, 0);
     }
-    match abi::dispatch(before.rax, before.arguments()) {
+    #[cfg(feature = "cap-test")]
+    let dispatched = if super::capabilities::private(before.rax) {
+        let active = s
+            .binding
+            .unwrap_or_else(|| fatal("capability request without Node"));
+        if !super::preemptive::enabled()
+            || !super::preemptive::request_binding_valid(
+                active,
+                s.stack.unwrap_or_else(|| fatal("capability stack")),
+            )
+        {
+            fatal("capability caller publication");
+        }
+        super::capabilities::request(active, frame, address, top)
+    } else {
+        abi::dispatch(before.rax, before.arguments())
+    };
+    #[cfg(not(feature = "cap-test"))]
+    let dispatched = abi::dispatch(before.rax, before.arguments());
+    match dispatched {
         Outcome::Exit(status) => {
             serial::write(format_args!(
                 "[NEU] Native thread_exit: status={}\n",
@@ -519,23 +538,24 @@ pub(super) fn user_fault(frame: exceptions::ExceptionFrame, cr2: u64, handler_rs
 
 #[cfg(not(feature = "node-test"))]
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
-    let kind = if cfg!(feature = "test-native-unknown") {
-        1
-    } else if cfg!(feature = "test-native-exit-invalid") {
-        2
-    } else if cfg!(feature = "test-native-return-rip") {
-        3
-    } else if cfg!(feature = "test-native-return-rsp") {
-        4
-    } else if cfg!(feature = "test-native-return-flags") {
-        5
-    } else if cfg!(feature = "test-native-return-selectors") {
-        6
-    } else if cfg!(feature = "test-native-disabled") {
-        7
-    } else {
-        0
-    };
+    let kind =
+        if cfg!(feature = "test-native-unknown") || cfg!(feature = "test-native-cap-disabled") {
+            1
+        } else if cfg!(feature = "test-native-exit-invalid") {
+            2
+        } else if cfg!(feature = "test-native-return-rip") {
+            3
+        } else if cfg!(feature = "test-native-return-rsp") {
+            4
+        } else if cfg!(feature = "test-native-return-flags") {
+            5
+        } else if cfg!(feature = "test-native-return-selectors") {
+            6
+        } else if cfg!(feature = "test-native-disabled") {
+            7
+        } else {
+            0
+        };
     let length =
         ptr::addr_of!(neu_native_payload_end) as usize - ptr::addr_of!(neu_native_payload) as usize;
     if length == 0 || length > PAGE as usize {

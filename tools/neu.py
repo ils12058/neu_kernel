@@ -56,6 +56,10 @@ PREEMPT_NEGATIVE = ("preempt-unexpected","preempt-software","preempt-origin")
 FEATURES.update({name:"test-"+name for name in PREEMPT_CASES})
 MULTI_CASES = ('threads', 'threads-xapic', 'threads-a1-fault', 'threads-a2-fault', 'threads-b-fault', 'threads-cross', 'threads-a-cross', 'threads-rollback', 'threads-stale', 'threads-stack', 'threads-user-guard', 'threads-return-stack')
 FEATURES.update({name:"test-"+name for name in MULTI_CASES})
+CAP_CASES = ('capabilities','capabilities-xapic','capabilities-a-fault','capabilities-a2-fault','capabilities-b-fault','capabilities-rollback')
+FEATURES.update({name:"test-"+name for name in CAP_CASES})
+FEATURES["native-cap-disabled"]="test-native-cap-disabled"
+NATIVE_CASES["native-cap-disabled"]=1
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -155,7 +159,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -206,6 +210,9 @@ def elf_info(path):
         for name,opcode in (("neu_multi_atomic_site",b"\xf0\x48\x0f\xc1"),("neu_multi_syscall_site",b"\x0f\x05"),("neu_context_iret",b"\x48\xcf")):
             address=symbols[name];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
             if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+len(opcode)]!=opcode:raise Failure("Missing actual LOCK XADD/SYSCALL/IRETQ in the multiple-Thread image.")
+    if "neu_cap_syscall_site" in symbols:
+        address=symbols["neu_cap_syscall_site"];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
+        if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+2]!=b"\x0f\x05":raise Failure("Capability requests must use an actual SYSCALL instruction.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -617,6 +624,15 @@ for name in MULTI_CASES:
         "[NEU] Multi three runnable:","[NEU] Multi selected:","[NEU] Preempt timer stopped:","[NEU] Multi accounting restored:",
         "[NEU] Multiple Thread test passed:","[NEU] Kernel bootstrap successful","[NEU] Idle: interrupts disabled; halting"],
         ["BOOT FAILURE:","PANIC:","EXCEPTION:","Interrupt failure:","Switch yield saved:","verified=false"])
+
+
+for name in CAP_CASES:
+    base,forbidden=EXPECT['threads'];required=[]
+    for marker in base:
+        if marker=='[NEU] Preempt timer stopped:':required+=['[NEU] Cap regrant:','[NEU] Cap Node cleanup:','[NEU] Cap accounting restored:']
+        required.append(marker)
+        if marker=='[NEU] Multi Thread ready: label=2':required.append('[NEU] Cap bootstrap:')
+    EXPECT[name]=(required,forbidden)
 
 
 def switch_site(symbols,name):
@@ -1043,7 +1059,34 @@ def multi_registers(frame,record,symbols):
     if any(frame[index]!=value for index,value in expected.items()):raise Failure('Independent Thread GPR witness was corrupted across preemption.')
 
 
-def observe_multi(qmp,serial,symbols,start,sequence,record,deadline):
+def observe_cap_request(qmp,cpu,symbols,record):
+    reg=lambda key:native_register(cpu,key)
+    words=debug_words(qmp,symbols['neu_cap_witness'],24)
+    node,thread,space,root=(record[k] for k in ('node','thread','space','root'))
+    if words[1:6]!=[node,thread,space,root,node] or 'CPL=0' not in cpu or reg('CS')!=8 or reg('SS')!=0x10 or reg('RFL')&0x77700 or reg('CR3')!=root or not record['bottom']<=reg('RSP')<record['top']-160:raise Failure('Native capability request lost its trusted Node/root/stack binding.')
+    if reg('CR0')&10!=10 or reg('CR4')&0x50600 or reg('EFER')&1!=1:raise Failure('Capability request exposed unsupported CPU state.')
+    if words[20:22]!=[record['top'],record['top']-160] or words[22]&0x600 or words[23]!=1:raise Failure('Capability witness was not published in an exclusive IF=0 native transaction.')
+    tr=re.search(r'TR =0018 ([0-9a-fA-F]+)',cpu)
+    if not tr or debug_words(qmp,int(tr[1],16)+4,1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_selected_top'],1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_busy'],1)[0]!=1:raise Failure('Capability operation used the wrong TSS/native entry ownership.')
+    frame=debug_words(qmp,words[21],20)
+    if frame[14]!=words[6] or frame[8:10]!=words[7:9] or frame[6]!=0x100000001 or frame[15:17]!=[words[18],0x3b] or frame[18:]!=[words[19],0x33] or frame[17]&0x202!=0x202 or words[18]!=multi_site(symbols,'neu_cap_syscall_resume') or not record['user_base']<=words[19]<=record['initial_rsp']:raise Failure('Capability request did not originate in the selected real Ring 3 syscall frame.')
+    walks={}
+    storage=symbols['neu_cap_storage'];size=debug_words(qmp,symbols['neu_cap_storage_bytes'],1)[0]
+    for address in (symbols['neu_cap_witness'],storage):
+        w=switch_walk(qmp,root,address)
+        if not w['present'] or any(e&4 for e in w['entries']) or w['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2:raise Failure('Capability metadata is not supervisor-only RW/NX storage.')
+        walks[str(address)]=w
+    if words[16]:
+        if not storage<=words[16]<storage+size:raise Failure('Object value is outside the actual fixed registry storage.')
+        actual=debug_words(qmp,words[16],1)[0]
+        if words[12]==2:actual&=255
+        if actual!=words[17] or (words[9]==0 and words[15]!=1):raise Failure('Observed object storage/value/pin differs from the authorized operation.')
+        walks[str(words[16])]=switch_walk(qmp,root,words[16])
+    elif words[9]==0:raise Failure('Successful observed operation did not use real typed object storage.')
+    return {'cpu':cpu,'words':words,'frame':frame,'walks':walks,'storage':storage,'storage_bytes':size}
+
+
+def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=None):
     root,bottom,top,initial=tuple(record[k] for k in ('root','bottom','top','initial_rsp'))
     local_rsp=initial-64;user_base=initial&~4095;seed=record['seed'];label=record['label']
     result={'sequence':sequence,'label':label,'root':root,'bottom':bottom,'top':top,'initial_rsp':initial}
@@ -1051,11 +1094,27 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline):
     reg_order=('R15','R14','R13','R12','R11','R10','R9','R8','RDI','RSI','RBP','RDX','RCX','RBX','RAX')
     while time.monotonic()<deadline:
         if 'Switch common restored:' in transcript(serial)[start:]:break
+        if cap_state is not None:
+            # A running snapshot is only a location hint. Stop and reread before
+            # asserting any CPU/frame/object property. Avoid starving the guest
+            # with stop/continue polls during unrelated kernel validation.
+            hint=qmp.call('human-monitor-command',{'command-line':'info registers'})
+            hint_rip=native_register(hint,'RIP');wanted=False
+            if native_register(hint,'CR3')==root:
+                wanted=('restore' not in result and symbols['neu_preempt_restore_wait']<=hint_rip<symbols['neu_preempt_restore_wait_end']) or ('user' not in result and 'CPL=3' in hint and multi_site(symbols,'neu_multi_loop')<=hint_rip<multi_site(symbols,'neu_multi_loop_end') and native_register(hint,'RSP')==local_rsp) or ('irq' not in result and symbols['neu_preempt_irq_wait']<=hint_rip<symbols['neu_preempt_irq_wait_end'])
+                if symbols['neu_cap_request_wait']<=hint_rip<symbols['neu_cap_request_wait_end']:
+                    wanted=debug_words(qmp,symbols['neu_cap_witness'],1)[0] not in cap_state['native']
+            if not wanted:
+                time.sleep(0.001);continue
         qmp.call('stop')
         try:
             cpu=qmp.call('human-monitor-command',{'command-line':'info registers'});reg=lambda key:native_register(cpu,key)
             if reg('CR3')!=root:continue
             rip=reg('RIP');stage=None
+            if cap_state is not None and symbols['neu_cap_request_wait']<=rip<symbols['neu_cap_request_wait_end']:
+                seq=debug_words(qmp,symbols['neu_cap_witness'],1)[0]
+                if seq not in cap_state['native']:cap_state['native'][seq]=observe_cap_request(qmp,cpu,symbols,record)
+                continue
             if symbols['neu_preempt_restore_wait']<=rip<symbols['neu_preempt_restore_wait_end'] and reg('RSP')==top-160:stage='restore'
             elif 'CPL=3' in cpu and multi_site(symbols,'neu_multi_loop')<=rip<multi_site(symbols,'neu_multi_loop_end') and reg('RSP')==local_rsp:stage='user'
             elif symbols['neu_preempt_irq_wait']<=rip<symbols['neu_preempt_irq_wait_end'] and reg('RSP')==top-176:stage='irq'
@@ -1069,27 +1128,35 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline):
             if stage=='restore':
                 if 'CPL=0' not in cpu or reg('RFL')&0x600:raise Failure('Unsafe member restore boundary.')
                 sample['frame']=debug_words(qmp,top-160,20)
-                sample['data_walk']=switch_walk(qmp,root,0x402000);sample['code_walk']=switch_walk(qmp,root,0x400000)
-                if not sample['data_walk']['present'] or sample['data_walk']['physical']!=record['data_pa']:raise Failure('Actual shared-data backing differs from the owned Node frame.')
-                data=sample['data_walk'];code=sample['code_walk']
-                if data['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2 or not all(e&4 for e in data['entries']) or not code['present'] or code['entries'][-1]&((1<<63)|0x82) or not all(e&4 for e in code['entries']):raise Failure('Shared Node data/code permissions differ from RW/NX and RX.')
-                walks={str(va):switch_walk(qmp,root,va) for va in (user_base-4096,user_base,user_base+4096,bottom-4096,bottom,bottom+4096,top)}
-                for guard in (user_base-4096,user_base+4096,bottom-4096,top):
-                    if walks[str(guard)]['present']:raise Failure('A member stack guard is mapped.')
-                for va,pa,user in ((user_base,record['user_pa'],True),(bottom,record['k0'],False),(bottom+4096,record['k1'],False)):
-                    w=walks[str(va)]
-                    if not w['present'] or w['physical']!=pa or w['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2 or (all(entry&4 for entry in w['entries']))!=user:raise Failure('Member stack backing/permissions are incorrect.')
-                sample['walks']=walks
-                sample['all_user_stacks']={str(slot):switch_walk(qmp,root,0x404000+slot*0x4000) for slot in range(3)}
-                sample['all_kernel_stacks']={str(slot):switch_walk(qmp,root,0xffffc00000001000+slot*0x4000) for slot in range(3)}
-                probe=switch_walk(qmp,root,0x410000);sample['probe_walk']=probe
-                if label in (1,2):
-                    if not probe['present'] or probe['physical']!=record['data_pa']:raise Failure('Node A private data probe is not an alias of its shared frame.')
-                elif probe['present']:raise Failure('Node B has an unauthorized mapping of Node A private data.')
-                if 'x2APIC=false' in transcript(serial):
-                    device=switch_walk(qmp,root,0xffffb00000000000)
-                    if not device['present'] or any(e&4 for e in device['entries']) or device['entries'][-1]&((1<<63)|0x9f)!=(1<<63)|0x1b or device['physical']!=0xfee00000:raise Failure('Member xAPIC view is not supervisor UC RW/NX.')
-                    sample['device_walk']=device
+                epoch=len(re.findall(r'Multi Thread retired:',transcript(serial)))
+                cache_key=(record['thread'],root,epoch)
+                cached=None if cap_state is None else cap_state['maps'].get(cache_key)
+                if cached is not None:
+                    sample.update(cached);sample['maps_observed']=False
+                else:
+                    sample['data_walk']=switch_walk(qmp,root,0x402000);sample['code_walk']=switch_walk(qmp,root,0x400000)
+                    if not sample['data_walk']['present'] or sample['data_walk']['physical']!=record['data_pa']:raise Failure('Actual shared-data backing differs from the owned Node frame.')
+                    data=sample['data_walk'];code=sample['code_walk']
+                    if data['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2 or not all(e&4 for e in data['entries']) or not code['present'] or code['entries'][-1]&((1<<63)|0x82) or not all(e&4 for e in code['entries']):raise Failure('Shared Node data/code permissions differ from RW/NX and RX.')
+                    walks={str(va):switch_walk(qmp,root,va) for va in (user_base-4096,user_base,user_base+4096,bottom-4096,bottom,bottom+4096,top)}
+                    for guard in (user_base-4096,user_base+4096,bottom-4096,top):
+                        if walks[str(guard)]['present']:raise Failure('A member stack guard is mapped.')
+                    for va,pa,user in ((user_base,record['user_pa'],True),(bottom,record['k0'],False),(bottom+4096,record['k1'],False)):
+                        w=walks[str(va)]
+                        if not w['present'] or w['physical']!=pa or w['entries'][-1]&((1<<63)|0x82)!=(1<<63)|2 or (all(entry&4 for entry in w['entries']))!=user:raise Failure('Member stack backing/permissions are incorrect.')
+                    sample['walks']=walks
+                    sample['all_user_stacks']={str(slot):switch_walk(qmp,root,0x404000+slot*0x4000) for slot in range(3)}
+                    sample['all_kernel_stacks']={str(slot):switch_walk(qmp,root,0xffffc00000001000+slot*0x4000) for slot in range(3)}
+                    probe=switch_walk(qmp,root,0x410000);sample['probe_walk']=probe
+                    if label in (1,2):
+                        if not probe['present'] or probe['physical']!=record['data_pa']:raise Failure('Node A private data probe is not an alias of its shared frame.')
+                    elif probe['present']:raise Failure('Node B has an unauthorized mapping of Node A private data.')
+                    if 'x2APIC=false' in transcript(serial):
+                        device=switch_walk(qmp,root,0xffffb00000000000)
+                        if not device['present'] or any(e&4 for e in device['entries']) or device['entries'][-1]&((1<<63)|0x9f)!=(1<<63)|0x1b or device['physical']!=0xfee00000:raise Failure('Member xAPIC view is not supervisor UC RW/NX.')
+                        sample['device_walk']=device
+                    sample['maps_observed']=True
+                    if cap_state is not None:cap_state['maps'][cache_key]={k:v for k,v in sample.items() if k not in ('cpu','frame','tss_rsp0','common_rsp','maps_observed')}
             elif stage=='user':
                 if reg('CS')!=0x3b or reg('SS')!=0x33 or reg('RFL')&0x202!=0x202 or reg('RFL')&~0x10ad7:raise Failure('Member execution has wrong privilege/flags.')
                 actual=[reg(key) for key in reg_order]+[rip,reg('CS'),reg('RFL'),reg('RSP'),reg('SS')]
@@ -1110,7 +1177,7 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline):
                 sample.update(raw_frame=raw,frame=frame,lapic=lapic,words=debug_words(qmp,0x402000,32),markers=debug_words(qmp,local_rsp,3))
                 if sample['markers']!=markers:raise Failure('IRQ used another member user stack.')
             result[stage]=sample
-            if all(key in result for key in ('restore','user','irq')):return result
+            if (cap_state is None and all(key in result for key in ('restore','user','irq'))) or (cap_state is not None and record.get('peer') and stage=='irq'):return result
         finally:qmp.call('cont')
         time.sleep(0.001)
     else:raise Failure('Timed out observing three-Thread preemption.')
@@ -1118,7 +1185,7 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline):
     return result
 
 
-def check_multi(case,text,symbols,observations,kernel_root,qmp):
+def check_multi(case,text,symbols,observations,kernel_root,qmp,capabilities=False):
     calibrated=re.search(r'Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=10000',text)
     if not calibrated:raise Failure('Missing three-Thread 10 ms calibration.')
     hz,ref,a,b,c,divided,initial=map(int,calibrated.groups())
@@ -1188,15 +1255,15 @@ def check_multi(case,text,symbols,observations,kernel_root,qmp):
             if (thread,observations[seq]['irq']['frame']) not in irq_frames:raise Failure('Recorded member handoff was not the actual QMP hardware frame.')
         yielded=logged_frames(episode,'multi-saved')
         if yielded:
-            if len(yielded)!=1 or not fifo or not irq_frames or yielded[0]!=(thread,irq_frames[-1][1]) or seq not in observations or 'irq' not in observations[seq]:raise Failure('Member scheduling was not caused by a real copied timer context.')
+            if len(yielded)!=1 or not fifo or not irq_frames or yielded[0]!=(thread,irq_frames[-1][1]) or seq not in observations or 'irq' not in observations[seq]:raise Failure(f'Member scheduling lacks a real copied timer context: sequence={seq}, yielded={len(yielded)}, peer={bool(fifo)}, IRQs={len(irq_frames)}, observed={list(observations.get(seq,{}))}.')
             saved[label]=yielded[0][1];captures[label]+=1;fifo.append(label)
             progress=re.search(r'Multi progress: label=(\d+) captures=(\d+) stored=(\d+) committed=(\d+) boots=1 total=(\d+)',episode)
-            if not progress or (int(progress[1]),int(progress[2]))!=(label,captures[label]) or int(progress[4])<=last_work[label] or multi_committed(int(progress[3]),saved[label],symbols)!=int(progress[4]):raise Failure('A member failed to make independent atomic progress.')
+            if not progress or (int(progress[1]),int(progress[2]))!=(label,captures[label]) or (int(progress[4])<last_work[label] if capabilities else int(progress[4])<=last_work[label]) or multi_committed(int(progress[3]),saved[label],symbols)!=int(progress[4]):raise Failure('A member failed to make independent atomic progress.')
             actual_stored=observations[seq]['irq']['words'][8+(label-1)*4]
             if actual_stored!=int(progress[3]):raise Failure('Saved member progress was not the actual observed IRQ memory.')
             suspended_counts[label]=multi_committed(actual_stored,saved[label],symbols)
             last_work[label]=int(progress[4])
-            if captures[label]<=4 and re.search(r'Native terminal:.*entries=[1-9]',episode):raise Failure('Cooperative/native calls caused the claimed three-Thread alternation.')
+            if not capabilities and captures[label]<=4 and re.search(r'Native terminal:.*entries=[1-9]',episode):raise Failure('Cooperative/native calls caused the claimed three-Thread alternation.')
         else:
             outcome=re.search(r'Multi outcome: label=(\d+) thread=(\d+) reason=(normal|fault) status=(\d+) committed=(\d+) node_state=(Active|Exited)',episode)
             if not outcome or int(outcome[1])!=label or int(outcome[2])!=thread or (outcome[3]=='fault')!=(fault_label==label) or int(outcome[5])<last_work[label]:raise Failure('Missing correct independent Thread outcome.')
@@ -1237,7 +1304,7 @@ def check_multi(case,text,symbols,observations,kernel_root,qmp):
     if fifo or set(outcomes)!={1,2,3} or len(node_results)!=2 or order[:6]!=[1,3,2,1,3,2]:raise Failure('Missing repeated three-Thread preemption or terminal/empty completion.')
     minimum=1 if case=='threads-return-stack' else 4
     if min(captures.values())<minimum or any(sum(row['label']==label for row in user_samples)<(1 if case=='threads-return-stack' and label==2 else 2) for label in (1,2,3)):raise Failure('Insufficient actual interrupted/resumed CPU observations for all three members.')
-    if not any(not e['switched'] for e in events):raise Failure('Missing direct hardware return for the final runnable member.')
+    if not capabilities and not any(not e['switched'] for e in events):raise Failure('Missing direct hardware return for the final runnable member.')
     if case=='threads-rollback':
         budgets=re.findall(r'Multi rollback: budget=(\d+) accounting=restored sibling_contexts=unchanged pins=1,1',text)
         if list(map(int,budgets))!=[0,1,2,3] or 'Multi context rollback: rejected=Association accounting=restored' not in text:raise Failure('A2 construction did not roll back while A1/B1 remained runnable and pinned.')
@@ -1261,6 +1328,95 @@ def check_multi(case,text,symbols,observations,kernel_root,qmp):
         if debug_words(qmp,symbols[name],1)[0]!=0:raise Failure('Stale native/shared-root entry state at final halt.')
     if debug_words(qmp,symbols['neu_preempt_busy'],1)[0]&255 or int(re.search(r'EFER=([0-9a-fA-F]+)',qmp.call('human-monitor-command',{'command-line':'info registers'}))[1],16)&1:raise Failure('Stale IRQ busy state or SCE at halt.')
     return {'threads':records,'peak':list(map(int,peak.groups())),'calibration':calibration,'order':order,'captures':captures,'events':events,'outcomes':outcomes,'node_results':node_results,'shared_audits':shared_audits,'user_samples':user_samples,'observations':observations,'ticks':ticks,'eois':eois,'drain_ticks':drain,'accounting':list(map(int,restored.groups())),'final_lapic':final}
+
+
+def check_capabilities(case,text,symbols,members,state):
+    records=[]
+    for line in re.finditer(r'Cap record: words=([^\n]+)\n',text):
+        words=[int(v,0) for v in line[1].split(',')]
+        if len(words)!=24 or words[0]!=len(records)+1:raise Failure('Incomplete/out-of-order capability transaction record.')
+        records.append(words)
+    boot=re.search(r'Cap bootstrap: A=(\d+) table=(\d+) B=(\d+) table=(\d+) counter=(\d+) other=(\d+) solo=(\d+) objects=4 references=6 handles=5,1 ABI=0.1 test_only=true',text)
+    done=re.search(r'Cap accounting restored: objects=0 references=0 pins=0 leases=0 requests=(\d+) public_ABI=unchanged',text)
+    if not boot or not done or int(done[1])!=len(records):raise Failure('Missing exact capability bootstrap/final accounting.')
+    a,at,b,bt,aid,bid,solo=map(int,boot.groups());h1=0x100000001;new_h=0x200000001
+    if (a,at,b,bt)!=(members['threads'][1]['node'],a,members['threads'][3]['node'],b) or a==b or (aid,bid,solo)!=(0x10000000101,0x10000000102,0x10000000104):raise Failure('Capability tables/object generations do not match the actual Node profile.')
+    flag=0x20000000103
+    objects={aid:{'kind':1,'value':10,'refs':3},bid:{'kind':1,'value':200,'refs':1},flag:{'kind':2,'value':1,'refs':1},solo:{'kind':1,'value':9,'refs':1}}
+    tables={a:{h1:(aid,3),h1+1:(aid,1),h1+2:(aid,2),h1+3:(flag,1),h1+4:(solo,1)},b:{h1:(bid,3)}}
+    generations={a:[1]*5+[1 if case=='capabilities-rollback' else 0]*3,b:[1]+[0]*7}
+    entries=[]
+    for match in re.finditer(r'Native entry: seq=\d+ op=(0x[0-9a-f]+) arg1=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) R11=(0x[0-9a-f]+)',text):
+        if 0xfffffffffffffd00<=int(match[1],16)<=0xfffffffffffffd05:entries.append(match)
+    if len(entries)!=len(records):raise Failure('Capability records were not genuine native scalar requests.')
+    timeline=[(m.start(),'request',(m,r)) for m,r in zip(entries,records)]
+    for m in re.finditer(r'Cap regrant: node=(\d+) old_object=(\d+) new_object=(\d+) old_handle=(0x[0-9a-f]+) new_handle=(0x[0-9a-f]+) initial=77',text):timeline.append((m.start(),'regrant',m))
+    for m in re.finditer(r'Cap Node cleanup: node=(\d+) handles=(\d+) objects_before=(\d+) after=(\d+) references_before=(\d+) after=(\d+) pins=0 lease=none',text):timeline.append((m.start(),'cleanup',m))
+    regranted=False;cleaned=set();errors=set();used=set();native=state['native'];successful_pins=0;post_exit=False
+    normal_a1=re.search(r'Multi outcome: label=1 .*reason=normal',text)
+    selections=list(re.finditer(r'Multi selected: sequence=\d+ label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+)',text))
+    def release(target):
+        objects[target]['refs']-=1
+        if objects[target]['refs']==0:del objects[target]
+    for position,kind,event in sorted(timeline,key=lambda item:item[0]):
+        if kind=='regrant':
+            if regranted or h1 in tables[a] or solo in objects or tuple(int(v,0) for v in event.groups())!=(a,solo,0x10000000204,h1,new_h):raise Failure('Trusted slot reuse did not follow effective close/last-reference cleanup.')
+            objects[0x10000000204]={'kind':1,'value':77,'refs':1};tables[a][new_h]=(0x10000000204,3);generations[a][0]=2;regranted=True;continue
+        if kind=='cleanup':
+            node,count,before,after,refs_before,refs_after=map(int,event.groups())
+            if node in cleaned or node not in tables or count!=len(tables[node]) or before!=len(objects) or refs_before!=sum(o['refs'] for o in objects.values()):raise Failure('Node capability teardown started with incorrect table/reference ownership.')
+            for target,_ in tables[node].values():release(target)
+            tables[node].clear();cleaned.add(node)
+            if after!=len(objects) or refs_after!=sum(o['refs'] for o in objects.values()):raise Failure('Node cleanup released foreign authority or leaked references.')
+            continue
+        entry,r=event;seq,node,thread,space,root,table,op,handle,value,status,scalar,target,obj_kind,rights,refs,pins,source,actual_value,rip,rsp,top,frame_ptr,flags,probed=r
+        selected=next((m for m in reversed(selections) if m.start()<position),None)
+        if not selected:raise Failure('Capability request has no selected execution context.')
+        label=int(selected[1]);owner=members['threads'][label]
+        if (node,thread,space,root)!=(owner['node'],owner['thread'],owner['space'],owner['root']) or table!=node or node in cleaned or top!=owner['top'] or frame_ptr!=top-160 or flags&0x600:raise Failure('A userspace argument selected foreign or terminal authority.')
+        if (op,handle,rip,rsp)!=tuple(int(v,16) for v in entry.groups()[:4]):raise Failure('Capability request did not match its actual native entry scalars.')
+        following=text[entry.end():next((m.start() for m in entries if m.start()>entry.start()),len(text))]
+        returned=re.search(r'Native return prepared: seq=\d+ RAX=(0x[0-9a-f]+) RDX=(0x[0-9a-f]+)',following)
+        if not returned or tuple(int(v,16) for v in returned.groups())!=(status,scalar):raise Failure('Capability result did not return through the validated native frame.')
+        used.add(label);slot=(handle&0xffffffff)-1;generation=handle>>32;expected_status=0;expected_scalar=0;old=tables[node].get(handle)
+        if not 0<=slot<8 or generation==0:expected_status=-16
+        elif generations[node][slot]==0:expected_status=-16
+        elif generation!=generations[node][slot] or old is None:expected_status=-17
+        expected_info=None
+        if expected_status==0:
+            object_id,granted=old;obj=objects[object_id]
+            if (target,obj_kind,rights)!=(object_id,obj['kind'],granted):raise Failure('A handle resolved to the wrong typed kernel object or rights.')
+            required=2 if op==0xfffffffffffffd01 else 3 if op==0xfffffffffffffd03 else 1
+            requested_type=2 if op==0xfffffffffffffd04 else 1
+            if op!=0xfffffffffffffd02 and obj['kind']!=requested_type:expected_status=-19
+            elif op!=0xfffffffffffffd02 and granted&required!=required:expected_status=-18
+            if expected_status:
+                expected_info=(obj['refs'],0,obj['value'])
+            elif op==0xfffffffffffffd02:
+                del tables[node][handle];release(object_id)
+                expected_info=(objects[object_id]['refs'],0,objects[object_id]['value']) if object_id in objects else (0,0,0)
+            else:
+                if op in (0xfffffffffffffd00,0xfffffffffffffd04):expected_scalar=obj['value']
+                elif op==0xfffffffffffffd01:obj['value']=value
+                elif op==0xfffffffffffffd03:expected_scalar=obj['value'];obj['value']=value
+                elif op==0xfffffffffffffd05:
+                    expected_scalar=obj['value'];del tables[node][handle];obj['refs']-=1
+                expected_info=(obj['refs'],1,obj['value']);successful_pins+=1
+                if op==0xfffffffffffffd05 and obj['refs']==0:del objects[object_id]
+        elif (target,obj_kind,rights,refs,pins,source,actual_value)!=(0,0,0,0,0,0,0):raise Failure('Invalid handle exposed foreign object contents or metadata.')
+        signed=status-(1<<64) if status>>63 else status
+        if signed!=expected_status or scalar!=(0 if expected_status else expected_scalar):raise Failure('Capability result violated the independent type/rights/lifetime oracle.')
+        if expected_info and (refs,pins,actual_value)!=expected_info:raise Failure('Capability pin/reference/value snapshot differs from actual object ownership.')
+        if signed:errors.add(signed)
+        if probed:
+            if seq not in native or native[seq]['words']!=r:raise Failure('Missing actual CPL=0/object-storage observation for a required capability probe.')
+        elif seq in native:raise Failure('An unrequested native probe was conflated with another operation.')
+        if normal_a1 and label==2 and position>normal_a1.end() and signed==0:post_exit=True
+    if cleaned!={a,b} or objects or any(tables.values()) or not regranted or used!={1,2,3} or not {-16,-17,-18,-19}<=errors or successful_pins<12:raise Failure('Incomplete Node-local authorization/isolation/lifetime coverage.')
+    if case in ('capabilities','capabilities-xapic','capabilities-rollback','capabilities-b-fault') and not post_exit:raise Failure('Surviving A2 did not use retained authority after A1 normal exit.')
+    if case=='capabilities-rollback' and 'Cap rollback: table=full objects=full invalid_rights=rejected references=restored entries=5,1' not in text:raise Failure('Missing bounded registry/table installation rollback.')
+    if set(native)!={r[0] for r in records if r[23]}:raise Failure('Native capability probes were missed or duplicated.')
+    return {'requests':records,'native':native,'errors':sorted(errors),'post_a1_exit':post_exit,'node_tables':{a:at,b:bt},'objects_final':0,'references_final':0,'pins_final':0,'closed_nodes':sorted(cleaned)}
 
 
 def native_register(registers, name):
@@ -1343,7 +1499,7 @@ def check_native(case, text, symbols, observed):
     contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
     canaries = re.findall(r"Native canaries: RBX=(0x[0-9a-f]+) RBP=(0x[0-9a-f]+) R12=(0x[0-9a-f]+) R13=(0x[0-9a-f]+) R14=(0x[0-9a-f]+) R15=(0x[0-9a-f]+)", text)
     query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
-    operations = [query, query, exit_op] if kind == 0 else ([query, (1 << 64) - 1, query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
+    operations = [query, query, exit_op] if kind == 0 else ([query, (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
     arguments = [11, 11, 0] if kind == 0 else ([11, 11, 11, 0] if kind == 1 else ([11, 256, 11, 0] if kind == 2 else ([] if kind == 7 else [11])))
     if len(entries) != len(operations) or len(contexts) != len(entries) or len(canaries) != len(entries):
         raise Failure("Incorrect native entry/context count.")
@@ -1587,7 +1743,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -1604,6 +1760,8 @@ def run_case(case, esp, timeout):
                 switch_observations = {}
                 preempt_observations = {}
                 multi_observations = {}
+                cap_state={"native":{},"maps":{}} if case in CAP_CASES else None
+                if cap_state is not None:result.update(capability_observations=cap_state["native"],member_observations=multi_observations)
                 while required[-1] not in transcript(serial):
                     if process.poll() is not None:
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
@@ -1650,7 +1808,7 @@ def run_case(case, esp, timeout):
                             if sequence not in preempt_observations and ready:
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 preempt_observations[sequence]=observe_preempt(qmp,serial,symbols,selected.start(),sequence,label,root,int(ready[1],16),int(ready[2],16),started+timeout)
-                    if case in MULTI_CASES:
+                    if case in MULTI_CASES or case in CAP_CASES:
                         current=transcript(serial)
                         resource=re.findall(r"Multi Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) user_base=(0x[0-9a-f]+) initial_rsp=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_pa=(0x[0-9a-f]+) k0=(0x[0-9a-f]+) k1=(0x[0-9a-f]+) seed=(\d+)",current)
                         keys=('label','node','thread','space','root','user_base','initial_rsp','bottom','top','data_pa','user_pa','k0','k1','seed')
@@ -1660,8 +1818,8 @@ def run_case(case, esp, timeout):
                             sequence,label=map(int,selected.groups()[:2]);episode=current[selected.start():runs[index+1].start() if index+1<len(runs) else len(current)]
                             if sequence not in multi_observations and re.search(r"Switch native ready:.*fresh=(true|false)\n",episode):
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
-                                multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,records[label],started+timeout)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES else 0.05)
+                                multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,{**records[label],'peer':selected[8]=='true'},started+timeout,cap_state)
+                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -1711,11 +1869,13 @@ def run_case(case, esp, timeout):
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
-                members=check_multi(case,text,symbols,multi_observations,paging["root"],qmp) if case in MULTI_CASES else None
+                member_case={'capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES else case)
+                members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES) if case in MULTI_CASES or case in CAP_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
-                result.update(timer=timer,switching=switching,preemption=preemption,members=members)
+                capabilities=check_capabilities(case,text,symbols,members,cap_state) if case in CAP_CASES else None
+                result.update(timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result

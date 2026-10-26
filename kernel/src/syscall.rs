@@ -222,7 +222,18 @@ mod tests {
                 scalar: ABI_INFO
             }
         );
-        for number in [0, 3, 0x80000000, u64::MAX] {
+        for number in [
+            0,
+            3,
+            0x80000000,
+            u64::MAX,
+            0xfffffffffffffd00,
+            0xfffffffffffffd01,
+            0xfffffffffffffd02,
+            0xfffffffffffffd03,
+            0xfffffffffffffd04,
+            0xfffffffffffffd05,
+        ] {
             assert_eq!(
                 dispatch(number, [u64::MAX; 6]),
                 Outcome::Return {

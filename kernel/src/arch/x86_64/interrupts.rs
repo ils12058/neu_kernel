@@ -16,7 +16,7 @@ use core::{
 #[cfg(feature = "timer-test")]
 use neu_kernel::timer::Session;
 use neu_kernel::timer::{self as policy, Capabilities, Configuration, MAX_EVENTS, Mode};
-global_asm!(include_str!("interrupts.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64});
+global_asm!(include_str!("interrupts.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="cap-test") {0x00400000u64}else if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64});
 const APIC_BASE: u32 = 0x1b;
 const LVT: u32 = 0x320;
 const INITIAL: u32 = 0x380;

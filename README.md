@@ -5,33 +5,29 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K4 / Phase 4D adds multiple independently preemptible Threads in one Node.
-Node A's A1/A2 share a SpaceId, CR3, RX code and writable data frame; B1 runs in
-an isolated Node B. All three retain distinct guarded user/entry stacks and
-complete saved integer contexts. Real LAPIC interrupts drive the ThreadId FIFO.
-A normal exit releases only that Thread's stacks; the last live Thread ends its
-Node. A supported unrecoverable Node fault cancels its live siblings.
+K5 / Phase 5A adds a Node-local typed capability foundation. Every Node has a
+bounded generation-checked handle table; A1/A2 share Node A's authority and B1
+uses a separate table. READ/WRITE rights authorize actual kernel-managed test
+objects. Close invalidates one handle, and operation pins protect object lifetime.
 
-The suite contains **87 host tests and 83 QEMU scenarios**, retaining all previous
-72/71 regressions. Twelve new scenarios cover shared atomic computation,
-x2APIC/xAPIC, early exit, faults in either A member or B, isolation, guards,
-construction rollback, stale identities and selected-Thread return validation.
-See [implementation status](docs/IMPLEMENTATION_STATUS.md) for actual verification,
-CPU observations, resource accounting and limits.
+**Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
 
-The provisional calibrated clockevent remains 10 ms. QEMU observations establish
-progress and preserved contexts, not exact timing or per-Node fairness. FIFO
-schedules Threads; two runnable members can give a Node more aggregate CPU time.
-Selected userspace runs with IF=1; native entry and scheduler/resource transactions
-retain IF=0. The fixed profile supports two Nodes, three Threads, at most two live
-members per Node, and integer-only execution. Same-Node user stacks share a
-protection domain. General kernel preemption, SMP, TLS/SIMD, public creation,
-capabilities/factories and IPC remain deferred. Experimental ABI 0.1 is unchanged.
+The suite contains **113 host tests and 90 QEMU scenarios**, retaining all previous
+87/83 regressions. New cases exercise real Ring 3/native capability calls, shared
+Thread authority, numeric handle reuse across isolated Nodes, rights/type/stale
+failures, close, recycled object/handle generations, fault cleanup and capacity
+rollback. [Implementation status](docs/IMPLEMENTATION_STATUS.md) records actual
+CPU/object evidence, validation and limits; [ADR 0015](docs/adr/0015-node-local-capabilities-and-typed-objects.md)
+records the scoped architectural decision.
 
-[ADR 0014](docs/adr/0014-multiple-threads-in-one-node.md) records the scoped decision.
-Architecture v0.2 and previous ADR rationale remain historical baselines. The
-validated environment remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF,
-Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon.
+These are internal trusted-bootstrap test objects and private test operations.
+Experimental ABI 0.1 query/exit and feature results remain unchanged. The profile
+retains one CPU, user-only 10 ms provisional preemption, distinct guarded Thread
+stacks and a shared Node protection domain. Public creation, capability transfer,
+derivation, revocation, IPC, MemoryObjects, SMP and TLS/SIMD remain deferred.
+Architecture v0.2 and accepted ADR history are preserved. The validated platform
+remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF, Rust 1.95.0 and Limine
+12.9.4/base 6 on Apple Silicon.
 
 ## Build and run
 
@@ -54,7 +50,10 @@ disk. No ISO tools, graphical display, kernel filesystem, or custom bootloader
 are required. `make run` stays halted after successful bootstrap; Ctrl-C stops
 QEMU. `make test` runs host memory/paging/lifecycle/ABI/timer tests, observes each
 guest's expected result, active CR3 and halt through QMP, then shuts QEMU down
-itself. Run `python3 tools/neu.py test --case threads` for shared-Node scheduling,
+itself. Run `python3 tools/neu.py test --case capabilities` for live authorization,
+`--case capabilities-a-fault` for Node fault cleanup, `--case capabilities-rollback`
+for bounded exhaustion, or `--case native-cap-disabled` for private-op rejection.
+Run `python3 tools/neu.py test --case threads` for shared-Node scheduling,
 `--case threads-xapic` for its controller fallback, `--case threads-a2-fault`
 for Node-wide sibling cancellation, `--case threads-rollback` for partial member
 construction, or `--case threads-stale` for generation reuse.

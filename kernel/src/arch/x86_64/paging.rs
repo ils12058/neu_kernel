@@ -1942,3 +1942,24 @@ impl Paging<'_, '_> {
         })
     }
 }
+
+#[cfg(feature = "cap-test")]
+impl Paging<'_, '_> {
+    pub fn member_cap_words(&mut self, space: &UserSpace) -> Result<[u64; 4]> {
+        self.member_boundary(space)?;
+        self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            core::array::from_fn(|i| {
+                u64::from_le_bytes(bytes[256 + i * 8..264 + i * 8].try_into().unwrap())
+            })
+        })
+    }
+    pub fn member_cap_write(&mut self, space: &UserSpace, index: usize, value: u64) -> Result<()> {
+        self.member_boundary(space)?;
+        if index >= 4 {
+            return Err(Error::Address);
+        }
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            bytes[256 + index * 8..264 + index * 8].copy_from_slice(&value.to_le_bytes())
+        })
+    }
+}

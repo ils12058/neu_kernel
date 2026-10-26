@@ -116,6 +116,7 @@ pub struct Nodes {
     node_generations: [u32; MAX_NODES],
     thread_generations: [u32; MAX_THREADS],
     active: Option<ActiveContext>,
+    tables: [Option<crate::capability::Table>; MAX_NODES],
 }
 impl Default for Nodes {
     fn default() -> Self {
@@ -130,7 +131,52 @@ impl Nodes {
             node_generations: [0; MAX_NODES],
             thread_generations: [0; MAX_THREADS],
             active: None,
+            tables: [const { None }; MAX_NODES],
         }
+    }
+    pub fn authority(&self, id: NodeId) -> Result<&crate::capability::Table> {
+        if self.node(id)?.state == NodeState::Reclaimed {
+            return Err(Error::Identity);
+        }
+        self.tables[id.slot]
+            .as_ref()
+            .filter(|t| t.id().owner() == id)
+            .ok_or(Error::InUse)
+    }
+    pub fn authority_mut(&mut self, id: NodeId) -> Result<&mut crate::capability::Table> {
+        if self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        self.authority(id)?;
+        self.tables[id.slot].as_mut().ok_or(Error::InUse)
+    }
+    pub fn take_authority(&mut self, active: ActiveContext) -> Result<crate::capability::Lease> {
+        let t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        if self.active != Some(active)
+            || t.state != ThreadState::Running
+            || t.node != active.node
+            || t.context != active.context
+            || n.state != NodeState::Active
+            || n.space != Some(active.context.space)
+        {
+            return Err(Error::Association);
+        }
+        self.authority(active.node)?;
+        let table = self.tables[active.node.slot].take().ok_or(Error::InUse)?;
+        Ok(crate::capability::Lease::new(active, table))
+    }
+    pub fn restore_authority(&mut self, lease: crate::capability::Lease) -> Result<()> {
+        let active = lease.active();
+        if self.active != Some(active)
+            || self.node(active.node)?.state != NodeState::Active
+            || self.tables[active.node.slot].is_some()
+            || lease.table().id().owner() != active.node
+        {
+            return Err(Error::Association);
+        }
+        self.tables[active.node.slot] = Some(lease.into_table());
+        Ok(())
     }
     pub fn active(&self) -> Option<ActiveContext> {
         self.active
@@ -163,6 +209,7 @@ impl Nodes {
             slot,
             generation: self.node_generations[slot],
         };
+        self.tables[slot] = Some(crate::capability::Table::new(id));
         self.nodes[slot] = Some(Node {
             id,
             state: NodeState::Created,
@@ -406,7 +453,7 @@ impl Nodes {
         Ok(active)
     }
     pub fn complete(&mut self, active: ActiveContext, outcome: ExitReason) -> Result<()> {
-        if self.active != Some(active) {
+        if self.active != Some(active) || self.tables[active.node.slot].is_none() {
             return Err(Error::Association);
         }
         let mut t = self.thread(active.thread)?;
@@ -447,6 +494,10 @@ impl Nodes {
         };
         if !live {
             n.outcome = Some(outcome);
+            self.tables[n.id.slot]
+                .as_mut()
+                .ok_or(Error::InUse)?
+                .terminate();
         }
         self.nodes[n.id.slot] = Some(n);
         self.active = None;
@@ -532,7 +583,7 @@ impl Nodes {
         self.suspend_context(active, SavedContext::yielded(active, stack, frame))
     }
     pub fn suspend_context(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
-        if self.active != Some(active) {
+        if self.active != Some(active) || self.tables[active.node.slot].is_none() {
             return Err(Error::Association);
         }
         let mut t = self.thread(active.thread)?;
@@ -574,6 +625,10 @@ impl Nodes {
         }
         n.state = NodeState::Exited;
         n.outcome = Some(ExitReason::ConstructionFailure);
+        self.tables[id.slot]
+            .as_mut()
+            .ok_or(Error::InUse)?
+            .terminate();
         for t in self.threads.iter_mut().flatten().filter(|t| t.node == id) {
             t.state = ThreadState::Exited;
             t.outcome = n.outcome;
@@ -616,6 +671,10 @@ impl Nodes {
         }) {
             return Err(Error::InUse);
         }
+        if !self.authority(id)?.is_empty() {
+            return Err(Error::InUse);
+        }
+        self.tables[id.slot] = None;
         for t in self.threads.iter_mut().flatten().filter(|t| t.node == id) {
             t.state = ThreadState::Reclaimed;
         }

@@ -13,3 +13,5 @@ pub mod context;
 pub mod scheduler;
 
 pub mod preemption;
+
+pub mod capability;

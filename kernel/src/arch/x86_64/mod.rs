@@ -83,3 +83,6 @@ pub fn valid_boot_range(address: usize, length: usize, alignment: usize) -> bool
         && length != 0
         && address.checked_add(length - 1).is_some()
 }
+
+#[cfg(feature = "cap-test")]
+pub mod capabilities;

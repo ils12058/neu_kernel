@@ -157,3 +157,15 @@ fault cancellation. It revises the scoped pinned-stack mutation rule with an
 exclusive inactive-Thread edit proof and a checked cleanup receipt. Public
 creation, capability authority, SMP and full scheduling proposals remain open.
 Earlier ADR rationale is preserved through dated extensions.
+
+
+## Phase 5A record
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0015: Node-local capabilities and typed objects](0015-node-local-capabilities-and-typed-objects.md) | Accepted, fixed test objects, Node-local authority, private scalar requests | NEU-005/006/007/009; NEU-008/011; NEU-021/023/024 |
+
+ADR 0015 implements the initial typed lookup/rights/close foundation, explicit
+bootstrap grants and safe reference lifetimes shared by a Node's Threads. It does
+not accept transfer, public derivation/attenuation, revocation or unrestricted
+factories. Earlier rationale remains in place with dated extensions.

@@ -1,5 +1,385 @@
 # Neu Kernel implementation status
 
+**Verified:** 2026-10-26. **Milestone:** K5 / Phase 5A, Node-local capability
+and authorization foundation. **Result: 113 host tests and 90 QEMU
+scenarios pass**, plus nine repeats and four clean-build QMP boots; evidence and
+limits are recorded below. This is a
+bounded, single-CPU trusted-bootstrap implementation, not a public capability ABI.
+The starting tree was clean on `main` at
+[`ba47cbb`](https://github.com/ils12058/neu_kernel/commit/ba47cbbd93488332a15b1e2106355e18d8c60a71).
+The 87 host baseline tests were rerun before edits; the preceding successful
+83-case QEMU report was retained as `build/phase5a-baseline-qemu.json`. Full
+regressions are rerun after implementation. Architecture v0.2 remains unchanged:
+SHA-256 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`.
+Rust 1.95.0, Limine 12.9.4/base 6, the UEFI/OVMF hashes, QEMU 11.0.0 TCG/q35,
+one vCPU/512 MiB and all dependencies remain unchanged. No packages were installed.
+
+**Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
+
+## Phase 5A files
+
+Created:
+
+- `kernel/src/capability.rs`: actual fixed object registry, typed identities,
+  Node-local tables, rights, reference/pin guards, close and movable table lease.
+- `kernel/src/capability/tests.rs`: 26 host tests of those same production methods,
+  including real Node/Thread/FIFO integration and negative mixed caller bindings.
+- `kernel/src/arch/x86_64/capabilities.rs`: explicit bootstrap grants, exclusive
+  native lease ownership, scalar request dispatch, operation/cleanup records and
+  actual object-value observation points.
+- `kernel/src/arch/x86_64/capabilities.S`: sealed userspace authorization/interleaving
+  script and bounded supervisor observation hold.
+- [ADR 0015](adr/0015-node-local-capabilities-and-typed-objects.md): rationale,
+  alternatives, ownership, close/lifetime semantics and deferred authority APIs.
+
+Modified:
+
+- `kernel/src/node.rs`, `lib.rs`: every created Node owns one non-copyable table;
+  lease admission checks the full active binding, lease return precedes execution
+  changes, terminal tables reject new grants/lookups and reclamation requires empty
+  unleased authority.
+- `kernel/src/arch/x86_64/multithread.rs` and `.S`: reuse the three-Thread profile
+  for shared authority, deterministic scalar phase ordering, trusted regrant,
+  surviving-Thread authority, fault cancellation and Node cleanup.
+- `kernel/src/arch/x86_64/native.rs` and `.S`, `preemptive.rs`: feature-gated scalar
+  dispatch from trusted native state and publication checks; a separate image
+  proves a private capability operation is unsupported without capability support.
+- `kernel/src/arch/x86_64/paging.rs`: common-root fixture control words only;
+  capability handles do not map memory or expose page-frame identities.
+- `kernel/src/arch/x86_64/cooperative.rs`, `interrupts.rs`, `mod.rs`, `main.rs` and
+  `kernel/Cargo.toml`: isolated images and bounded observation holds. IRQ handling
+  never accesses capability state.
+- `kernel/src/syscall.rs`: the existing dispatch test now also checks all six
+  private capability numbers return NOT_SUPPORTED in the unchanged scalar dispatcher.
+- `tools/neu.py`: seven additional scenarios, real native/object CPU observations,
+  independent authorization/reference replay and exact final accounting.
+- `README.md`, this status, ADR index and dated extensions to ADRs 0009/0010/0014.
+
+No existing execution profile or public-looking ABI operation is removed. The
+older 87 host test names and 83 QEMU feature bindings remain. The implementation
+below is authoritative for Phase 5A; retained earlier measurements follow it.
+
+## Tables, identities and rights
+
+`Nodes::create` constructs an empty eight-slot `Table` bound to the exact NodeId,
+including its generation. `TableId` is a distinct Rust type wrapping that owner;
+its diagnostic integer may equal the Node's number. A1/A2 borrow the same authority
+through their owning Node. ThreadId never indexes authority. B1's table is separate.
+No userspace operation accepts a NodeId or object ID as an authority selector.
+
+A handle is opaque `u64`: upper 32 bits are a nonzero generation; lower 32 bits
+are slot+1, in 1..=8. Zero, malformed generation, out-of-range and unallocated
+slots fail. Close removes the entry; reuse increments the slot generation. A slot
+at `u32::MAX` is never reused, so generation wrap cannot revive an old handle.
+A new Node generation receives a distinct table identity; equal numeric handles
+in separate tables are expected and resolve only within their respective owners.
+Handle secrecy is not a protection boundary. Lookup and close always operate on
+the local entry when a foreign numeric handle happens to collide with a valid
+local one; owner-mismatched table access is rejected.
+
+Each private entry contains an object identity, object type and rights. The
+four-slot `Objects` registry stores actual `TestCounter(u64)` and `TestFlag(bool)`
+values, reference counts, operation pins and nonwrapping generation metadata.
+Object identities bind slot, generation and type. They are kernel-only tokens,
+not pointers or allocator identities and not accepted as userspace handles.
+Entry/type validation checks both the registry's actual type and requested type.
+
+| Test object | Valid rights | Supported mechanism |
+| --- | --- | --- |
+| TestCounter | READ=1, WRITE=2, READ\|WRITE=3 | Read, write, exchange requiring both rights |
+| TestFlag | READ=1 | Typed boolean read; Counter operations reject it |
+
+Zero or unknown rights bits and Flag WRITE grants fail before publication.
+WRITE does not imply READ. A lookup guard receives exactly the requested rights,
+so even a READ lookup through an RW handle cannot subsequently write. There is
+no universal ADMIN right, user factory, transfer, derivation or attenuation API.
+
+Bootstrap creates Counter A=10, Counter B=200, Flag=true and a sole-reference
+Counter=9. A explicitly receives RW/RO/WO handles to Counter A, a READ handle to
+Flag, and a READ handle to the sole counter (five handles). B receives one RW
+handle to Counter B. Four trusted creator references are explicitly released
+once the grants are installed: four live objects, six handle references, zero
+pins. Separate RO/WO grants are test coverage, not public capability derivation.
+
+## Lookup, close and object lifetime
+
+Lookup validates table ownership, handle fields/generation, live typed object,
+requested type and all required rights before access. It returns a borrowed
+`Guard` holding exclusive registry access and a pin on that exact generation.
+Only typed scalar operations are exposed; no arbitrary mutable registry reference
+escapes. The guard cannot outlive storage, and checked methods cannot amplify
+its rights. Lookup failure returns zero scalar output to userspace.
+
+An `ObjectRef` owns a trusted creator reference; each installed entry owns another
+reference. Neither creator tokens, tables nor execution leases are Copy/Clone.
+Close invalidates one handle and releases its reference. Double/stale close fails;
+independent handles remain valid. Last-reference collection requires refs=0 and
+pins=0. A successful read-close operation demonstrates refs=0/pins=1 while the
+already authorized guard reads value 9; dropping the guard then reclaims the object.
+No slot can be recycled while a pin retains that generation.
+
+Closing is not revocation. It does not invalidate other grants, descendants or
+mappings. There are no derivation trees or capability-created mappings here.
+Node-shared user data and its atomic workload are separate from supervisor-only
+TestCounter storage. Closing a test handle does not unmap user memory.
+
+Grant first validates identity, rights, free slot and reference overflow, then
+commits reference retention and the slot generation/entry in one non-preemptible
+transaction. Failed grant and object-pool exhaustion leave accounting and
+unpublished generations unchanged. Successful temporary grants followed by close
+consume generations permanently. The rollback image fills A's last three slots,
+rejects a ninth grant, rejects a fifth object and invalid Flag rights, then closes
+the temporary entries and restores the original references. Those three slots
+correctly remain at generation 1; the later guessed closed slot is stale rather
+than never allocated. No generation is rolled backward to simulate rollback.
+
+## Native caller and serialization contract
+
+Before every capability slice, `Nodes::take_authority` validates Running Thread,
+active NodeId/ThreadId, exact ThreadContext/SpaceId/root and Node state, then moves
+the actual table into a non-copyable `Lease`. The controller retains no mutable
+table reference. The separate native storage owns it during execution. Every
+request matches that lease against the trusted native session, published IRQ
+binding, current CR3, entry-stack ownership and TSS.RSP0. An unchecked userspace
+argument never chooses the authority domain. The fixture deliberately puts Node
+A's diagnostic number in R9 even on B1's calls; it remains an ignored scalar.
+
+The lease returns to `Nodes` after common-stack/root restoration and before any
+FIFO suspension or Thread completion. The model rejects those transitions while
+the table is leased. This ownership movement avoids borrowing the controller's
+suspended mutable Nodes/Paging state from a native handler.
+
+All capability operations run with IF=0 on one CPU. A concrete `UnsafeCell<State>`
+wrapper has an explicit single-CPU/non-reentrant execution argument, an atomic
+exclusive-borrow gate and a closure interface that cannot return borrowed storage.
+The assembly native guard, immutable active binding and separate fatal IST policy
+remain. No IRQ handler accesses this registry or mutates capability tables;
+requests never occur inside IRQ handoff. This is a serialization boundary, not an
+SMP-safe concurrent table design or a generally preemptible kernel.
+
+Private operations exist only in `cap-test` images:
+
+| Private test number | Meaning / scalar arguments |
+| --- | --- |
+| `0xfffffffffffffd00` | Counter read: RDI=handle |
+| `0xfffffffffffffd01` | Counter write: RDI=handle, RSI=value |
+| `0xfffffffffffffd02` | Close one handle |
+| `0xfffffffffffffd03` | Counter exchange, requiring READ\|WRITE |
+| `0xfffffffffffffd04` | Typed Flag read |
+| `0xfffffffffffffd05` | Authorized read-close lifetime test |
+
+RAX is status and RDX scalar output; all failed requests return RDX=0. Private
+handle/stale/rights/type errors are -16/-17/-18/-19. Other internal failures have
+separate typed errors. These are test definitions, not reserved production ABI.
+`abi_query=1`, `thread_exit=2`, ABI 0.1 and result `0x100000003` are unchanged.
+The capability-disabled image runs a genuine Ring 3 request for fd00 and observes
+NOT_SUPPORTED=-1 through the original native boundary. No pointer-copy API is added.
+
+## Interleaving, exit and cleanup
+
+The FIFO still selects A1/B1/A2, with actual LAPIC user IRQs and complete saved
+integer contexts. The sealed script uses Node-owned aligned scalar phase words
+for test ordering; those words never confer kernel authority. Its operations run
+through native SYSCALL and return validation, not synthetic yields.
+
+1. A1 reads 10, checks invalid/rights/type failures, writes 20 and read-closes the
+   sole counter. B1's same numeric RW handle reads its own 200, then writes 300.
+2. A2 reads A's 20 through the shared RW handle, exchanges it for 40 and reads
+   through the independent RO handle.
+3. A1 closes RW handle `0x100000001`; A2's subsequent lookup fails stale. RO still
+   reads 40; WO writes 50 and RO observes 50.
+4. At the common inactive boundary, a fixed owner/value/rights grant preauthorized
+   by bootstrap requires the recorded successful close, pinned last-reference read
+   and stale lookup. Trusted code then recycles the freed
+   sole-counter object slot to a new Counter=77 and the closed RW handle slot to
+   generation 2 (`0x200000001`). These are independent slot lifetimes. A2's old
+   handle still fails; the new handle works, reaches 99, and RO still reads the
+   separate original counter's 50.
+5. After A1's normal exit, A2 still reads RO=50 and new RW=99, writes/reads 111,
+   closes the new handle, gets stale on reuse and still reads RO=50. B stays at 300.
+
+Fault variants instead trigger an actual #UD in A1, A2 or B1 after this initial
+shared-authority protocol. The existing Node-wide cancellation discards live
+siblings' saved/queued execution. A healthy Node keeps its table and values.
+
+A normal Thread exit retains its Node table while a sibling lives. Terminal Node
+state disables new lookup/grant before cleanup. After native/IRQ ownership ends,
+execution references are canceled and terminal stacks are retired, drain that
+Node's remaining handles under common CR3/IF=0, then destroy its shared root and
+reclaim metadata. Unleased empty authority is a model reclamation prerequisite.
+The object registry is independent of user page tables. Final counts must be
+objects=0, references=0, pins=0, leases=0, alongside the existing exact frame/table
+baseline, empty FIFO and quiescent interrupt controller.
+
+## CPU and authorization evidence
+
+The host independently replays every actual native request against expected
+Node tables, handle/object generations, typed rights, values and reference counts.
+It matches the operation, handle, user RIP/RSP and returned RAX/RDX against native
+entry/return records. Actual QMP observations cover valid reads in all three
+Threads, wrong rights/type, stale handle, recycled generation, read-close's last
+reference and A2's retained authority after A1 exit where applicable.
+
+At those probes QMP stops and rereads the CPU: CPL=0, CS=8/SS=0x10, IF=0, selected
+CR3/private stack/TSS and busy native guard. It reads the real Ring 3 frame at
+entry-stack top-160, including R9's deliberately wrong authority selector. It
+walks the supervisor RW/NX registry/witness pages and reads the actual registry
+value at the guarded address, comparing type/value/references/pins. Raw addresses
+in these developer diagnostics are not returned to userspace or used as handles.
+
+A running CPU snapshot is only a probe-location hint; every assertion uses a
+stopped and reread coherent CPU. New capability profiles walk static hierarchies
+on first observation and again when stack-lifetime epochs change. Per-dispatch
+CPU, complete restore/IRQ frames, TSS, markers, actual shared atomic totals and
+native object probes remain observed. Earlier profiles retain their original
+per-dispatch hierarchy checks. Bounded probe holds are shorter in capability
+images; the per-guest deadline remains 30 seconds.
+
+Unlike the original CPU-only workload, a capability script can finish its last
+native transaction before another no-peer interrupt. New capability cases do not
+require an extra no-peer event after that transaction. The original Phase 4D
+scenarios retain that coverage requirement; every delivered IRQ, including any
+no-peer event, still has strict CPU-frame/ISR/EOI/accounting checks. No software
+interrupt or cooperative yield counts as successful preemption.
+
+## Security limits and next scope
+
+The accepted foundation covers fixed test objects and trusted bootstrap grants,
+not capability authority over every existing kernel mechanism. Test-object values,
+rights and lifetimes are real, but no MemoryObject, Channel, NodeFactory or
+ResourcePool implementation is implied. Existing ABI query/self-exit behavior is
+preserved. The fixed bounds are two Nodes, three Threads, eight handles per Node,
+four objects and 96 developer trace records; data/mapping/table pools remain
+16/64/64. Trace exhaustion is a test failure, not a production event-log policy.
+
+No public creation, derivation, attenuation, transfer, revocation, cross-Node
+sharing, pointer-copy API, ELF loading, device delegation, heap, SMP, TLS/SIMD or
+general kernel preemption is added. Kernel/privileged corruption and unsupported
+nested critical events retain fail-stop policy. QEMU evidence is not physical
+hardware or hosted-CI validation. Generation checks establish reference validity;
+they do not implement future revocation semantics.
+
+Recommended **K5B**: define the versioned minimal capability ABI and authority
+bootstrap contract for a narrowly selected real kernel object, with typed rights,
+close/ownership accounting and denial tests. Carry forward the lease/reference
+rules before exposing more authority. Keep IPC transfer, derivation and revocation
+as separate decisions; no future ADR placeholder or speculative subsystem is added.
+
+## Phase 5A actual validation results
+
+**Result: 113 host tests and 90 QEMU scenarios pass**, preserving all previous
+87/83 regressions. All supplied acceptance criteria are met within this bounded
+single-CPU profile. The full suite, final checks, focused cases, repeats and
+clean-image boots used the same 30-second guest deadline.
+
+| Check | Actual result |
+| --- | --- |
+| `make doctor` | Pass; the existing Rust/Cargo, Python, QEMU and OVMF identities |
+| `make check` | Pass, including the final source: formatting and Clippy with warnings denied across 90 kernel configurations and the host library |
+| Python syntax / diff | `python3 -m py_compile tools/neu.py` and `git diff --check` pass |
+| `make build` | Pass; ordinary EFI artifact, ELF64/x86-64, four LOAD segments |
+| Host | **113 pass**: original 87 + 26 capability/object/Node integration tests |
+| QEMU full suite | **90 pass**: original 83 + six capability images + one capability-disabled native image |
+| Focused pass | All seven new images pass actual CPU/frame/object and authorization verification |
+| Repeated interleavings | **9 pass**: three rounds each of normal, xAPIC and A2-fault capability scheduling |
+| Clean-directory builds | **4 pass**: separate empty target directories for boot, capability, xAPIC capability and rollback images |
+| Clean-image QMP boots | **4 pass**: all four independently built images pass their normal CPU/accounting oracles |
+
+| Added image | Full-suite seconds | Requests / native object snapshots | Demonstrated outcome |
+| --- | --- | --- | --- |
+| `capabilities` | 19.406 | 41 / 9 | Shared A authority, isolated B, all error classes, close/reuse and post-A1-exit use |
+| `capabilities-xapic` | 29.869 | 41 / 9 | Same authorization protocol with private UC xAPIC views and actual MMIO timer delivery |
+| `capabilities-a-fault` | 17.398 | 34 / 8 | A1 #UD cancels A2, drains A handles and preserves B's counter/authority |
+| `capabilities-a2-fault` | 16.866 | 34 / 8 | A2 #UD cancels A1, drains A handles and preserves B |
+| `capabilities-b-fault` | 18.128 | 40 / 9 | B1 #UD cleans B only; A1/A2 complete and A2 uses authority after A1 exit |
+| `capabilities-rollback` | 15.405 | 41 / 9 | Full table/object pool and bad-right grant fail without partial publication or reference leaks |
+| `native-cap-disabled` | 3.377 | Existing native observations | fd00 returns NOT_SUPPORTED; query/exit/version/features remain unchanged |
+
+The full normal run made 47 selections and copied 44 real user IRQ contexts.
+There were 45 timer ticks/45 EOIs, including one separately counted kernel drain.
+No extra no-peer event occurred after the final script transaction; the original
+Phase 4D cases continue to require that independent coverage. Final normal,
+xAPIC and fault images restored allocated=7/free=118228/tables=7; the rollback
+image restored its own allocated=7/free=118225/tables=7 baseline. Object accounting
+was zero in every capability case, FIFO empty, no active/leased/saved continuation,
+native state cleared and LAPIC masked/stopped/drained before the controlled halt.
+
+Representative actual native probes from that full normal run follow. IDs are
+supervisor diagnostic identities, never user-visible object selectors. Every row
+has an actual CPL=0 CPU sample and matching original Ring 3 entry frame; successful
+reads/pins are checked against the real registry value storage through QMP.
+
+| Request / member | Handle | Status / scalar | Registry object | References / pins during probe |
+| --- | --- | --- | --- | --- |
+| 1 / A1 | `0x100000001` | 0 / 10 | Counter `0x10000000101` | 3 / 1 |
+| 2 / B1 | same number | 0 / 200 | Different Counter `0x10000000102` | 1 / 1 |
+| 3 / A1 | RO `0x100000002`, write | -18 / 0; actual value remains 10 | Counter A | 3 / 0 |
+| 8 / A1 | Flag `0x100000004`, Counter read | -19 / 0; actual Flag remains true | `0x20000000103` | 1 / 0 |
+| 17 / A1 | Sole `0x100000005`, read-close | 0 / 9 | Counter `0x10000000104` | **0 / 1** |
+| 19 / A2 | `0x100000001` | 0 / 20 | Same Counter A as A1 | 3 / 1 |
+| 24 / A2 | Closed `0x100000001` | -17 / 0 | No object resolved | 0 / 0 |
+| 29 / A2 | Recycled `0x200000001` | 0 / 77 | New generation `0x10000000204` | 1 / 1 |
+| 35 / A2 | Same recycled handle after A1 exit | 0 / 99 | Same new Counter | 1 / 1 |
+
+A1/A2 used CR3 `0xc000` with distinct actual TSS.RSP0 values
+`0xffffc00000003000` / `0xffffc0000000b000`; B1 used CR3 `0x1b000` and
+`0xffffc00000007000`. Counter A's observed value address was
+`0xffffffff80071c28`, shared by A1/A2 requests; B's was `0xffffffff80071c48`.
+The sole counter's `0xffffffff80071c88` address was reused only with a new object
+generation after its pin ended. All are actual supervisor-only RW/NX registry
+storage, distinct from user shared-counter VA `0x402000`. Numbers and durations
+are observations, not stable ABI values, hard-real-time or physical-hardware claims.
+
+Repeat durations were 20.793/19.378/20.628 s for normal capability scheduling,
+29.858/28.061/28.089 s for xAPIC and 15.818/16.838/16.810 s for A2 fault cleanup.
+Fresh-image boot durations were 1.729/20.602/29.750/15.395 s for boot/normal/xAPIC/
+rollback. Tick/drain counts varied while identities, returned values, reference
+accounting and cleanup remained correct. No repeat required a relaxed timeout or
+source change. The longest full-suite guest was the xAPIC capability case at
+29.869 s; these instrumented runs have limited deadline margin on this host.
+
+During bring-up, full serial completion was not accepted as capability evidence
+until the CPU/object oracle existed. Incorrect marker ordering and a linker-elided
+size diagnostic were corrected. Excess stop/continue polling and long debug holds
+hit the deadline; running-location hints, coherent stopped captures, category-scoped
+native holds and hierarchy caching by lifetime epoch removed that overhead. A
+short restore hold missed a required frame and was increased; that assertion
+remains required. An experimental extra terminal busy loop exceeded the test
+controller's dispatch bound and was removed. The new script can finish before an
+additional no-peer IRQ, so its oracle checks safe termination while retaining the
+original profiles' explicit no-peer coverage. These failed attempts were not
+counted as passes. This did not widen kernel preemption or alter clockevent policy.
+
+Reproduction:
+
+```sh
+make doctor
+make check
+make build
+make test
+python3 tools/neu.py test --case capabilities
+python3 tools/neu.py test --case capabilities-xapic
+python3 tools/neu.py test --case capabilities-a2-fault
+python3 tools/neu.py test --case capabilities-rollback
+python3 tools/neu.py test --case native-cap-disabled
+```
+
+`build/phase5a-doctor.log`, `phase5a-check.log`, `phase5a-build.log` and
+`phase5a-test.log` retain command output. `build/test-results.json` has all 90 cases;
+`build/test-logs/<case>.json` retains actual CPU/restore/IRQ/native/object snapshots
+and independent authorization results. `build/phase5a-focused.json` retains the
+seven-case focused pass. Supplemental local procedures/results are in
+`build/phase5a-repeat.py`, `build/phase5a-repeat/results.json`,
+`build/phase5a-cold.py`, `build/phase5a-cold/builds.json`,
+`build/phase5a-cold-qmp.py` and `build/phase5a-cold/qmp-results.json`.
+These are ignored build artifacts, not committed CI or physical-hardware evidence.
+
+## Retained Phase 4D and earlier implementation references
+
+The following material preserves earlier profiles, layouts and measurements.
+Statements about absent capability support describe those historical profiles;
+the current bounded authorization foundation is specified above.
+
 **Verified:** 2026-10-26. **Milestone:** K4 / Phase 4D, multiple preemptible
 Threads in one Node, trusted bootstrap on one CPU. **Result: 87 host tests and
 83 QEMU scenarios pass**, including all previous 72/71 regressions. The implementation and

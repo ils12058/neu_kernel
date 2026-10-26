@@ -16,11 +16,13 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("multithread.S"));
+global_asm!(include_str!("capabilities.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
     static neu_multi_syscall_resume: u8;
+    #[cfg(feature = "cap-test")]
+    static neu_cap_syscall_resume: u8;
     static neu_multi_after_atomic: u8;
     static neu_multi_after_inc: u8;
 }
@@ -42,7 +44,16 @@ pub fn return_contract(root: u64, context: ThreadContext) -> ReturnContract {
         code_end: site(ptr::addr_of!(neu_multi_payload_end)),
         stack_start: base,
         stack_end: base + PAGE,
-        resumes: [site(ptr::addr_of!(neu_multi_syscall_resume)); 2],
+        resumes: [site(ptr::addr_of!(neu_multi_syscall_resume)), {
+            #[cfg(feature = "cap-test")]
+            {
+                site(ptr::addr_of!(neu_cap_syscall_resume))
+            }
+            #[cfg(not(feature = "cap-test"))]
+            {
+                site(ptr::addr_of!(neu_multi_syscall_resume))
+            }
+        }],
     }
 }
 fn check<T>(result: node::Result<T>) -> Result<T> {
@@ -409,7 +420,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let (mut a, mut a1) = create(paging, &mut nodes, 1, 0)?;
     let (mut b, mut b1) = create(paging, &mut nodes, 3, 1)?;
     let actions = [
-        if cfg!(feature = "test-threads-a1-fault") {
+        if cfg!(feature = "test-threads-a1-fault") || cfg!(feature = "test-capabilities-a-fault") {
             1
         } else if cfg!(feature = "test-threads-a-cross") {
             2
@@ -418,14 +429,14 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         } else {
             0
         },
-        if cfg!(feature = "test-threads-a2-fault") {
+        if cfg!(feature = "test-threads-a2-fault") || cfg!(feature = "test-capabilities-a2-fault") {
             1
         } else if cfg!(feature = "test-threads-user-guard") {
             5
         } else {
             0
         },
-        if cfg!(feature = "test-threads-b-fault") {
+        if cfg!(feature = "test-threads-b-fault") || cfg!(feature = "test-capabilities-b-fault") {
             1
         } else if cfg!(feature = "test-threads-cross") {
             3
@@ -440,6 +451,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     }
     let mut a2 = add_member(&mut nodes, &a, 2, 53, 2)?;
     install(paging, &mut nodes, &mut queue, &mut a, &mut a2, actions[1])?;
+    #[cfg(feature = "cap-test")]
+    super::capabilities::bootstrap(&mut nodes, a.id, b.id).map_err(|_| Error::Corrupt)?;
+    #[cfg(feature = "cap-test")]
+    let mut caps_ready = false;
     let mut members = [a1, a2, b1];
     let mut limited = [false; 3];
     let mut printed = 0;
@@ -492,7 +507,16 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         if reject {
             dispatch.saved.frame.context.rsp = members[0].active.context.rsp - 64;
         }
-        let event = match native::execute_slice(paging, space(owner_node)?, dispatch, 96) {
+        #[cfg(feature = "cap-test")]
+        super::capabilities::enter(check(nodes.take_authority(active))?)
+            .map_err(|_| Error::Corrupt)?;
+        let execution = native::execute_slice(paging, space(owner_node)?, dispatch, 96);
+        #[cfg(feature = "cap-test")]
+        check(
+            nodes
+                .restore_authority(super::capabilities::leave(active).map_err(|_| Error::Corrupt)?),
+        )?;
+        let event = match execution {
             Ok(event) if !reject => event,
             Err(Error::Flags) if reject => {
                 preemptive::terminal(publication)?;
@@ -530,13 +554,34 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                 let count = committed(words[offset], Some(frame))?;
                 serial::write(format_args!("[NEU] Multi progress: label={} captures={} stored={} committed={} boots={} total={}\n",members[index].label,members[index].preemptions,words[offset],count,words[offset+2],words[0])).map_err(|_|Error::Corrupt)?;
                 audit(paging, owner_node, &members)?;
+                #[cfg(feature = "cap-test")]
+                if !caps_ready {
+                    let phase = paging.member_cap_words(space(&a)?)?[0];
+                    if phase == 4 {
+                        let handle = super::capabilities::regrant(&mut nodes, a.id)
+                            .map_err(|_| Error::Corrupt)?;
+                        paging.member_cap_write(space(&a)?, 2, handle)?;
+                        paging.member_cap_write(space(&a)?, 0, 5)?;
+                    } else if phase == 6 {
+                        caps_ready = true;
+                    }
+                }
                 let faulting = actions.iter().position(|action| *action != 0);
                 let early = if let Some(fault) = faulting {
                     index == fault
                 } else {
                     index == 0
                 };
-                if early && members[index].preemptions >= 4 && !limited[index] {
+                if early && members[index].preemptions >= 4 && !limited[index] && {
+                    #[cfg(feature = "cap-test")]
+                    {
+                        caps_ready
+                    }
+                    #[cfg(not(feature = "cap-test"))]
+                    {
+                        true
+                    }
+                } {
                     paging.member_limit(
                         space(owner_node)?,
                         members[index].label,
@@ -609,6 +654,9 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     if paging.member_pins(space(domain)?)? != 0 {
                         return Err(Error::InUse);
                     }
+                    #[cfg(feature = "cap-test")]
+                    super::capabilities::cleanup(&mut nodes, domain.id)
+                        .map_err(|_| Error::Corrupt)?;
                     let s = domain.space.take().ok_or(Error::NotOwned)?;
                     let id = s.id();
                     paging.destroy_user(s)?;
@@ -667,6 +715,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     {
         return Err(Error::Corrupt);
     }
+    #[cfg(feature = "cap-test")]
+    super::capabilities::finish().map_err(|_| Error::Corrupt)?;
     let captures = preemptive::stop(paging)?;
     if paging.stats() != before || paging.table_count() != tables {
         return Err(Error::Corrupt);

@@ -104,3 +104,15 @@ API. Kernel corruption and unsupported nested critical events remain fail-stop.
 - **2026-10-26:** Chosen for Phase 4D before implementation. Earlier ADR rationale
   and architecture v0.2 remain intact. Actual verification and limitations belong
   in [implementation status](../IMPLEMENTATION_STATUS.md).
+
+
+### 2026-10-26 — Phase 5A extension
+
+[ADR 0015](0015-node-local-capabilities-and-typed-objects.md) adds one generation-bound
+Node-local table and concrete typed test objects with explicit READ/WRITE grants.
+A movable execution lease preserves shared Node authority without borrowing the
+controller's suspended mutable model from native handlers. Close invalidates one
+handle; pins retain already authorized operations, and terminal Node cleanup
+releases remaining references. ABI 0.1 remains unchanged; private capability test
+operations are feature-gated. Public creation, transfer, derivation and revocation
+remain deferred. The historical scope and rationale above are preserved.

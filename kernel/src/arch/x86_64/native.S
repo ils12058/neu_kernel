@@ -193,7 +193,11 @@ neu_native_after_wait_end:
     je 3f
     jmp 5f
 2:
-    mov rax, -1
+    .if {cap_disabled}
+    mov rax,0xfffffffffffffd00
+    .else
+    mov rax,-1
+    .endif
     call neu_native_invoke
     cmp rax, {unsupported}
     jne neu_native_failed
