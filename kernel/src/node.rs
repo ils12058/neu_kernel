@@ -166,6 +166,46 @@ impl Nodes {
         let table = self.tables[active.node.slot].take().ok_or(Error::InUse)?;
         Ok(crate::capability::Lease::new(active, table))
     }
+    /// Trusted initial bootstrap only; both actual tables remain exclusively
+    /// borrowed here and no native execution may hold a lease.
+    pub fn bootstrap_channel(
+        &mut self,
+        objects: &mut crate::capability::Objects,
+        a: NodeId,
+        b: NodeId,
+    ) -> crate::capability::Result<()> {
+        use crate::capability::Error as C;
+        if a == b {
+            return Err(C::Owner);
+        }
+        for id in [a, b] {
+            let n = self.node(id).map_err(|_| C::Owner)?;
+            if !matches!(
+                n.state,
+                NodeState::Created | NodeState::Configuring | NodeState::Ready
+            ) {
+                return Err(C::InUse);
+            }
+            self.authority(id).map_err(|_| C::Owner)?;
+        }
+        if self.active.is_some() {
+            return Err(C::InUse);
+        }
+        let (a, b) = if a.slot < b.slot {
+            let (lo, hi) = self.tables.split_at_mut(b.slot);
+            (
+                lo[a.slot].as_mut().ok_or(C::InUse)?,
+                hi[0].as_mut().ok_or(C::InUse)?,
+            )
+        } else {
+            let (lo, hi) = self.tables.split_at_mut(a.slot);
+            (
+                hi[0].as_mut().ok_or(C::InUse)?,
+                lo[b.slot].as_mut().ok_or(C::InUse)?,
+            )
+        };
+        objects.install_channel(a, b)
+    }
     pub fn restore_authority(&mut self, lease: crate::capability::Lease) -> Result<()> {
         let active = lease.active();
         if self.active != Some(active)

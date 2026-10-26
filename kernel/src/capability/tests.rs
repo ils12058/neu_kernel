@@ -839,3 +839,410 @@ fn immutable_inspection_binding_rejects_wrong_node_thread_space_root_and_missing
     r.unpin_space(reference.id()).unwrap();
     r.release_space_ref(reference).unwrap();
 }
+
+fn channels() -> (Nodes, Objects, NodeId, NodeId) {
+    let (mut n, a, b) = owners();
+    let mut o = Objects::with_channels();
+    n.bootstrap_channel(&mut o, a, b).unwrap();
+    for id in [a, b] {
+        n.authority_mut(id).unwrap().seal_bootstrap();
+    }
+    (n, o, a, b)
+}
+fn endpoint(n: &Nodes, o: &Objects, node: NodeId, index: u64) -> Handle {
+    n.authority(node)
+        .unwrap()
+        .bootstrap_get(o, node, index)
+        .unwrap()
+}
+fn send(n: &Nodes, o: &mut Objects, node: NodeId, h: Handle, v: u64) -> Result<()> {
+    n.authority(node)
+        .unwrap()
+        .lookup(o, node, h, ObjectType::ChannelEndpoint, Rights::SEND)?
+        .channel_send(v)
+}
+fn receive(n: &Nodes, o: &mut Objects, node: NodeId, h: Handle) -> Result<u64> {
+    n.authority(node)
+        .unwrap()
+        .lookup(o, node, h, ObjectType::ChannelEndpoint, Rights::RECEIVE)?
+        .channel_receive()
+}
+#[test]
+fn typed_endpoint_caps_authorize_real_bidirectional_queue_operations() {
+    let (n, mut o, a, b) = channels();
+    let ah = endpoint(&n, &o, a, 4);
+    let bh = endpoint(&n, &o, b, 4);
+    assert_eq!(ah, bh);
+    assert_ne!(
+        n.authority(a).unwrap().describe(a, ah).unwrap().0,
+        n.authority(b).unwrap().describe(b, bh).unwrap().0
+    );
+    send(&n, &mut o, a, ah, 0).unwrap();
+    send(&n, &mut o, b, bh, u64::MAX).unwrap();
+    assert_eq!(receive(&n, &mut o, b, bh), Ok(0));
+    assert_eq!(receive(&n, &mut o, a, ah), Ok(u64::MAX));
+}
+#[test]
+fn send_and_receive_rights_are_independent_and_denials_preserve_messages() {
+    let (n, mut o, a, b) = channels();
+    let send_only = endpoint(&n, &o, a, 6);
+    let recv_only = endpoint(&n, &o, a, 7);
+    let bh = endpoint(&n, &o, b, 4);
+    send(&n, &mut o, b, bh, 7).unwrap();
+    let before = o.channel_state().snapshot();
+    assert_eq!(receive(&n, &mut o, a, send_only), Err(Error::Rights));
+    assert_eq!(send(&n, &mut o, a, recv_only, 9), Err(Error::Rights));
+    assert_eq!(o.channel_state().snapshot(), before);
+    assert_eq!(receive(&n, &mut o, a, recv_only), Ok(7));
+}
+#[test]
+fn wrong_types_and_malformed_rights_do_not_touch_channel_storage() {
+    let (mut n, mut o, a, _) = channels();
+    let c = o.counter(8).unwrap();
+    let h = n
+        .authority_mut(a)
+        .unwrap()
+        .grant(&mut o, &c, Rights::READ_WRITE)
+        .unwrap();
+    let before = o.channel_state().snapshot();
+    assert_eq!(send(&n, &mut o, a, h, 9), Err(Error::Type));
+    assert_eq!(receive(&n, &mut o, a, h), Err(Error::Type));
+    assert_eq!(o.channel_state().snapshot(), before);
+    for bits in [4, 8, 128, u64::MAX] {
+        assert_eq!(Rights::from_bits(bits), Err(Error::Rights));
+    }
+    for rights in [Rights::SEND, Rights::RECEIVE, Rights::SEND_RECEIVE] {
+        assert_eq!(
+            n.authority_mut(a).unwrap().grant(&mut o, &c, rights),
+            Err(Error::Rights)
+        );
+    }
+}
+#[test]
+fn closing_one_endpoint_handle_preserves_independent_authority_and_stale_close_is_inert() {
+    let (mut n, mut o, a, b) = channels();
+    let h = endpoint(&n, &o, a, 4);
+    let other = endpoint(&n, &o, a, 5);
+    let bh = endpoint(&n, &o, b, 4);
+    n.authority_mut(a).unwrap().close(&mut o, a, h).unwrap();
+    send(&n, &mut o, a, other, 19).unwrap();
+    let before = o.channel_state().snapshot();
+    assert_eq!(send(&n, &mut o, a, h, 20), Err(Error::Stale));
+    assert_eq!(
+        n.authority_mut(a).unwrap().close(&mut o, a, h),
+        Err(Error::Stale)
+    );
+    assert_eq!(o.channel_state().snapshot(), before);
+    assert_eq!(receive(&n, &mut o, b, bh), Ok(19));
+    assert_eq!(
+        n.authority(a).unwrap().bootstrap_get(&o, a, 4),
+        Err(Error::Stale)
+    );
+}
+#[test]
+fn final_close_waits_for_operation_pin_and_then_reports_peer_closed() {
+    let (mut n, mut o, a, b) = channels();
+    let h = endpoint(&n, &o, a, 4);
+    let bh = endpoint(&n, &o, b, 4);
+    for index in 5..8 {
+        let h = endpoint(&n, &o, a, index);
+        n.authority_mut(a).unwrap().close(&mut o, a, h).unwrap();
+    }
+    {
+        let t = n.authority_mut(a).unwrap();
+        let mut g = t
+            .lookup(&mut o, a, h, ObjectType::ChannelEndpoint, Rights::SEND)
+            .unwrap();
+        g.close_handle(t, h).unwrap();
+        assert_eq!(g.info().references, 0);
+        assert_eq!(g.info().pins, 1);
+        g.channel_send(17).unwrap();
+        assert_eq!(g.channel_snapshot()[2] != 0, true);
+    }
+    assert_eq!(receive(&n, &mut o, b, bh), Ok(17));
+    assert_eq!(receive(&n, &mut o, b, bh), Err(Error::PeerClosed));
+    assert_eq!(o.channel_state().stats().endpoints, 1);
+}
+#[test]
+fn node_termination_drain_preserves_healthy_peer_pending_messages() {
+    let (mut n, mut o, a, b) = channels();
+    let ah = endpoint(&n, &o, a, 4);
+    let bh = endpoint(&n, &o, b, 4);
+    send(&n, &mut o, a, ah, 41).unwrap();
+    send(&n, &mut o, b, bh, 42).unwrap();
+    n.authority_mut(a).unwrap().terminate();
+    assert_eq!(n.authority_mut(a).unwrap().drain(&mut o, a), Ok(4));
+    assert_eq!(receive(&n, &mut o, b, bh), Ok(41));
+    assert_eq!(receive(&n, &mut o, b, bh), Err(Error::PeerClosed));
+    assert_eq!(o.channel_state().snapshot()[20], 1);
+    n.authority_mut(b).unwrap().drain(&mut o, b).unwrap();
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+}
+#[test]
+fn endpoint_constructor_object_exhaustion_never_publishes_half_a_channel() {
+    let (mut n, a, b) = owners();
+    let mut o = Objects::with_channels();
+    let refs: [_; 5] = core::array::from_fn(|_| o.flag(true).unwrap());
+    let before = o.stats();
+    let snap = o.channel_state().snapshot();
+    let gens = o.slots.each_ref().map(|s| s.generation);
+    assert_eq!(n.bootstrap_channel(&mut o, a, b), Err(Error::Capacity));
+    assert_eq!(o.stats(), before);
+    assert_eq!(o.channel_state().snapshot(), snap);
+    assert_eq!(o.slots.each_ref().map(|s| s.generation), gens);
+    assert!(n.authority(a).unwrap().is_empty());
+    assert!(n.authority(b).unwrap().is_empty());
+    for r in refs {
+        o.release(r).unwrap();
+    }
+}
+#[test]
+fn endpoint_constructor_table_exhaustion_and_sealed_manifest_are_atomic() {
+    for sealed in [false, true] {
+        let (mut n, a, b) = owners();
+        let mut o = Objects::with_channels();
+        let r = o.flag(true).unwrap();
+        if sealed {
+            n.authority_mut(b).unwrap().seal_bootstrap();
+        } else {
+            for _ in 0..5 {
+                n.authority_mut(b)
+                    .unwrap()
+                    .grant(&mut o, &r, Rights::READ)
+                    .unwrap();
+            }
+        }
+        let before = o.stats();
+        let snap = o.channel_state().snapshot();
+        assert_eq!(
+            n.bootstrap_channel(&mut o, a, b),
+            Err(if sealed {
+                Error::InUse
+            } else {
+                Error::Capacity
+            })
+        );
+        assert_eq!(o.stats(), before);
+        assert_eq!(o.channel_state().snapshot(), snap);
+        assert!(n.authority(a).unwrap().is_empty());
+        assert_eq!(n.authority(a).unwrap().bootstrap_limit, 4);
+    }
+}
+#[test]
+fn channel_profile_preserves_legacy_pool_limit_and_original_manifest_range() {
+    let mut o = Objects::new();
+    let refs: [_; 4] = core::array::from_fn(|_| o.flag(true).unwrap());
+    assert_eq!(o.flag(false).err(), Some(Error::Capacity));
+    for r in refs {
+        o.release(r).unwrap();
+    }
+    let (n, o, a, _) = channels();
+    assert_eq!(
+        n.authority(a).unwrap().bootstrap_get(&o, a, 3),
+        Err(Error::Handle)
+    );
+    assert_eq!(
+        n.authority(a).unwrap().bootstrap_get(&o, a, 8),
+        Err(Error::Handle)
+    );
+}
+#[test]
+fn retired_endpoint_object_generations_and_handles_cannot_reach_a_new_pair() {
+    let (mut n, mut o, a, b) = channels();
+    let old = endpoint(&n, &o, a, 4);
+    let id = n.authority(a).unwrap().describe(a, old).unwrap().0;
+    for node in [a, b] {
+        n.authority_mut(node).unwrap().drain(&mut o, node).unwrap();
+    }
+    let mut fresh_a = Table::new(a);
+    let mut fresh_b = Table::new(b);
+    o.install_channel(&mut fresh_a, &mut fresh_b).unwrap();
+    fresh_a.seal_bootstrap();
+    fresh_b.seal_bootstrap();
+    let h = fresh_a.bootstrap_get(&o, a, 4).unwrap();
+    fresh_a
+        .lookup(&mut o, a, h, ObjectType::ChannelEndpoint, Rights::SEND)
+        .unwrap()
+        .channel_send(9)
+        .unwrap();
+    assert_eq!(o.info(id), Err(Error::Object));
+    assert_eq!(send(&n, &mut o, a, old, 1), Err(Error::Stale));
+}
+#[test]
+fn endpoint_grants_reject_other_node_owner_and_inappropriate_rights_atomically() {
+    let (mut n, a, b) = owners();
+    let mut o = Objects::with_channels();
+    n.bootstrap_channel(&mut o, a, b).unwrap();
+    let target = n.authority(a).unwrap().bootstrap[4].unwrap();
+    let id = n.authority(a).unwrap().describe(a, target).unwrap().0;
+    o.retain(id).unwrap();
+    let creator = ObjectRef { id };
+    let before = o.stats();
+    assert_eq!(
+        n.authority_mut(b)
+            .unwrap()
+            .grant(&mut o, &creator, Rights::SEND),
+        Err(Error::Owner)
+    );
+    for rights in [
+        Rights::NONE,
+        Rights::READ,
+        Rights::WRITE,
+        Rights::INSPECT,
+        Rights::from_bits(48).unwrap(),
+    ] {
+        assert_eq!(
+            n.authority_mut(a).unwrap().grant(&mut o, &creator, rights),
+            Err(Error::Rights)
+        );
+    }
+    assert_eq!(o.stats(), before);
+    o.release(creator).unwrap();
+}
+#[test]
+fn exhausted_endpoint_object_generation_cannot_partially_create_a_pair() {
+    let (mut n, a, b) = owners();
+    let mut o = Objects::with_channels();
+    let _refs: [_; 4] = core::array::from_fn(|_| o.flag(true).unwrap());
+    o.slots[4].generation = u32::MAX;
+    let before = o.stats();
+    let snapshot = o.channel_state().snapshot();
+    assert_eq!(n.bootstrap_channel(&mut o, a, b), Err(Error::Capacity));
+    assert_eq!(o.stats(), before);
+    assert_eq!(o.channel_state().snapshot(), snapshot);
+    assert!(n.authority(a).unwrap().is_empty());
+}
+#[test]
+fn full_real_address_space_profile_coexists_with_channel_and_releases_every_resource() {
+    let (mut n, a, b) = owners();
+    let mut r = Registry::new();
+    let mut o = Objects::with_channels();
+    let mut spaces = [crate::paging::SpaceId::KERNEL; 2];
+    for (i, node) in [a, b].into_iter().enumerate() {
+        let space = r.create_space().unwrap();
+        r.bind_root(space, 0x1000 * (i as u64 + 1)).unwrap();
+        spaces[i] = space;
+        n.configure(node).unwrap();
+        n.bind_space(node, space).unwrap();
+        let creator = o
+            .address_space(node, r.retain_space(space).unwrap())
+            .unwrap();
+        let flag = o.flag(true).unwrap();
+        let t = n.authority_mut(node).unwrap();
+        for (index, rights) in [
+            (0, Rights::INSPECT),
+            (1, Rights::INSPECT),
+            (2, Rights::NONE),
+        ] {
+            t.install_bootstrap(&mut o, &creator, rights, index)
+                .unwrap();
+        }
+        t.install_bootstrap(&mut o, &flag, Rights::READ, 3).unwrap();
+        o.release(creator).unwrap();
+        o.release(flag).unwrap();
+    }
+    n.bootstrap_channel(&mut o, a, b).unwrap();
+    assert_eq!(
+        o.stats(),
+        Stats {
+            live: 6,
+            references: 16,
+            pins: 0
+        }
+    );
+    assert_eq!(o.flag(false).err(), Some(Error::Capacity));
+    for node in [a, b] {
+        assert_eq!(n.authority(node).unwrap().len(), 8);
+        n.authority_mut(node).unwrap().seal_bootstrap();
+        n.authority_mut(node).unwrap().drain(&mut o, node).unwrap();
+    }
+    while let Some(reference) = o.reap_space() {
+        r.release_space_ref(reference).unwrap();
+    }
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+    for s in spaces {
+        assert_eq!(r.object_references(s), Ok(0));
+        assert_eq!(r.can_destroy_space(s), Ok(()));
+    }
+}
+#[test]
+fn bootstrap_channel_refuses_to_touch_a_running_nodes_execution_lease() {
+    let (mut n, _, mut q, ids) = runnable();
+    let a = n.thread(ids[0]).unwrap().node;
+    let b = n.thread(ids[2]).unwrap().node;
+    let mut o = Objects::with_channels();
+    let active = q.next(&mut n).unwrap().unwrap();
+    let lease = n.take_authority(active.active).unwrap();
+    let before = o.stats();
+    assert_eq!(n.bootstrap_channel(&mut o, a, b), Err(Error::InUse));
+    assert_eq!(o.stats(), before);
+    n.restore_authority(lease).unwrap();
+}
+#[test]
+fn channel_pool_exhaustion_preserves_existing_queued_payload_and_tables() {
+    let (n, mut o, a, b) = channels();
+    let h = endpoint(&n, &o, a, 4);
+    send(&n, &mut o, a, h, 31).unwrap();
+    let before = o.stats();
+    let snapshot = o.channel_state().snapshot();
+    let mut ta = Table::new(a);
+    let mut tb = Table::new(b);
+    assert_eq!(o.install_channel(&mut ta, &mut tb), Err(Error::Capacity));
+    assert_eq!(o.stats(), before);
+    assert_eq!(o.channel_state().snapshot(), snapshot);
+    assert!(ta.is_empty() && tb.is_empty());
+    assert_eq!(receive(&n, &mut o, b, h), Ok(31));
+}
+#[test]
+fn exhausted_handle_generations_cannot_partially_extend_the_manifest() {
+    let (mut n, a, b) = owners();
+    let mut o = Objects::with_channels();
+    for s in &mut n.authority_mut(a).unwrap().slots[..5] {
+        s.generation = u32::MAX;
+    }
+    let before = o.stats();
+    let snapshot = o.channel_state().snapshot();
+    assert_eq!(n.bootstrap_channel(&mut o, a, b), Err(Error::Capacity));
+    assert_eq!(o.stats(), before);
+    assert_eq!(o.channel_state().snapshot(), snapshot);
+    assert_eq!(n.authority(a).unwrap().bootstrap_limit, 4);
+}
+#[test]
+fn checked_guard_never_amplifies_combined_capability_beyond_requested_rights() {
+    let (n, mut o, a, _) = channels();
+    let h = endpoint(&n, &o, a, 4);
+    let before = o.channel_state().snapshot();
+    {
+        let mut g = n
+            .authority(a)
+            .unwrap()
+            .lookup(&mut o, a, h, ObjectType::ChannelEndpoint, Rights::SEND)
+            .unwrap();
+        assert_eq!(g.channel_receive(), Err(Error::Rights));
+    }
+    {
+        let mut g = n
+            .authority(a)
+            .unwrap()
+            .lookup(&mut o, a, h, ObjectType::ChannelEndpoint, Rights::RECEIVE)
+            .unwrap();
+        assert_eq!(g.channel_send(9), Err(Error::Rights));
+    }
+    assert_eq!(o.channel_state().snapshot(), before);
+    assert_eq!(o.stats().pins, 0);
+}
+#[test]
+fn opposite_node_table_cannot_close_another_tables_entry() {
+    let (mut n, mut o, a, b) = channels();
+    let h = endpoint(&n, &o, a, 4);
+    let before = o.stats();
+    assert_eq!(
+        n.authority_mut(a).unwrap().close(&mut o, b, h),
+        Err(Error::Owner)
+    );
+    assert_eq!(o.stats(), before);
+    send(&n, &mut o, a, h, 32).unwrap();
+    assert_eq!(receive(&n, &mut o, b, h), Ok(32));
+}

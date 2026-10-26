@@ -89,3 +89,6 @@ pub mod capabilities;
 
 #[cfg(feature = "abi-02")]
 pub mod address_space;
+
+#[cfg(feature = "channel-test")]
+pub mod ipc;

@@ -102,3 +102,12 @@ and close use a separate experimental ABI 0.2. TestCounter/TestFlag READ/WRITE,
 opaque generations and close-versus-revocation reasoning remain unchanged.
 The root token is reaped only after the native shared borrow and operation pins
 end. Transfer, derivation, attenuation and revocation are still deferred.
+
+### 2026-10-26 — Phase 5C extension
+
+[ADR 0017](0017-bounded-scalar-channel-endpoints.md) adds real ChannelEndpoint
+objects and object-specific SEND/RECEIVE rights. Legacy profiles keep their
+four-object allocation limit; the Channel profile has six slots and eight initial
+handles per Node. Endpoint tokens retire after final references and operation
+pins, with directional queue ownership independent of page-table roots. Original
+close-versus-revocation reasoning remains; capability transport is deferred.

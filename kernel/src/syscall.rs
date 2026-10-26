@@ -40,6 +40,17 @@ pub mod v02 {
     }
 }
 
+/// Deliberate scalar Channel extension; v0.1/v0.2 results remain unchanged.
+pub mod v03 {
+    pub const CHANNEL_SEND: u64 = 0x13;
+    pub const CHANNEL_RECEIVE: u64 = 0x14;
+    pub const FEATURE_CHANNEL: u32 = 32;
+    pub const INFO: u64 = super::version(0, 3, 31 | FEATURE_CHANNEL);
+    pub fn owns(number: u64) -> bool {
+        (CHANNEL_SEND..=CHANNEL_RECEIVE).contains(&number)
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
@@ -435,5 +446,31 @@ mod capability_abi_tests {
             }
         );
         assert_eq!(dispatch(THREAD_EXIT, [2, 0, 0, 0, 0, 0]), Outcome::Exit(2));
+    }
+}
+
+#[cfg(test)]
+mod channel_abi_tests {
+    use super::*;
+    #[test]
+    fn channel_version_numbers_and_features_do_not_change_previous_definitions() {
+        assert_eq!(v03::INFO, 0x30000003f);
+        assert_eq!(v02::INFO, 0x20000001f);
+        assert_eq!(ABI_INFO, 0x100000003);
+        assert_eq!((v03::CHANNEL_SEND, v03::CHANNEL_RECEIVE), (0x13, 0x14));
+        assert!(v03::owns(0x13) && v03::owns(0x14));
+        assert!(!v02::owns(0x13));
+    }
+    #[test]
+    fn old_scalar_dispatch_rejects_both_channel_numbers_with_zero_results() {
+        for op in [v03::CHANNEL_SEND, v03::CHANNEL_RECEIVE] {
+            assert_eq!(
+                dispatch(op, [u64::MAX; 6]),
+                Outcome::Return {
+                    status: NOT_SUPPORTED,
+                    scalar: 0
+                }
+            );
+        }
     }
 }

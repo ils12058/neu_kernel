@@ -49,6 +49,10 @@ neu_multi_payload:
     mov qword ptr [rsp+56],0
     call neu_as_user_steps
     .endif
+    .if {channels}
+    mov qword ptr [rsp+56],0
+    call neu_ipc_user_steps
+    .endif
     xor eax, eax
 .global neu_multi_loop,neu_multi_atomic_site,neu_multi_after_atomic,neu_multi_after_inc,neu_multi_committed,neu_multi_loop_end
 neu_multi_loop:
@@ -98,6 +102,12 @@ neu_multi_committed:
     ja 4f
     call neu_as_user_steps
 4:
+    .endif
+    .if {channels}
+    cmp qword ptr [rsp+56],99
+    je 3f
+    call neu_ipc_user_steps
+3:
     .endif
     cmp rax, [rdx + 8]
     jb neu_multi_loop
@@ -181,5 +191,8 @@ neu_multi_failed:
 .endif
 .if {abi02}
     neu_as_user_body
+.endif
+.if {channels}
+    neu_ipc_user_body
 .endif
 neu_multi_payload_end:

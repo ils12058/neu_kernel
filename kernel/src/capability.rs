@@ -3,12 +3,15 @@
 use crate::node::{ActiveContext, NodeId};
 pub const HANDLES: usize = 8;
 pub const OBJECTS: usize = 4;
+pub const CHANNEL_OBJECTS: usize = 6;
+pub const BOOTSTRAP: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjectType {
     Counter = 1,
     Flag = 2,
     AddressSpace = 3,
+    ChannelEndpoint = 4,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rights(u8);
@@ -17,9 +20,12 @@ impl Rights {
     pub const WRITE: Self = Self(2);
     pub const READ_WRITE: Self = Self(3);
     pub const INSPECT: Self = Self(16);
+    pub const SEND: Self = Self(32);
+    pub const RECEIVE: Self = Self(64);
+    pub const SEND_RECEIVE: Self = Self(96);
     pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
-        if bits == 0 || bits & !0x13 != 0 {
+        if bits == 0 || bits & !0x73 != 0 {
             Err(Error::Rights)
         } else {
             Ok(Self(bits as u8))
@@ -33,6 +39,7 @@ impl Rights {
             ObjectType::Counter => self.0 != 0 && self.0 & !3 == 0,
             ObjectType::Flag => self.0 == 1,
             ObjectType::AddressSpace => self.0 & !16 == 0,
+            ObjectType::ChannelEndpoint => self.0 != 0 && self.0 & !96 == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -95,9 +102,14 @@ pub enum Error {
     Owner = -21,
     Capacity = -22,
     InUse = -23,
+    Empty = -32,
+    Full = -33,
+    PeerClosed = -34,
+    Terminal = -35,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 enum Value {
+    Endpoint(crate::channel::EndpointRef),
     Counter(u64),
     Flag(bool),
     AddressSpace {
@@ -108,6 +120,7 @@ enum Value {
 impl Value {
     fn kind(&self) -> ObjectType {
         match self {
+            Self::Endpoint(_) => ObjectType::ChannelEndpoint,
             Self::Counter(_) => ObjectType::Counter,
             Self::Flag(_) => ObjectType::Flag,
             Self::AddressSpace { .. } => ObjectType::AddressSpace,
@@ -150,7 +163,9 @@ pub struct ObjectInfo {
     pub pins: u32,
 }
 pub struct Objects {
-    slots: [Object; OBJECTS],
+    slots: [Object; CHANNEL_OBJECTS],
+    limit: usize,
+    channels: crate::channel::Channels,
 }
 impl Default for Objects {
     fn default() -> Self {
@@ -160,8 +175,19 @@ impl Default for Objects {
 impl Objects {
     pub const fn new() -> Self {
         Self {
-            slots: [const { Object::EMPTY }; OBJECTS],
+            slots: [const { Object::EMPTY }; CHANNEL_OBJECTS],
+            limit: OBJECTS,
+            channels: crate::channel::Channels::new(),
         }
+    }
+    pub const fn with_channels() -> Self {
+        Self {
+            limit: CHANNEL_OBJECTS,
+            ..Self::new()
+        }
+    }
+    pub fn channel_state(&self) -> &crate::channel::Channels {
+        &self.channels
     }
     pub fn counter(&mut self, value: u64) -> Result<ObjectRef> {
         self.create(Value::Counter(value))
@@ -172,6 +198,7 @@ impl Objects {
     fn free_slot(&self) -> Result<usize> {
         self.slots
             .iter()
+            .take(self.limit)
             .position(|s| s.value.is_none() && s.generation != u32::MAX)
             .ok_or(Error::Capacity)
     }
@@ -207,6 +234,60 @@ impl Objects {
             Err(e) => return Err((e, reference)),
         };
         Ok(self.create_at(slot, Value::AddressSpace { owner, reference }))
+    }
+    /// Trusted atomic two-table construction. All capacity/generation/manifest
+    /// checks precede mutation. The exclusive transaction makes commit infallible;
+    /// no userspace or IRQ can observe a half-published pair.
+    pub fn install_channel(&mut self, a: &mut Table, b: &mut Table) -> Result<()> {
+        if self.limit != CHANNEL_OBJECTS {
+            return Err(Error::Capacity);
+        }
+        for t in [&*a, &*b] {
+            if !t.live || t.sealed || t.bootstrap[4..].iter().any(Option::is_some) {
+                return Err(Error::InUse);
+            }
+            if t.slots
+                .iter()
+                .filter(|s| s.entry.is_none() && s.generation != u32::MAX)
+                .count()
+                < 4
+            {
+                return Err(Error::Capacity);
+            }
+        }
+        if a.id == b.id {
+            return Err(Error::Owner);
+        }
+        if self
+            .slots
+            .iter()
+            .take(self.limit)
+            .filter(|s| s.value.is_none() && s.generation != u32::MAX)
+            .count()
+            < 2
+        {
+            return Err(Error::Capacity);
+        }
+        self.channels.available()?;
+        let pair = self.channels.pair([a.id.owner(), b.id.owner()])?;
+        for (table, endpoint) in [a, b].into_iter().zip(pair) {
+            let creator = self
+                .create(Value::Endpoint(endpoint))
+                .expect("reserved object slot");
+            table.bootstrap_limit = BOOTSTRAP;
+            for (index, rights) in [
+                (4, Rights::SEND_RECEIVE),
+                (5, Rights::SEND_RECEIVE),
+                (6, Rights::SEND),
+                (7, Rights::RECEIVE),
+            ] {
+                table
+                    .install_bootstrap(self, &creator, rights, index)
+                    .expect("preflighted endpoint grant");
+            }
+            self.release(creator).expect("creator ownership");
+        }
+        Ok(())
     }
     pub fn reap_space(&mut self) -> Option<crate::paging::SpaceRef> {
         let slot = self.slots.iter().position(|o| {
@@ -257,7 +338,7 @@ impl Objects {
         match self.object(id)?.value.as_ref() {
             Some(Value::Counter(v)) => Ok(*v),
             Some(Value::Flag(v)) => Ok(*v as u64),
-            Some(Value::AddressSpace { .. }) => Err(Error::Type),
+            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
             None => Err(Error::Object),
         }
     }
@@ -267,7 +348,7 @@ impl Objects {
         match self.object(id)?.value.as_ref() {
             Some(Value::Counter(value)) => Ok(value as *const u64 as u64),
             Some(Value::Flag(value)) => Ok(value as *const bool as u64),
-            Some(Value::AddressSpace { .. }) => Err(Error::Type),
+            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
             None => Err(Error::Object),
         }
     }
@@ -294,7 +375,12 @@ impl Objects {
             && self.slots[slot].pins == 0
             && !matches!(self.slots[slot].value, Some(Value::AddressSpace { .. }))
         {
-            self.slots[slot].value = None;
+            let retired = self.slots[slot].value.take();
+            if let Some(Value::Endpoint(reference)) = retired {
+                self.channels
+                    .retire(reference)
+                    .expect("last unpinned endpoint reference");
+            }
         }
     }
     fn release_id(&mut self, id: ObjectId) -> Result<()> {
@@ -348,7 +434,8 @@ pub struct Table {
     live: bool,
     id: TableId,
     slots: [Slot; HANDLES],
-    bootstrap: [Option<Handle>; 4],
+    bootstrap: [Option<Handle>; BOOTSTRAP],
+    bootstrap_limit: usize,
     sealed: bool,
 }
 impl Table {
@@ -357,7 +444,8 @@ impl Table {
             live: true,
             id: TableId(owner),
             slots: [const { Slot::new() }; HANDLES],
-            bootstrap: [None; 4],
+            bootstrap: [None; BOOTSTRAP],
+            bootstrap_limit: 4,
             sealed: false,
         }
     }
@@ -403,7 +491,12 @@ impl Table {
             return Err(Error::Owner);
         }
         let id = reference.id;
-        objects.object(id)?;
+        let object = objects.object(id)?;
+        if let Some(Value::Endpoint(reference)) = object.value.as_ref()
+            && objects.channels.info(reference.id())?.owner != self.id.owner()
+        {
+            return Err(Error::Owner);
+        }
         if !rights.valid(id.kind) {
             return Err(Error::Rights);
         }
@@ -431,7 +524,7 @@ impl Table {
         rights: Rights,
         index: usize,
     ) -> Result<Handle> {
-        if self.sealed || index >= 4 || self.bootstrap[index].is_some() {
+        if self.sealed || index >= self.bootstrap_limit || self.bootstrap[index].is_some() {
             return Err(Error::InUse);
         }
         let handle = self.grant(objects, reference, rights)?;
@@ -446,7 +539,7 @@ impl Table {
         if !self.live {
             return Err(Error::Owner);
         }
-        if !self.sealed || index >= 4 {
+        if !self.sealed || index >= self.bootstrap_limit as u64 {
             return Err(Error::Handle);
         }
         let h = self.bootstrap[index as usize].ok_or(Error::Handle)?;
@@ -534,7 +627,7 @@ impl Guard<'_> {
         match self.objects.object(self.id)?.value.as_ref() {
             Some(Value::Counter(v)) => Ok(*v),
             Some(Value::Flag(v)) => Ok(*v as u64),
-            Some(Value::AddressSpace { .. }) => Err(Error::Type),
+            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
             None => Err(Error::Object),
         }
     }
@@ -546,6 +639,37 @@ impl Guard<'_> {
             Some(Value::AddressSpace { owner, reference }) => Ok((*owner, reference)),
             _ => Err(Error::Type),
         }
+    }
+    pub fn endpoint_info(&self) -> Result<crate::channel::EndpointInfo> {
+        match self.objects.object(self.id)?.value.as_ref() {
+            Some(Value::Endpoint(r)) => self.objects.channels.info(r.id()),
+            _ => Err(Error::Type),
+        }
+    }
+    pub fn channel_send(&mut self, payload: u64) -> Result<()> {
+        if !self.rights.contains(Rights::SEND) {
+            return Err(Error::Rights);
+        }
+        let info = self.endpoint_info()?;
+        self.objects.channels.send(info.id, self.caller, payload)
+    }
+    pub fn channel_receive(&mut self) -> Result<u64> {
+        if !self.rights.contains(Rights::RECEIVE) {
+            return Err(Error::Rights);
+        }
+        let info = self.endpoint_info()?;
+        self.objects.channels.receive(info.id, self.caller)
+    }
+    #[cfg(feature = "channel-test")]
+    pub fn registry_stats(&self) -> Stats {
+        self.objects.stats()
+    }
+    pub fn channel_snapshot(&self) -> [u64; 22] {
+        self.objects.channels.snapshot()
+    }
+    #[cfg(feature = "channel-test")]
+    pub fn queue_addresses(&self) -> [u64; 2] {
+        self.objects.channels.queue_addresses()
     }
     pub fn write(&mut self, value: u64) -> Result<()> {
         if self.id.kind != ObjectType::Counter {

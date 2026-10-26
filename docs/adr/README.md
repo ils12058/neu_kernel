@@ -180,3 +180,13 @@ ADR 0016 extends 0009/0015 with explicit capability discovery/close and a real
 AddressSpace INSPECT operation. Earlier ABI 0.1 configurations and private test
 operations remain separate. Transfer, general mapping authority and revocation
 remain future decisions. See the [versioned ABI specification](../abi/experimental-v0.2.md).
+
+## Phase 5C record — bridge to K6
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0017: Bounded scalar Channel endpoints](0017-bounded-scalar-channel-endpoints.md) | Accepted, exclusive Node endpoints, nonblocking two-message directional queues, experimental ABI 0.3 | NEU-005/006/007/008/009/010/011/021/023/024 scoped subsets |
+
+This implements a narrow K6 communication subset while continuing K5 authority
+enforcement. K6 is not declared complete; K7 moves and K10 revocation remain open.
+Earlier ADR rationale and ABI 0.1/0.2 configurations remain intact.

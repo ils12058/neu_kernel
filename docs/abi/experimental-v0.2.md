@@ -177,3 +177,9 @@ Node/root and sibling capabilities remain alive. There is no ownership cycle.
 MAP/UNMAP, cross-Node views/transfers, derivation, attenuation, revocation,
 MemoryObjects, IPC, factories, device delegation, general Thread creation, SMP,
 kernel preemption, pointer-copy APIs and a userspace runtime are deferred.
+
+## 2026-10-26 extension note
+
+[Experimental ABI 0.3](experimental-v0.3.md) adds scalar Channel operations and
+bootstrap indices 4–7 in its own image family. This specification and the ABI
+0.2 version/feature/index bounds remain unchanged for ABI 0.2 images.

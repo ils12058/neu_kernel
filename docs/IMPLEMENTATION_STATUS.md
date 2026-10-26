@@ -1,5 +1,262 @@
 # Neu Kernel implementation status
 
+**Verified:** 2026-10-26. **Milestone:** K5 / Phase 5C — capability-backed endpoints
+and bounded scalar IPC. **159 host tests and 104 QEMU scenarios pass**, preserving
+all 129/97 baseline regressions, plus twelve scheduling repeats and four
+independent clean-directory builds with QMP boots.
+This is a bridge to the Channel work assigned to **K6**, not completion of K6.
+Starting tree: clean `main` at `c0cc7a786bc0a1616ab256387bb40daf02eab39e`, the
+merge of PR #1. All 129 baseline host tests were rerun before edits; the preceding
+successful 97-case report is retained as `build/phase5c-baseline-qemu.json`.
+Architecture v0.2 remains unchanged, SHA-256
+`dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`.
+The Rust 1.95.0, Limine 12.9.4/base 6, QEMU 11.0.0 TCG/q35, one vCPU/512 MiB
+and pinned OVMF environment/dependencies remain unchanged. No packages were installed.
+
+**Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
+
+## Phase 5C files
+
+Created:
+
+- `kernel/src/channel.rs`, `channel/tests.rs`: architecture-neutral real Channel,
+  endpoint tokens/identities, two directional FIFOs, lifecycle/accounting and
+  tests of the same methods used by the kernel.
+- `kernel/src/arch/x86_64/ipc.rs`, `.S`: exclusive native adapter, supervisor FIFO
+  witnesses, bounded scalar Ring 3 protocol and ordered terminal records.
+- [Experimental ABI 0.3](abi/experimental-v0.3.md): numbers, feature discovery,
+  bootstrap grants, scalar registers/errors and close/peer semantics.
+- [ADR 0017](adr/0017-bounded-scalar-channel-endpoints.md): scoped K5C/K6 rationale,
+  alternatives, ownership, capacity and deferred communication mechanisms.
+
+Modified:
+
+- `capability.rs`, `capability/tests.rs`: six-slot backing storage with explicit
+  legacy four-slot limit; real ChannelEndpoint values, typed SEND/RECEIVE rights,
+  constructor preflight, owner checks, guard pins and final-token retirement.
+- `node.rs`: initial pair installation borrows the two actual generation-checked
+  Node tables using disjoint mutable slices; active/terminal Nodes and leases
+  cannot use the trusted constructor.
+- `syscall.rs`, `lib.rs`, `main.rs`, Cargo features and architecture module list:
+  0.3 definitions and isolated Channel/legacy rejection images.
+- `arch/x86_64/address_space.rs` and `.S`: registry/lease integration, atomic
+  initial endpoint grants, ordered cleanup, and an ABI 0.2 rejection fixture.
+- `native.rs`/`.S`, `multithread.rs`/`.S`, `paging.rs`: checked scalar dispatch,
+  version results, sealed payload/resume sites, bounded per-slice test pacing,
+  fault/exit integration and actual user-memory control under the common root.
+  IRQ handlers and scheduling policy do not access Channel state.
+- `tools/neu.py`: seven new profiles, live native/FIFO CPU observations, independent
+  capability/queue/message reconciliation and retained regression checks.
+- README, this status, ADR index and dated extensions to ADRs 0015/0016 and ABI
+  0.2 documentation; original rationale and old configuration contracts remain.
+
+## Mechanism, authority and capacity
+
+One fixed Channel has two separately generation-checked endpoints. Endpoint A
+belongs exclusively to Node A and is shared by A1/A2; B belongs to Node B/B1.
+Each endpoint sends into the opposite inbound FIFO and receives from its own.
+Each FIFO holds two u64 payloads. Payload zero and full-width values are valid;
+messages contain no pointers, capability references or duplicated ownership data.
+ChannelId and EndpointId are internal types, never user handles.
+
+The Channel profile retains all four real AddressSpace/Flag objects and adds two
+endpoint objects: six usable object slots, one Channel, two endpoint metadata
+slots and four scalar message slots. Legacy Objects::new retains a four-object
+allocation limit. Both profiles have eight handle slots per Node; the manifest
+has eight storage entries but retains a four-index effective legacy bound.
+Only the trusted Channel constructor extends that bound to eight. Generation
+exhaustion retires capacity instead of wrapping.
+
+Bootstrap indices 0–3 preserve own-AS INSPECT, independent own-AS INSPECT, own-AS
+NONE and Flag READ. New indices 4/5 independently grant SEND|RECEIVE to the Node's
+own endpoint; 6 grants SEND only and 7 RECEIVE only. These are explicit initial
+fixture grants, not derivation/attenuation. Startup has sixteen live handle
+references, eight of them endpoint references, six objects, no operation pins,
+and two separate retained AS roots. Endpoints each own one non-copyable token;
+queue messages hold no capability references. No public creation/factory exists.
+
+All object, handle, manifest, Channel and endpoint capacity/generation checks
+precede pair publication. During this exclusive bootstrap transaction commit has
+no fallible allocation or user-controlled selector. Failed preflight leaves
+existing handles, object references, generations, queues and Channel identity
+unchanged. A rollback guest fills the second Node table before construction,
+checks failure, closes that explicit extra grant and then successfully installs
+both endpoints. Its B primary endpoint handle has generation two; discovery
+works without hardcoded handle values. Other profiles demonstrate equal numeric
+handles in different Nodes resolving only to their respective endpoints.
+
+Object-specific SEND=32 and RECEIVE=64 are independent of Counter READ/WRITE and
+AS INSPECT. Both grant and operation validate exact endpoint owner generation.
+Lookup validates Node table/handle/object/type/rights, then pins the endpoint.
+A guard cannot invoke more rights than were requested by its checked lookup.
+Denied operations do not reach queue mutation; no unused register selects a Node.
+
+## ABI, FIFO and peer-close behavior
+
+ABI 0.3 advertises 0x3f and adds 0x13 channel_send / 0x14 channel_receive.
+Query=1, exit=2 and 0x10–0x12 keep their meanings. ABI 0.1/0.2 images keep their
+original versions/features and reject new numbers. Private Phase 5A operations
+remain separate. Scalar registers, preserved GPRs/RSP and checked IRETQ remain.
+
+Send commits exactly one scalar and returns RDX=0. Receive removes the oldest
+committed scalar and returns it, including zero. Empty (-32), Full (-33) and
+PeerClosed (-34) are distinguishable. Inconsistent terminal identities (-35)
+are guarded internally; after final endpoint retirement ordinary old handles
+are stale/expired. Errors return scalar zero without changing prior messages.
+Each push/pop is a single serialized commit; FIFO follows actual successful
+transactions rather than intended Thread ordering. No kernel wait or retry loop
+is introduced, and no Thread blocking/wait-queue state is added.
+
+Closing one handle releases one reference. Other references keep the endpoint
+live; a pinned authorized guard can finish after final handle close. Last
+reference/pin release consumes the token once, retires that endpoint, and discards
+only its own undeliverable inbound messages. Already queued messages for the
+surviving receiver remain receivable, followed by PeerClosed after draining.
+New sends to a dead receiver fail. Both retired endpoints release the Channel
+slot with no live message slots. Close is not revocation or authority transport.
+
+## Ownership, execution and cleanup
+
+Actual endpoint objects and queues are owned by the same Objects registry. The
+native backend owns the selected actual Node table through a non-copyable lease
+and passes exclusive registry/table borrows to the IPC adapter. Disjoint Rust
+field borrows support guard-pinned queue access; no suspended mutable Nodes,
+Paging or allocator pointer is accessed. The separate diagnostics gate owns
+only records. Both concrete static access contracts require one CPU, IF=0/DF=0,
+exclusive non-reentrant transactions and no escaping borrowed references.
+IRQ/NMI handlers never access this storage. SMP/kernel preemption are unsupported.
+
+The immutable paging view and root reference contract from Phase 5B remain. A
+Channel operation does not mutate Paging or retain mutable registry references
+into Ring 3. Endpoint lifetimes are independent of page-table roots. Normal A1
+exit retains A2's table/endpoint; terminal Node cleanup returns leases, cancels
+saved execution references, drains handles, retires its endpoint and accounts
+messages, reaps AS references, then reclaims roots and Node metadata. A healthy
+peer can continue after the other's root is destroyed. No ownership cycle exists.
+
+The Ring 3 protocol uses once-per-dispatch pulses and gate bits in each Node's
+own private data page to pace full/close/fault tests. These are test scheduling
+controls, contain no message payload or authority and are not ABI operations.
+The controller never copies a message between Nodes. Channel images allow at
+most 96 dispatches (older profiles retain 64); their 30-second deadline and
+mandatory restore/CPU/IRQ checks are unchanged. Channel diagnostics reserve 110
+native records plus two terminal records; overflow fails before mutation.
+
+## Phase 5C validation
+
+`make doctor`, `make check`, `make build` and `make test` passed. The full run
+completed **159 host tests and 104 QEMU scenarios** at the unchanged 30-second
+deadline. Final review then made post-commit diagnostic failure fail-stop,
+preserving the promise that returned operational errors do not mutate queues.
+The seven affected/new profiles were rebuilt and rerun, followed by all twelve
+repeats and four cold builds/boots. Legacy execution code was unchanged. The original 129 host test names and 97 QEMU case names/bindings are
+retained. Thirty new host tests exercise the actual Channel/capability methods.
+Focused host filters passed 18 Channel-related tests and 9 endpoint-related
+tests (overlapping subsets, not additional unique tests).
+
+| New profile | IPC records including terminal events | Stopped native/FIFO probes | Seconds |
+| --- | --- | --- | --- |
+| channels | 41 | 17 | 12.041 |
+| channels-xapic | 41 | 17 | 11.722 |
+| channels-a-fault | 35 | 16 | 11.209 |
+| channels-b-fault | 36 | 16 | 10.975 |
+| channels-rollback | 41 | 17 | 13.770 |
+
+The other two new cases verify genuine native rejection by ABI 0.1 of a Channel
+number, and by ABI 0.2 of both Channel numbers, preserving query version/features.
+Old AddressSpace, bootstrap, private Phase 5A, IRQ, scheduler, paging and native
+return scenarios remain passing. No original negative oracle was removed.
+
+Stopped-CPU QMP verifies real CPL=3 syscall origin frames and CPL=0 entry, selected
+Node/Thread/Space/root, CR3, guarded stack, TSS RSP0, native busy/flags, and actual
+supervisor-only RW/NX FIFO storage. It reads both real FIFO structures directly,
+checking head/tail/length and scalar slots against the live operation witness.
+Successful and operational-error probes retain the real endpoint guard pin.
+The existing coherent restore/IRQ/GPR, timer ISR/EOI, root/stack and final halt
+checks also run. Physical table snapshots are discarded before CONT.
+
+An independent host model replays every committed request and Node cleanup:
+lookup/generation/type/rights, original queue slots, FIFO wraparound, exact
+returned scalars, endpoint reference counts, peer state, discards and terminal
+resource accounting. It does not infer success from matching printed constants.
+A1/A2 send through the same endpoint while B owns the other; each receive is
+matched to a successful send. All profiles send four messages A→B and three B→A,
+including zero and nontrivial 64-bit payloads. Normal/B-fault profiles receive all
+seven; A-fault receives six and discards exactly the pending reply addressed to
+canceled A. Failed sends/receives never alter previously committed messages.
+
+A1 closes its primary handle while independent references remain. A2 later uses
+the same Node authority after A1's real normal exit, receives the pending reply,
+then observes PeerClosed and closes remaining references. Normal peer close
+preserves the pending reply. B-fault terminal cleanup similarly preserves that
+reply for A2 after B's root is reclaimed. A-fault cancels A2, retires A's receiver,
+discards its one pending reply, and lets healthy B observe PeerClosed and release
+its own endpoint. Double-close, stale/forged/zero/out-of-range/wrong-type handles,
+SEND/RECEIVE rights negatives and uninstalled/closed bootstrap originals reject.
+Host tests additionally cover opposite-owner grants, malformed rights, checked
+guard non-amplification, object/endpoint/Channel generations, final close while
+pinned, generation exhaustion, table/object/Channel capacity and atomic preflight
+rollback with unchanged existing messages and accounting.
+
+All runs finish with zero Channel/endpoints/messages, capability references,
+operation pins, leases and retained AS roots. Exact per-image frame/free/table
+baselines are restored. Peak storage remains 16 owned data frames plus 33 x2APIC
+or 42 xAPIC table frames (49/58 total); the final allocation is seven pinned
+kernel table frames. Static object/queue/diagnostic storage is part of the
+supervisor kernel image, not a new heap or unaccounted user mapping.
+
+The initial Channel run reached the inherited 64-dispatch cap before final
+completion; no such run is counted as a pass. The Channel fixture's 17 native
+observation holds and protocol need 65 dispatches in the normal profile, so only
+Channel images now have a bounded 96-dispatch allowance. All legacy profiles keep
+64. Timeout, required observations and CPU/IRQ assertions remain unchanged.
+
+Follow-up validation performed three rounds each of normal, xAPIC, A-fault and
+B-fault (**12 passes**), plus four builds in independent empty target directories
+(boot, Channel, xAPIC and rollback). QMP then booted those exact four artifacts;
+all four hashes match their corresponding ordinary final builds. No physical
+hardware or formal safety verification is claimed.
+
+Evidence (ignored local artifacts):
+
+- `build/phase5c-doctor.log`, `phase5c-check.log`, `phase5c-build.log`,
+  `phase5c-full-test.log`: command output, including all 159 host tests.
+- `build/phase5c-full-results.json` / `build/test-results.json`: all 104 scenarios;
+  individual JSON/serial/QMP CPU, stack, FIFO and PTE observations in test-logs.
+- `build/phase5c-final-results.json`: full regression results combined with the
+  final seven profile reruns after the diagnostic failure-path correction; its
+  validation_note records that provenance. The normal table above gives the
+  full-run measurements, while focused.json contains the final rerun timings.
+- `build/phase5c-focused.json`, `phase5c-focused.log`: the seven targeted profiles.
+- `build/phase5c-host-channel.log`, `phase5c-host-endpoint.log`: focused host runs.
+- `build/phase5c-regression-audit.json`: baseline names/cases and ADR history audit.
+- `build/phase5c-repeat/results.json`: 12 independent scheduling/QMP repeats.
+- `build/phase5c-cold/builds.json` and `qmp-results.json`: four cold builds/boots;
+  corresponding phase5c scripts/logs retain exact commands and hashes.
+
+## Remaining limits and K6 continuation
+
+This is fixed-topology, nonblocking scalar IPC for the supported QEMU profile.
+It does not complete K6, qualify physical hardware or formally prove safety.
+There is one Channel, no generalized heap or resource-pool governance, no public
+creation, capability transport, SEND_CAPS, moves, derivation, revocation,
+variable-length data, MemoryObjects, pointer copying, zero-copy sharing, blocking,
+wait queues, priority donation, SMP, kernel preemption, public Thread/Node creation,
+ELF runtime or POSIX compatibility.
+
+Recommended K6 continuation: broaden lifecycle, backpressure, cancellation,
+resource-accounting and scheduling stress for Channels before designing blocking
+wait/wake semantics in a separate ADR. Capability moves remain K7 and revocation
+K10; no placeholder ADRs or implemented claims are created for them.
+
+---
+
+## Historical Phase 5B and earlier evidence
+
+The records below retain their original milestone scope. Current Phase 5C behavior
+is defined above, by ABI 0.3 and ADR 0017.
+
+
 **Verified:** 2026-10-26. **Milestone:** K5 / Phase 5B — experimental capability ABI
 and real AddressSpace inspection. **129 host tests and 97 QEMU scenarios pass**,
 retaining every 113/90 baseline test, plus nine repeats and four independent

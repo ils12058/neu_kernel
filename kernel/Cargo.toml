@@ -128,3 +128,13 @@ test-address-space-a2-fault = ["abi-02"]
 test-address-space-b-fault = ["abi-02"]
 test-address-space-rollback = ["abi-02"]
 test-native-abi02-disabled = ["native-test"]
+
+# ABI 0.3 bridge to K6: bounded scalar IPC, no capability transport.
+channel-test = ["abi-02"]
+test-channels = ["channel-test"]
+test-channels-xapic = ["channel-test"]
+test-channels-a-fault = ["channel-test"]
+test-channels-b-fault = ["channel-test"]
+test-channels-rollback = ["channel-test"]
+test-native-abi03-disabled = ["native-test"]
+test-address-space-channel-disabled = ["abi-02"]

@@ -17,3 +17,5 @@ pub mod preemption;
 pub mod capability;
 
 pub mod inspection;
+
+pub mod channel;

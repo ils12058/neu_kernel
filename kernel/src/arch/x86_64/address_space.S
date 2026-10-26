@@ -48,6 +48,10 @@ neu_as_user_steps:
     cmp qword ptr [r15+56],0
     jne .Las_a1_after
     as_call 1,0,0,0,0x20000001f
+    .if {channel_disabled}
+    as_call 0x13,0,0,-1,0
+    as_call 0x14,0,0,-1,0
+    .endif
     as_get 0,16
     as_get 1,24
     as_get 2,32
@@ -154,7 +158,7 @@ neu_as_syscall_site:
 neu_as_syscall_resume:
     ret
 .endm
-.if {abi02}
+.if {abi02} || {channels}
 .section .text.as_probe,"ax"
 .global neu_as_request_probe,neu_as_request_wait,neu_as_request_wait_end
 neu_as_request_probe:

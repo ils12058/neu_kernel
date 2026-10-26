@@ -100,7 +100,14 @@ const _: () = assert!(
         + cfg!(feature = "test-address-space-a2-fault") as u8
         + cfg!(feature = "test-address-space-b-fault") as u8
         + cfg!(feature = "test-address-space-rollback") as u8
-        + cfg!(feature = "test-native-abi02-disabled") as u8)
+        + cfg!(feature = "test-native-abi02-disabled") as u8
+        + cfg!(feature = "test-channels") as u8
+        + cfg!(feature = "test-channels-xapic") as u8
+        + cfg!(feature = "test-channels-a-fault") as u8
+        + cfg!(feature = "test-channels-b-fault") as u8
+        + cfg!(feature = "test-channels-rollback") as u8
+        + cfg!(feature = "test-native-abi03-disabled") as u8
+        + cfg!(feature = "test-address-space-channel-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

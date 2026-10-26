@@ -16,15 +16,17 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const cfg!(feature="abi-02") as u8,abi_info=const if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
     static neu_multi_syscall_resume: u8;
     #[cfg(feature = "cap-test")]
     static neu_cap_syscall_resume: u8;
-    #[cfg(feature = "abi-02")]
+    #[cfg(all(feature = "abi-02", not(feature = "channel-test")))]
     static neu_as_syscall_resume: u8;
+    #[cfg(feature = "channel-test")]
+    static neu_ipc_syscall_resume: u8;
     static neu_multi_after_atomic: u8;
     static neu_multi_after_inc: u8;
 }
@@ -51,9 +53,13 @@ pub fn return_contract(root: u64, context: ThreadContext) -> ReturnContract {
             {
                 site(ptr::addr_of!(neu_cap_syscall_resume))
             }
-            #[cfg(feature = "abi-02")]
+            #[cfg(all(feature = "abi-02", not(feature = "channel-test")))]
             {
                 site(ptr::addr_of!(neu_as_syscall_resume))
+            }
+            #[cfg(feature = "channel-test")]
+            {
+                site(ptr::addr_of!(neu_ipc_syscall_resume))
             }
             #[cfg(not(any(feature = "cap-test", feature = "abi-02")))]
             {
@@ -429,6 +435,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         if cfg!(feature = "test-threads-a1-fault")
             || cfg!(feature = "test-capabilities-a-fault")
             || cfg!(feature = "test-address-space-a-fault")
+            || cfg!(feature = "test-channels-a-fault")
         {
             1
         } else if cfg!(feature = "test-threads-a-cross") {
@@ -451,6 +458,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         if cfg!(feature = "test-threads-b-fault")
             || cfg!(feature = "test-capabilities-b-fault")
             || cfg!(feature = "test-address-space-b-fault")
+            || cfg!(feature = "test-channels-b-fault")
         {
             1
         } else if cfg!(feature = "test-threads-cross") {
@@ -497,7 +505,13 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     .map_err(|_| Error::Corrupt)?;
     while let Some(mut dispatch) = check(queue.next(&mut nodes))? {
         dispatches += 1;
-        if dispatches > 64 {
+        if dispatches
+            > if cfg!(feature = "channel-test") {
+                96
+            } else {
+                64
+            }
+        {
             return Err(Error::Corrupt);
         }
         let index = members
@@ -533,6 +547,12 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         #[cfg(feature = "abi-02")]
         super::address_space::enter(check(nodes.take_authority(active))?)
             .map_err(|_| Error::Corrupt)?;
+        #[cfg(feature = "channel-test")]
+        {
+            let gates = super::address_space::channel_gates().map_err(|_| Error::Corrupt)?
+                | if members[0].outcome.is_some() { 4 } else { 0 };
+            paging.channel_control(space(owner_node)?, dispatches, gates)?;
+        }
         let execution = native::execute_slice(paging, space(owner_node)?, dispatch, 96);
         #[cfg(feature = "cap-test")]
         check(
@@ -583,7 +603,22 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                 }
                 let count = committed(words[offset], Some(frame))?;
                 #[cfg(feature = "abi-02")]
-                if paging.member_cap_words(space(&a)?)?[0] == 3 {
+                if paging.member_cap_words(space(&a)?)?[0] == 3
+                    && (!cfg!(feature = "test-channels-a-fault")
+                        && !cfg!(feature = "test-channels-b-fault")
+                        || {
+                            #[cfg(feature = "channel-test")]
+                            {
+                                super::address_space::channel_gates().map_err(|_| Error::Corrupt)?
+                                    & 8
+                                    != 0
+                            }
+                            #[cfg(not(feature = "channel-test"))]
+                            {
+                                true
+                            }
+                        })
+                {
                     settled_slices[index] += 1;
                 }
                 serial::write(format_args!("[NEU] Multi progress: label={} captures={} stored={} committed={} boots={} total={}\n",members[index].label,members[index].preemptions,words[offset],count,words[offset+2],words[0])).map_err(|_|Error::Corrupt)?;

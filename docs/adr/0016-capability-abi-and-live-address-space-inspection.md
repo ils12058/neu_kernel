@@ -116,3 +116,9 @@ general userspace runtime require separate decisions.
   repeats and four independently clean-built QMP boots pass. The full suite was
   followed by rebuilt ABI 0.2 fixtures proving healthy B inspection after A's
   close/fault cleanup. See implementation status for exact provenance and limits.
+
+- **2026-10-26 Phase 5C extension:** [0017](0017-bounded-scalar-channel-endpoints.md)
+  adds ABI 0.3 Channels and an explicitly larger object/manifest profile. The
+  original ABI 0.2 limits, feature results, retained roots and scoped immutable
+  inspection borrow remain valid in their own configurations. No capability
+  transfer, blocking or revocation semantics are introduced.

@@ -2089,3 +2089,14 @@ impl Paging<'_, '_> {
             .map_err(|(e, _)| e)
     }
 }
+
+#[cfg(feature = "channel-test")]
+impl Paging<'_, '_> {
+    pub fn channel_control(&mut self, space: &UserSpace, epoch: u64, gates: u64) -> Result<()> {
+        self.member_boundary(space)?;
+        self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            bytes[264..272].copy_from_slice(&epoch.to_le_bytes());
+            bytes[336..344].copy_from_slice(&gates.to_le_bytes());
+        })
+    }
+}

@@ -45,7 +45,11 @@ struct Storage(UnsafeCell<State>);
 // cannot be invoked outside it. No mutable paging/controller alias is retained.
 unsafe impl Sync for Storage {}
 static STORAGE: Storage = Storage(UnsafeCell::new(State {
-    objects: Objects::new(),
+    objects: if cfg!(feature = "channel-test") {
+        Objects::with_channels()
+    } else {
+        Objects::new()
+    },
     lease: None,
     reader: None,
     count: 0,
@@ -164,6 +168,26 @@ pub fn bootstrap(
 
             serial::write(format_args!("[NEU] AS rollback: objects=full table=full manifest=duplicate references=restored root_refs=2\n")).map_err(|_|cap::Error::Object)?;
         }
+        #[cfg(feature = "channel-test")]
+        {
+            if cfg!(feature = "test-channels-rollback") {
+                let table = model(nodes.authority_mut(b))?;
+                let creator = creators[2].as_ref().unwrap();
+                let extra = table.grant(&mut s.objects, creator, Rights::INSPECT)?;
+                let before = s.objects.stats();
+                let snapshot = s.objects.channel_state().snapshot();
+                if nodes.bootstrap_channel(&mut s.objects, a, b) != Err(cap::Error::Capacity)
+                    || s.objects.stats() != before
+                    || s.objects.channel_state().snapshot() != snapshot
+                {
+                    return Err(cap::Error::Object);
+                }
+                model(nodes.authority_mut(b))?.close(&mut s.objects, b, extra)?;
+                serial::write(format_args!("[NEU] IPC rollback: table=full pair=unpublished queues=unchanged references=restored
+")).map_err(|_|cap::Error::Object)?;
+            }
+            nodes.bootstrap_channel(&mut s.objects, a, b)?;
+        }
         for r in creators.into_iter().flatten() {
             s.objects.release(r)?;
         }
@@ -171,10 +195,24 @@ pub fn bootstrap(
             model(nodes.authority_mut(owner))?.seal_bootstrap();
         }
         let stats = s.objects.stats();
-        if stats.live != 4 || stats.references != 8 || stats.pins != 0 {
+        if stats.live != if cfg!(feature = "channel-test") { 6 } else { 4 }
+            || stats.references
+                != if cfg!(feature = "channel-test") {
+                    16
+                } else {
+                    8
+                }
+            || stats.pins != 0
+        {
             return Err(cap::Error::Object);
         }
-        serial::write(format_args!("[NEU] AS bootstrap: A={} B={} grants=INSPECT,INSPECT,NONE,Flag.READ handles=4,4 objects=4 references=8 root_refs=2 ABI=0.2\n",a.raw(),b.raw())).map_err(|_|cap::Error::Object)
+        if cfg!(feature = "channel-test") {
+            #[cfg(feature = "channel-test")]
+            super::ipc::bootstrap(a, b, &s.objects)?;
+            Ok(())
+        } else {
+            serial::write(format_args!("[NEU] AS bootstrap: A={} B={} grants=INSPECT,INSPECT,NONE,Flag.READ handles=4,4 objects=4 references=8 root_refs=2 ABI=0.2\n",a.raw(),b.raw())).map_err(|_|cap::Error::Object)
+        }
     })
 }
 pub fn enter(lease: Lease) -> cap::Result<()> {
@@ -296,6 +334,13 @@ pub fn request(active: ActiveContext, frame: Frame, address: u64, top: u64) -> O
             address,
             interrupts::flags(),
         ]);
+        #[cfg(feature = "channel-test")]
+        if neu_kernel::syscall::v03::owns(op) || (op == v02::CAP_CLOSE && (h.raw() as u32) >= 5) {
+            let outcome =
+                super::ipc::request(&mut s.objects, &mut lease, active, frame, address, top)?;
+            s.lease = Some(lease);
+            return Ok(outcome);
+        }
         let result = (|| -> Result<u64, i64> {
             if op == v02::BOOTSTRAP_CAP_GET {
                 return lease
@@ -405,6 +450,10 @@ pub fn request(active: ActiveContext, frame: Frame, address: u64, top: u64) -> O
         super::halt()
     })
 }
+#[cfg(feature = "channel-test")]
+pub fn channel_gates() -> cap::Result<u64> {
+    tx(|s| super::ipc::gates(&s.objects))
+}
 pub fn reap(paging: &mut Paging<'_, '_>) -> cap::Result<()> {
     tx(|s| {
         if s.reader.is_some() || s.lease.is_some() {
@@ -428,7 +477,11 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
             return Err(cap::Error::InUse);
         }
         let before = s.objects.stats();
+        #[cfg(feature = "channel-test")]
+        let channel_before = s.objects.channel_state().snapshot();
         let count = model(nodes.authority_mut(node))?.drain(&mut s.objects, node)?;
+        #[cfg(feature = "channel-test")]
+        super::ipc::cleanup(node, channel_before, &s.objects)?;
         while let Some(r) = s.objects.reap_space() {
             paging
                 .release_object_space(r)
@@ -446,6 +499,8 @@ pub fn finish() -> cap::Result<()> {
         if s.reader.is_some() || s.lease.is_some() || s.objects.stats() != cap::Stats::default() {
             return Err(cap::Error::Object);
         }
+        #[cfg(feature = "channel-test")]
+        super::ipc::finish(&s.objects)?;
         for r in &s.records[..s.count] {
             serial::write(format_args!("[NEU] AS record: words="))
                 .map_err(|_| cap::Error::Object)?;
