@@ -93,7 +93,14 @@ const _: () = assert!(
         + cfg!(feature = "test-capabilities-a2-fault") as u8
         + cfg!(feature = "test-capabilities-b-fault") as u8
         + cfg!(feature = "test-capabilities-rollback") as u8
-        + cfg!(feature = "test-native-cap-disabled") as u8)
+        + cfg!(feature = "test-native-cap-disabled") as u8
+        + cfg!(feature = "test-address-space") as u8
+        + cfg!(feature = "test-address-space-xapic") as u8
+        + cfg!(feature = "test-address-space-a-fault") as u8
+        + cfg!(feature = "test-address-space-a2-fault") as u8
+        + cfg!(feature = "test-address-space-b-fault") as u8
+        + cfg!(feature = "test-address-space-rollback") as u8
+        + cfg!(feature = "test-native-abi02-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

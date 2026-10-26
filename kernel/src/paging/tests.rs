@@ -1274,3 +1274,164 @@ fn three_thread_stack_arena_has_bounded_distinct_guarded_ranges() {
     );
     assert_eq!((DATA_FRAMES, MAPPINGS), (16, 64));
 }
+
+#[test]
+fn address_space_refs_are_separate_from_context_pins_and_block_root_destruction() {
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, 0x1000).unwrap();
+    r.pin_space(s).unwrap();
+    r.pin_space(s).unwrap();
+    let reference = r.retain_space(s).unwrap();
+    assert_eq!(r.object_references(s), Ok(1));
+    assert_eq!(r.pins(s), Ok(2));
+    r.unpin_space(s).unwrap();
+    r.unpin_space(s).unwrap();
+    assert_eq!(r.can_allocate(s), Ok(()));
+    assert_eq!(r.can_destroy_space(s), Err(Error::InUse));
+    assert_eq!(r.clear_root(s, 0x1000), Err(Error::InUse));
+    r.release_space_ref(reference).unwrap();
+    r.clear_root(s, 0x1000).unwrap();
+    r.retire_space(s).unwrap();
+}
+#[test]
+fn space_ref_bounds_stale_generations_and_failed_release_preserve_ownership() {
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, 0x1000).unwrap();
+    let a = r.retain_space(s).unwrap();
+    let b = r.retain_space(s).unwrap();
+    assert!(matches!(r.retain_space(s), Err(Error::Capacity)));
+    r.activate_space(s).unwrap();
+    let (e, a) = r.release_space_ref(a).unwrap_err();
+    assert_eq!(e, Error::InUse);
+    assert_eq!(r.object_references(s), Ok(2));
+    r.deactivate_space(s).unwrap();
+    r.release_space_ref(a).unwrap();
+    r.release_space_ref(b).unwrap();
+    r.clear_root(s, 0x1000).unwrap();
+    r.retire_space(s).unwrap();
+    assert!(matches!(r.retain_space(s), Err(Error::NotOwned)));
+    let fresh = r.create_space().unwrap();
+    assert_ne!(fresh, s);
+    r.bind_root(fresh, 0x2000).unwrap();
+    assert!(matches!(r.retain_space(s), Err(Error::NotOwned)));
+}
+#[test]
+fn live_inspection_reads_actual_mapping_changes_and_returns_no_physical_address() {
+    use crate::inspection;
+    let mut m = Model::new();
+    let tree = PageTree::new(&mut m, 48).unwrap();
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, tree.root).unwrap();
+    let reference = r.retain_space(s).unwrap();
+    tree.map_user(&mut m, USER_BASE, 0x800000, Permissions::RX)
+        .unwrap();
+    assert_eq!(
+        inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(11)
+    );
+    tree.unmap(&mut m, USER_BASE).unwrap();
+    assert_eq!(
+        inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(0)
+    );
+    tree.map_user(&mut m, USER_BASE, 0x900000, Permissions::RW)
+        .unwrap();
+    assert_eq!(
+        inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(7)
+    );
+    r.release_space_ref(reference).unwrap();
+}
+#[test]
+fn inspection_rejects_unaligned_kernel_noncanonical_and_out_of_arena_addresses() {
+    let mut m = Model::new();
+    let tree = PageTree::new(&mut m, 48).unwrap();
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, tree.root).unwrap();
+    let reference = r.retain_space(s).unwrap();
+    for va in [
+        0,
+        USER_BASE - 4096,
+        USER_BASE + 1,
+        USER_BASE + USER_SIZE,
+        0x800000000000,
+        0xffff800000000000,
+        u64::MAX,
+    ] {
+        assert!(crate::inspection::inspect(&r, &reference, &m, 48, va).is_err());
+    }
+    assert_eq!(
+        crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(0)
+    );
+    r.release_space_ref(reference).unwrap();
+}
+#[test]
+fn inspection_rejects_nonpresent_software_entries_huge_leaves_and_reserved_flags() {
+    let mut m = Model::new();
+    let tree = PageTree::new(&mut m, 48).unwrap();
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, tree.root).unwrap();
+    let reference = r.retain_space(s).unwrap();
+    let path = indices(USER_BASE).unwrap();
+    m.write(tree.root, path[0], 512).unwrap();
+    assert_eq!(
+        crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Err(Error::Flags)
+    );
+    m.write(tree.root, path[0], 0).unwrap();
+    tree.map_user(&mut m, USER_BASE, 0x800000, Permissions::RW)
+        .unwrap();
+    let p3 = m.read(tree.root, path[0]).unwrap() & ADDRESS_FIELD;
+    let p2 = m.read(p3, path[1]).unwrap() & ADDRESS_FIELD;
+    let p1 = m.read(p2, path[2]).unwrap() & ADDRESS_FIELD;
+    let old = m.read(p1, path[3]).unwrap();
+    for bad in [old | 512, old | 128, old | 8, old | (1 << 55), old & !NX] {
+        m.write(p1, path[3], bad).unwrap();
+        assert!(crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE).is_err());
+    }
+    m.write(p1, path[3], old).unwrap();
+    let parent = m.read(p2, path[2]).unwrap();
+    m.write(p2, path[2], 0x800000 | 0x87 | NX).unwrap();
+    assert_eq!(
+        crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Err(Error::Flags)
+    );
+    m.write(p2, path[2], parent).unwrap();
+    r.release_space_ref(reference).unwrap();
+}
+#[test]
+fn inspection_applies_ancestor_permissions_and_accepts_hardware_accessed_dirty_bits() {
+    let mut m = Model::new();
+    let tree = PageTree::new(&mut m, 48).unwrap();
+    tree.map_user(&mut m, USER_BASE, 0x800000, Permissions::RW)
+        .unwrap();
+    let mut r = Registry::new();
+    let s = r.create_space().unwrap();
+    r.bind_root(s, tree.root).unwrap();
+    let reference = r.retain_space(s).unwrap();
+    let path = indices(USER_BASE).unwrap();
+    let parent = m.read(tree.root, path[0]).unwrap();
+    m.write(tree.root, path[0], (parent | NX | 32) & !2)
+        .unwrap();
+    assert_eq!(
+        crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(3)
+    );
+    m.write(tree.root, path[0], parent | 32).unwrap();
+    let p3 = m.read(tree.root, path[0]).unwrap() & ADDRESS_FIELD;
+    let p2 = m.read(p3, path[1]).unwrap() & ADDRESS_FIELD;
+    let p1 = m.read(p2, path[2]).unwrap() & ADDRESS_FIELD;
+    let leaf = m.read(p1, path[3]).unwrap();
+    m.write(p1, path[3], leaf | 32 | 64).unwrap();
+    assert_eq!(
+        crate::inspection::inspect(&r, &reference, &m, 48, USER_BASE),
+        Ok(7)
+    );
+    r.release_space_ref(reference).unwrap();
+}

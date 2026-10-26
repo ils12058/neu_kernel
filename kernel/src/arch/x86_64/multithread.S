@@ -45,6 +45,10 @@ neu_multi_payload:
     mov qword ptr [rsp+56],0
     call neu_cap_user_steps
     .endif
+    .if {abi02}
+    mov qword ptr [rsp+56],0
+    call neu_as_user_steps
+    .endif
     xor eax, eax
 .global neu_multi_loop,neu_multi_atomic_site,neu_multi_after_atomic,neu_multi_after_inc,neu_multi_committed,neu_multi_loop_end
 neu_multi_loop:
@@ -85,6 +89,16 @@ neu_multi_committed:
     call neu_cap_user_steps
 8:
     .endif
+    .if {abi02}
+    cmp qword ptr [rsp+56],2
+    je 4f
+    cmp qword ptr [0x402100],0
+    je 4f
+    cmp qword ptr [0x402100],3
+    ja 4f
+    call neu_as_user_steps
+4:
+    .endif
     cmp rax, [rdx + 8]
     jb neu_multi_loop
 neu_multi_loop_end:
@@ -113,11 +127,14 @@ neu_multi_loop_end:
     .if {capabilities}
     call neu_cap_user_final
     .endif
+    .if {abi02}
+    call neu_as_user_final
+    .endif
     mov eax, 1
     call neu_multi_invoke
     test rax, rax
     jne neu_multi_failed
-    movabs rcx, 0x100000003
+    movabs rcx, {abi_info}
     cmp rdx, rcx
     jne neu_multi_failed
     mov rdi, [rsp + 24]
@@ -161,5 +178,8 @@ neu_multi_failed:
     ud2
 .if {capabilities}
     neu_cap_user_body
+.endif
+.if {abi02}
+    neu_as_user_body
 .endif
 neu_multi_payload_end:

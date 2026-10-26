@@ -15,3 +15,5 @@ pub mod scheduler;
 pub mod preemption;
 
 pub mod capability;
+
+pub mod inspection;

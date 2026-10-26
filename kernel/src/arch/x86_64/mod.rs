@@ -86,3 +86,6 @@ pub fn valid_boot_range(address: usize, length: usize, alignment: usize) -> bool
 
 #[cfg(feature = "cap-test")]
 pub mod capabilities;
+
+#[cfg(feature = "abi-02")]
+pub mod address_space;

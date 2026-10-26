@@ -265,6 +265,31 @@ impl Memory<'_, '_> {
         }
         Ok(count)
     }
+    /// Equivalent parent-count invariant, with each parent read once instead
+    /// of once per child. read()/pointer() retain common-root ownership checks.
+    fn verify_parent_references(&self) -> Result<()> {
+        let mut counts = [0usize; TABLES];
+        for parent in self
+            .tables
+            .iter()
+            .filter(|t| t.physical != 0 && t.level > 1)
+        {
+            for index in 0..512 {
+                let entry = self.read(parent.physical, index)?;
+                if entry & 1 != 0
+                    && let Ok(slot) = self.slot(entry & ADDRESS_FIELD)
+                {
+                    counts[slot] += 1;
+                }
+            }
+        }
+        for (slot, table) in self.tables.iter().enumerate() {
+            if table.physical != 0 && counts[slot] != usize::from(table.level != 4) {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(())
+    }
     fn count(&self) -> usize {
         self.tables.iter().filter(|t| t.physical != 0).count()
     }
@@ -589,10 +614,8 @@ impl<'a, 'm> Paging<'a, 'm> {
             if view.physical != table.physical || view.permissions != Permissions::RW || view.user {
                 return Err(Error::Flags);
             }
-            if self.memory.parent_references(table.physical)? != usize::from(table.level != 4) {
-                return Err(Error::Corrupt);
-            }
         }
+        self.memory.verify_parent_references()?;
         if self.translate(SCRATCH)?.is_some() {
             return Err(Error::InUse);
         }
@@ -1111,11 +1134,7 @@ impl Paging<'_, '_> {
                 return Err(Error::Flags);
             }
         }
-        for table in self.memory.tables.iter().filter(|t| t.physical != 0) {
-            if self.memory.parent_references(table.physical)? != usize::from(table.level != 4) {
-                return Err(Error::Corrupt);
-            }
-        }
+        self.memory.verify_parent_references()?;
         let private = tree.translate(&self.memory, UNMAPPED)?;
         if let Some(frame) = space.private {
             let record = self.registry.mapping_for(space.id, UNMAPPED)?;
@@ -1192,7 +1211,7 @@ impl Paging<'_, '_> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
-        self.registry.can_allocate(space.id)?; // also refuses active/pinned roots
+        self.registry.can_destroy_space(space.id)?; // execution pins and object references
         #[cfg(feature = "switch-test")]
         if space.stacks.iter().any(Option::is_some) {
             return Err(Error::InUse);
@@ -1943,7 +1962,7 @@ impl Paging<'_, '_> {
     }
 }
 
-#[cfg(feature = "cap-test")]
+#[cfg(any(feature = "cap-test", feature = "abi-02"))]
 impl Paging<'_, '_> {
     pub fn member_cap_words(&mut self, space: &UserSpace) -> Result<[u64; 4]> {
         self.member_boundary(space)?;
@@ -1953,6 +1972,7 @@ impl Paging<'_, '_> {
             })
         })
     }
+    #[cfg(feature = "cap-test")]
     pub fn member_cap_write(&mut self, space: &UserSpace, index: usize, value: u64) -> Result<()> {
         self.member_boundary(space)?;
         if index >= 4 {
@@ -1961,5 +1981,111 @@ impl Paging<'_, '_> {
         self.with_frame_mut(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
             bytes[256 + index * 8..264 + index * 8].copy_from_slice(&value.to_le_bytes())
         })
+    }
+}
+
+/// A shared borrow freezes structural Paging mutation until the native slice
+/// ends. Only verified, supervisor aliases for this root may be read. Hardware
+/// A/D writes are allowed; no Rust references to table entry storage exist.
+#[cfg(feature = "abi-02")]
+pub struct LiveInspection<'p> {
+    registry: &'p Registry,
+    tables: &'p [TableOwner; TABLES],
+    visible: [bool; TABLES],
+    active: neu_kernel::node::ActiveContext,
+    bits: u8,
+}
+#[cfg(feature = "abi-02")]
+impl LiveInspection<'_> {
+    pub fn inspect(
+        &self,
+        active: neu_kernel::node::ActiveContext,
+        owner: neu_kernel::node::NodeId,
+        reference: &logic::SpaceRef,
+        va: u64,
+    ) -> core::result::Result<u64, i64> {
+        if !neu_kernel::inspection::scope_matches(
+            self.active,
+            active,
+            owner,
+            reference,
+            self.registry,
+            current_root(),
+        ) {
+            return Err(neu_kernel::capability::Error::Owner as i64);
+        }
+        logic::user_range(va, 1).map_err(|_| neu_kernel::syscall::INVALID_ARGUMENT)?;
+        neu_kernel::inspection::inspect(self.registry, reference, self, self.bits, va)
+            .map_err(|_| neu_kernel::syscall::v02::BAD_MAPPING)
+    }
+}
+#[cfg(feature = "abi-02")]
+impl TableMemory for LiveInspection<'_> {
+    fn allocate(&mut self, _: u8) -> Result<u64> {
+        Err(Error::InUse)
+    }
+    fn release(&mut self, _: u64) -> Result<()> {
+        Err(Error::InUse)
+    }
+    fn owned(&self, pa: u64, level: u8) -> bool {
+        self.tables
+            .iter()
+            .enumerate()
+            .any(|(i, t)| self.visible[i] && pa != 0 && t.physical == pa && t.level == level)
+    }
+    fn pinned(&self, _: u64) -> bool {
+        true
+    }
+    fn read(&self, pa: u64, index: usize) -> Result<u64> {
+        if current_root() != self.active.context.root || index >= 512 {
+            return Err(Error::InUse);
+        }
+        let slot = self
+            .tables
+            .iter()
+            .enumerate()
+            .position(|(i, t)| self.visible[i] && pa != 0 && t.physical == pa)
+            .ok_or(Error::NotOwned)?;
+        // SAFETY: activate_user verified these exact owned aliases immediately
+        // before this borrow. Shared Paging borrow forbids replacement/release;
+        // current CR3 and bounds checked here. IF=0, IRQ never reads this view.
+        Ok(unsafe { ptr::read_volatile(((WINDOW + slot as u64 * PAGE) as *const u64).add(index)) })
+    }
+    fn write(&mut self, _: u64, _: usize, _: u64) -> Result<()> {
+        Err(Error::InUse)
+    }
+    fn invalidate(&mut self, _: u64) {}
+    fn flush(&mut self) {}
+}
+#[cfg(feature = "abi-02")]
+impl Paging<'_, '_> {
+    pub fn inspection_view<'p>(
+        &'p self,
+        space: &UserSpace,
+        active: neu_kernel::node::ActiveContext,
+    ) -> Result<LiveInspection<'p>> {
+        if self.registry.active_space() != Some(space.id)
+            || self.registry.root(space.id)? != space.root
+            || current_root() != space.root
+            || active.context.space != space.id
+            || active.context.root != space.root
+        {
+            return Err(Error::InUse);
+        }
+        Ok(LiveInspection {
+            registry: &self.registry,
+            tables: &self.memory.tables,
+            visible: core::array::from_fn(|i| space.tables[i] && !space.stack_tables[i]),
+            active,
+            bits: self.tree.bits,
+        })
+    }
+    pub fn retain_object_space(&mut self, space: &UserSpace) -> Result<logic::SpaceRef> {
+        self.registry.retain_space(space.id)
+    }
+    pub fn release_object_space(&mut self, reference: logic::SpaceRef) -> Result<()> {
+        self.registry
+            .release_space_ref(reference)
+            .map_err(|(e, _)| e)
     }
 }

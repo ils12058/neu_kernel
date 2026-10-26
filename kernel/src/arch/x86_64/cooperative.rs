@@ -36,7 +36,7 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 const MARKERS: [u64; 3] = [0x11225566778899aa, 0xaabbccddeeff1234, 0x1234567887654321];
-global_asm!(include_str!("cooperative.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="cap-test") {0x00400000u64}else if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64},query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
+global_asm!(include_str!("cooperative.S"),preemptive=const cfg!(feature="preempt-test") as u8,probe_wait=const if cfg!(feature="multi-test") {0x01000000u64}else{0x04000000u64},query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,yield_op=const TEST_YIELD,private_value=const native::PRIVATE_VALUE,
     stack_bottom=const logic::KSTACK_BASE+PAGE,stack_guard=const logic::KSTACK_BASE,
     canary_bx=const CANARIES[0],canary_bp=const CANARIES[1],canary_12=const CANARIES[2],

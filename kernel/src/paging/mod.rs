@@ -403,12 +403,28 @@ impl SpaceId {
         }
     }
 }
+/// Owned reference to a generation-checked root. Separate from execution pins.
+#[must_use = "release the space reference at an inactive common-root boundary"]
+#[derive(Debug)]
+pub struct SpaceRef {
+    id: SpaceId,
+    root: u64,
+}
+impl SpaceRef {
+    pub fn id(&self) -> SpaceId {
+        self.id
+    }
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+}
 #[derive(Clone, Copy)]
 struct Space {
     generation: u64,
     live: bool,
     root: u64,
     pins: u8,
+    object_refs: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameId {
@@ -479,6 +495,7 @@ impl Registry {
                 live: false,
                 root: 0,
                 pins: 0,
+                object_refs: 0,
             }; USER_SPACES],
             active: None,
         }
@@ -498,6 +515,7 @@ impl Registry {
             live: true,
             root: 0,
             pins: 0,
+            object_refs: 0,
         };
         Ok(SpaceId { slot, generation })
     }
@@ -521,6 +539,51 @@ impl Registry {
         } else {
             Ok(())
         }
+    }
+    pub fn retain_space(&mut self, id: SpaceId) -> Result<SpaceRef> {
+        let space = self.space(id)?;
+        if self.active.is_some() || space.root == 0 {
+            return Err(Error::InUse);
+        }
+        if space.object_refs == 2 {
+            return Err(Error::Capacity);
+        }
+        let root = space.root;
+        self.spaces[id.slot].object_refs += 1;
+        Ok(SpaceRef { id, root })
+    }
+    pub fn validate_space_ref(&self, reference: &SpaceRef) -> Result<()> {
+        let s = self.space(reference.id)?;
+        if s.root != reference.root || s.root == 0 || s.object_refs == 0 {
+            return Err(Error::NotOwned);
+        }
+        Ok(())
+    }
+    pub fn release_space_ref(
+        &mut self,
+        reference: SpaceRef,
+    ) -> core::result::Result<(), (Error, SpaceRef)> {
+        if let Err(e) = self.validate_space_ref(&reference) {
+            return Err((e, reference));
+        }
+        if self.active.is_some() {
+            return Err((Error::InUse, reference));
+        }
+        self.spaces[reference.id.slot].object_refs -= 1;
+        Ok(())
+    }
+    pub fn object_references(&self, id: SpaceId) -> Result<u8> {
+        Ok(self.space(id)?.object_refs)
+    }
+    pub fn can_destroy_space(&self, id: SpaceId) -> Result<()> {
+        self.can_allocate(id)?;
+        if self.space(id)?.object_refs != 0 {
+            return Err(Error::InUse);
+        }
+        Ok(())
+    }
+    pub fn active_space(&self) -> Option<SpaceId> {
+        self.active
     }
     pub fn pin_space(&mut self, id: SpaceId) -> Result<()> {
         let space = self.space(id)?;
@@ -726,6 +789,7 @@ impl Registry {
     }
     pub fn clear_root(&mut self, id: SpaceId, root: u64) -> Result<()> {
         if self.root(id)? != root
+            || self.space(id)?.object_refs != 0
             || self.space(id)?.pins != 0
             || self.active == Some(id)
             || self.frames.iter().any(|f| f.live && f.owner == id)
@@ -739,6 +803,7 @@ impl Registry {
     pub fn retire_space(&mut self, id: SpaceId) -> Result<()> {
         self.space(id)?;
         if self.active == Some(id)
+            || self.space(id)?.object_refs != 0
             || self.space(id)?.pins != 0
             || self.spaces[id.slot].root != 0
             || self.frames.iter().any(|f| f.live && f.owner == id)
