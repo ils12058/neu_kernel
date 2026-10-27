@@ -33,6 +33,58 @@
     test rdx,rdx
     jne neu_multi_failed
 .endm
+.macro ipc_wait_call op,handle,value,status,scalar
+    mov rax,\op
+    mov rdi,\handle
+    mov rsi,\value
+    xor edx,edx
+    mov r9,0x100000001
+    call neu_ipc_invoke
+    cmp rax,\status
+    jne neu_multi_failed
+    mov rcx,\scalar
+    cmp rdx,rcx
+    jne neu_multi_failed
+.endm
+.macro ipc_wait_error op,handle,value,status
+    mov rax,\op
+    mov rdi,\handle
+    mov rsi,\value
+    xor edx,edx
+    call neu_ipc_invoke
+    cmp rax,\status
+    jne neu_multi_failed
+    test rdx,rdx
+    jne neu_multi_failed
+.endm
+.macro ipc_wait_delay
+    rdtsc
+    shl rdx,32
+    or rax,rdx
+    mov r8,rax
+.Lipc_wait_delay_tick:
+    rdtsc
+    shl rdx,32
+    or rax,rdx
+    sub rax,r8
+    cmp rax,500000000
+    jb .Lipc_wait_delay_tick
+.endm
+.macro ipc_exit status
+    mov edi,\status
+    mov eax,2
+    call neu_ipc_invoke
+    ud2
+.endm
+.macro ipc_close handle
+    mov eax,0x11
+    mov rdi,\handle
+    call neu_ipc_invoke
+    test rax,rax
+    jne neu_multi_failed
+    test rdx,rdx
+    jne neu_multi_failed
+.endm
 .macro neu_ipc_user_body
 neu_ipc_user_steps:
     push rax
@@ -58,12 +110,20 @@ neu_ipc_user_steps:
     je .Lipc_done
     mov [r13],r12
     cmp qword ptr [r15+56],0
+    .if {ipc_wait}
+    jne .Lipc_ready
+    .else
     jne .Lipc_dispatch
+    .endif
     mov eax,1
     call neu_ipc_invoke
     test rax,rax
     jne neu_multi_failed
+    .if {ipc_wait}
+    mov rcx,0x40000007f
+    .else
     mov rcx,0x30000003f
+    .endif
     cmp rdx,rcx
     jne neu_multi_failed
     mov r12d,4
@@ -82,12 +142,210 @@ neu_ipc_user_steps:
     cmp r12,8
     jne .Lipc_discover
     mov qword ptr [r15+56],1
+    .if {ipc_wait}
+    jmp .Lipc_wait
+    .endif
     .if {ipc_stress}
     cmp r14,2
     je .Lipc_done
     mov qword ptr [r15+56],10
     mov qword ptr [0x402168],0
     jmp .Lipc_stress
+    .endif
+    .if {ipc_wait}
+.Lipc_wait:
+    lea rbx,[r14*8+0x402200]
+    mov rax,[rbx]
+    .if {wait_mode} == 0
+    # A: B1 blocks in receive, then A1's blocking send commits 0x1111.
+    cmp r14,3
+    je .Lipc_wait_a_b
+    cmp r14,1
+    je .Lipc_wait_a_a1
+    ipc_exit 0x22
+.Lipc_wait_a_a1:
+    test rax,rax
+    jnz .Lipc_wait_a_send
+    mov qword ptr [rbx],1
+    jmp .Lipc_done
+.Lipc_wait_a_send:
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0x1111,0,0
+    mov qword ptr [rbx],2
+    ipc_exit 0x21
+.Lipc_wait_a_b:
+    test rax,rax
+    jnz .Lipc_wait_a_done
+    mov qword ptr [rbx],1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0x1111
+    mov qword ptr [rbx],2
+    ipc_exit 0x31
+.Lipc_wait_a_done:
+    ipc_exit 0x32
+    .endif
+    .if {wait_mode} == 1
+    # B: A1 fills B's inbound FIFO, blocks on the third send, then commits
+    # exactly once after B1 frees one slot.
+    cmp r14,3
+    je .Lipc_wait_b_b1
+    cmp r14,1
+    je .Lipc_wait_b_a1
+    cmp r14,2
+    je .Lipc_wait_b_a2
+    ipc_exit 0x22
+.Lipc_wait_b_a1:
+    test rax,rax
+    jnz .Lipc_wait_b_done
+    # Wait until A2 has started the blocked receive. A1/A2 share Node A data;
+    # B1 registers its receive wait before A2 lets A1 fill the peer queue.
+    cmp qword ptr [0x402160],1
+    jne .Lipc_wait_b_a1
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xb1,0,0
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xb2,0,0
+    mov qword ptr [rbx],1
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xb3,0,0
+    mov qword ptr [rbx],2
+    ipc_exit 0x23
+.Lipc_wait_b_done:
+    ipc_exit 0x24
+.Lipc_wait_b_b1:
+    # Register an empty-queue receive first, then drain the three scalars. A1
+    # cannot observe capacity until this Thread actually suspends and consumes.
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0xb1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0xb2
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0xb3
+    mov qword ptr [rbx],2
+    ipc_exit 0x34
+.Lipc_wait_b_a2:
+    mov qword ptr [0x402160],1
+    ipc_exit 0x22
+    .endif
+    .if {wait_mode} == 2
+    # C: A1 and A2 both block on Node A's inbound queue. B1 sends after both
+    # registrations exist; wake-one FIFO delivers one scalar to each.
+    cmp r14,3
+    je .Lipc_wait_c_b1
+    cmp r14,1
+    je .Lipc_wait_c_a1
+    # A2
+    test rax,rax
+    jnz .Lipc_wait_c_a2_done
+    mov qword ptr [rbx],1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0xc2
+    mov qword ptr [rbx],2
+    ipc_exit 0x42
+.Lipc_wait_c_a2_done:
+    ipc_exit 0x43
+.Lipc_wait_c_a1:
+    test rax,rax
+    jnz .Lipc_wait_c_a1_done
+    mov qword ptr [rbx],1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0xc1
+    mov qword ptr [rbx],2
+    ipc_exit 0x41
+.Lipc_wait_c_a1_done:
+    ipc_exit 0x44
+.Lipc_wait_c_b1:
+    test rax,rax
+    jnz .Lipc_wait_c_send
+    mov qword ptr [rbx],1
+    # Span at least one 10 ms quantum so A2 (next in FIFO) registers its receive
+    # wait before B1 observes the queue or commits.
+    ipc_wait_delay
+    jmp .Lipc_wait_c_send
+.Lipc_wait_c_send:
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xc1,0,0
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xc2,0,0
+    mov qword ptr [rbx],2
+    ipc_exit 0x45
+    .endif
+    .if {wait_mode} == 3
+    # D: B1 waits in receive while Node A closes its last endpoint reference.
+    cmp r14,3
+    je .Lipc_wait_d_b1
+    cmp r14,1
+    je .Lipc_wait_d_a1
+    ipc_exit 0x22
+.Lipc_wait_d_a1:
+    test rax,rax
+    jnz .Lipc_wait_d_close
+    mov qword ptr [rbx],1
+    jmp .Lipc_done
+.Lipc_wait_d_close:
+    ipc_close "qword ptr [0x402110]"
+    ipc_close "qword ptr [0x402118]"
+    ipc_close "qword ptr [0x402120]"
+    ipc_close "qword ptr [0x402128]"
+    mov qword ptr [rbx],2
+    ipc_exit 0x25
+.Lipc_wait_d_b1:
+    test rax,rax
+    jnz .Lipc_wait_d_done
+    mov qword ptr [rbx],1
+    ipc_wait_error 0x16,"qword ptr [0x402110]",0,-34
+    mov qword ptr [rbx],2
+    ipc_exit 0x35
+.Lipc_wait_d_done:
+    ipc_exit 0x36
+    .endif
+    .if {wait_mode} == 4
+    # E: A1 blocks on a full peer queue; B1 closes its endpoint. The pending
+    # scalar must not be delivered and A1 returns PeerClosed.
+    cmp r14,3
+    je .Lipc_wait_e_b1
+    cmp r14,1
+    je .Lipc_wait_e_a1
+    ipc_exit 0x22
+.Lipc_wait_e_a1:
+    test rax,rax
+    jnz .Lipc_wait_e_done
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xe1,0,0
+    ipc_wait_call 0x15,"qword ptr [0x402110]",0xe2,0,0
+    mov qword ptr [rbx],1
+    ipc_wait_error 0x15,"qword ptr [0x402110]",0xe3,-34
+    mov qword ptr [rbx],2
+    ipc_exit 0x26
+.Lipc_wait_e_done:
+    ipc_exit 0x27
+.Lipc_wait_e_b1:
+    ipc_close "qword ptr [0x402110]"
+    ipc_close "qword ptr [0x402118]"
+    ipc_close "qword ptr [0x402120]"
+    ipc_close "qword ptr [0x402128]"
+    ipc_exit 0x37
+    .endif
+    .if {wait_mode} == 5
+    # F: A1 blocks in receive, A2 faults. Node A cancels A1; B1 observes peer
+    # closure and returns PeerClosed. A2 waits for the registration flag so the
+    # fault cannot outrun the wait it is meant to cancel.
+    cmp r14,3
+    je .Lipc_wait_f_b1
+    cmp r14,2
+    je .Lipc_wait_f_fault
+    mov qword ptr [rbx],1
+    mov qword ptr [0x402160],1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0
+    ipc_exit 0x28
+.Lipc_wait_f_fault:
+    cmp qword ptr [0x402160],1
+    jne .Lipc_wait_f_fault
+    jmp neu_multi_ud_site
+.Lipc_wait_f_b1:
+    mov qword ptr [rbx],1
+    ipc_wait_error 0x16,"qword ptr [0x402110]",0,-34
+    ipc_exit 0x38
+    .endif
+    .if {wait_mode} == 6
+    # G: all three Threads block with no possible producer. The controller must
+    # classify bounded quiescence rather than hang or fabricate a wakeup.
+    mov qword ptr [rbx],1
+    ipc_wait_call 0x16,"qword ptr [0x402110]",0,0,0
+    ipc_exit 0x39
+    .endif
+    jmp .Lipc_done
+    .endif
+.Lipc_ready:
+    .if {ipc_wait}
+    jmp .Lipc_wait
     .endif
 .Lipc_initial_a:
     cmp r14,1
@@ -107,6 +365,11 @@ neu_ipc_user_steps:
     ipc_call 0x13,0x102,1,-16,0
     ipc_call 0x13,0x200000005,1,-17,0
     ipc_call 0x14,"qword ptr [0x402128]",0,-32,0
+    .if {ipc_legacy}
+    # ABI 0.3 images must reject the blocking extension without side effects.
+    ipc_call 0x15,"qword ptr [0x402110]",0,-1,0
+    ipc_call 0x16,"qword ptr [0x402110]",0,-1,0
+    .endif
     ipc_call 0x13,"qword ptr [0x402110]",0,0,0
     ipc_call 0x13,0x100000005,0xfedcba9876543210,0,0 # Guess resolves only locally.
     ipc_call 0x13,"qword ptr [0x402110]",999,-33,0

@@ -5,24 +5,26 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K5 / Phase 5C adds capability-backed Channel endpoints and bounded nonblocking
-scalar IPC as a bridge into the architecture's K6 work. A1/A2 share Node A's
-endpoint; B1 owns the opposite endpoint. Two independent two-message FIFOs carry
-actual scalar messages across isolated address spaces through typed SEND/RECEIVE
-authority. Close and Node cleanup preserve messages for a surviving receiver.
+K6 / Phase 6B adds real blocking scalar IPC. Ring 3 Threads that find an empty
+inbound FIFO or a full peer FIFO register one owned wait, enter the scheduler's
+`Blocked` state, leave the runnable FIFO, and resume through a validated
+post-SYSCALL continuation when a peer commits the matching operation. Close,
+peer retirement and Node faults cancel pending waits and release their pins
+exactly once. The legacy ABI 0.3 nonblocking operations remain immediate.
 
 **Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
 
-The suite passes **159 host tests and 104 QEMU scenarios**, retaining the 129/97
-baseline, plus twelve scheduling repeats and four clean-build QMP boots.
-[Implementation status](docs/IMPLEMENTATION_STATUS.md) records evidence and limits. [Experimental ABI 0.3](docs/abi/experimental-v0.3.md) adds scalar send
-and receive while preserving ABI 0.1/0.2 configurations. [ADR 0017](docs/adr/0017-bounded-scalar-channel-endpoints.md)
-records the ownership and lifetime decision. The architecture v0.2 baseline and
-accepted ADR history remain intact; K6 is not declared complete.
+The suite passes **190 host tests and 115 QEMU scenarios**, retaining the 164/105
+K6A baseline and all earlier regressions. [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+records evidence and limits. [Experimental ABI 0.4](docs/abi/experimental-v0.4.md)
+adds blocking send/receive while preserving ABI 0.1/0.2/0.3.
+[ADR 0019](docs/adr/0019-blocking-channel-waits.md) records the wait,
+suspension, wake, pin and cancellation decision. The architecture v0.2 baseline
+and accepted ADR history remain intact.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private
-Thread stacks. Public creation, blocking/wait queues, capability transport,
+Thread stacks. Public creation, public timeouts/deadlines, capability transport,
 derivation, revocation, shared memory, SMP, TLS/SIMD and ELF runtime remain deferred.
 The platform remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF, Rust 1.95.0
 and Limine 12.9.4/base 6 on Apple Silicon.
@@ -53,6 +55,13 @@ scalar IPC, `--case channels-xapic` for its controller fallback,
 `--case channels-a-fault` or `--case channels-b-fault` for peer/message cleanup,
 `--case channels-rollback` for atomic construction failure, and
 `--case address-space-channel-disabled` for legacy ABI 0.2 rejection.
+Run `--case channels-wait` for blocking receive/wake, `--case channels-wait-send`
+for blocking send/backpressure, `--case channels-wait-fifo` for multiple waiters,
+`--case channels-wait-close-receive` or `--case channels-wait-close-send` for peer
+closure, `--case channels-wait-fault` for Node-fault cancellation, or
+`--case channels-wait-deadlock` for bounded all-blocked quiescence.
+`--case channels-legacy` rechecks immediate ABI 0.3 behavior, and
+`--case native-abi04-disabled` checks legacy rejection of the blocking operations.
 Run `python3 tools/neu.py test --case address-space` for live ABI 0.2
 inspection, `--case address-space-a2-fault` for capability/root teardown,
 `--case address-space-rollback` for failed grants and pool exhaustion, or
@@ -75,6 +84,7 @@ Run `python3 tools/neu.py test --case switch` for cooperative switching,
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
+- [Experimental blocking Channel ABI 0.4](docs/abi/experimental-v0.4.md)
 - [Experimental scalar Channel ABI 0.3](docs/abi/experimental-v0.3.md)
 - [Experimental native ABI 0.2](docs/abi/experimental-v0.2.md)
 - [Architecture Decision Records](docs/adr/README.md)

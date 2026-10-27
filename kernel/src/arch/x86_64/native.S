@@ -195,6 +195,8 @@ neu_native_after_wait_end:
 2:
     .if {abi03_disabled}
     mov eax,0x13
+    .elseif {abi04_disabled}
+    mov eax,0x15
     .elseif {abi02_disabled}
     mov eax,0x12
     .elseif {cap_disabled}

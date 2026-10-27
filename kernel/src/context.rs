@@ -40,6 +40,9 @@ pub struct SavedContext {
     pub fresh: bool,
     pub preemptible: bool,
     pub interrupted: bool,
+    /// A resumed blocking SYSCALL continuation. RCX/R11 still describe the
+    /// return site, but RAX/RDX are the operation result rather than zero.
+    pub continuation: bool,
 }
 impl SavedContext {
     pub fn initial(active: ActiveContext, stack: StackBinding) -> Self {
@@ -49,6 +52,7 @@ impl SavedContext {
             fresh: true,
             preemptible: false,
             interrupted: false,
+            continuation: false,
             frame: Frame {
                 registers: abi::Registers::default(),
                 context: ReturnContext {
@@ -69,6 +73,19 @@ impl SavedContext {
             fresh: false,
             preemptible: false,
             interrupted: false,
+            continuation: false,
+        }
+    }
+    pub fn continuation(active: ActiveContext, stack: StackBinding, frame: Frame) -> Self {
+        let preemptible = frame.context.flags & 0x200 != 0;
+        Self {
+            active,
+            stack,
+            frame,
+            fresh: false,
+            preemptible,
+            interrupted: false,
+            continuation: true,
         }
     }
     pub fn initial_preemptible(active: ActiveContext, stack: StackBinding) -> Self {
@@ -85,6 +102,7 @@ impl SavedContext {
             fresh: false,
             preemptible: true,
             interrupted: true,
+            continuation: false,
         }
     }
     pub fn valid(self, active: ActiveContext, stack: StackBinding) -> bool {
@@ -114,6 +132,8 @@ impl SavedContext {
             || c.ss != abi::USER_SS
             || (self.fresh && self.interrupted)
             || (self.interrupted && !self.preemptible)
+            || (self.fresh && self.continuation)
+            || (self.interrupted && self.continuation)
             || (c.flags & 0x200 != 0) != self.preemptible
             || c.flags
                 & !(abi::USER_FLAGS
@@ -133,8 +153,8 @@ impl SavedContext {
         } else {
             self.frame.registers.rcx == c.rip
                 && self.frame.registers.r11 == c.flags
-                && self.frame.registers.rax == 0
-                && self.frame.registers.rdx == 0
+                && (self.continuation
+                    || (self.frame.registers.rax == 0 && self.frame.registers.rdx == 0))
         }
     }
 }
@@ -147,9 +167,82 @@ pub struct Dispatch {
 pub enum SliceEvent {
     Yield(Frame),
     Preempted(Frame),
+    Blocked(Frame),
     Exited(crate::node::ExitReason),
 }
 const _: () = assert!(core::mem::size_of::<Frame>() == 160);
 const _: () = assert!(core::mem::offset_of!(Frame, context) == 120);
 const _: () = assert!(core::mem::offset_of!(abi::Registers, rax) == 112);
 const _: () = assert!(core::mem::offset_of!(ReturnContext, rsp) == 24);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        node::{Nodes, ThreadContext},
+        paging::Registry,
+    };
+    fn live() -> (ActiveContext, StackBinding) {
+        let mut n = Nodes::new();
+        let mut r = Registry::new();
+        let space = r.create_space().unwrap();
+        r.bind_root(space, 0x1000).unwrap();
+        let node = n.create().unwrap();
+        n.configure(node).unwrap();
+        n.bind_space(node, space).unwrap();
+        let context = ThreadContext {
+            space,
+            root: 0x1000,
+            entry: 0x400000,
+            rsp: 0x404ff8,
+        };
+        let thread = n.initial_thread(node, context).unwrap();
+        n.ready(node).unwrap();
+        let active = ActiveContext {
+            node,
+            thread,
+            context,
+        };
+        (active, StackBinding::new(active))
+    }
+    #[test]
+    fn saved_continuation_accepts_full_syscall_results_but_rejects_forged_frames() {
+        let (active, stack) = live();
+        let mut frame = SavedContext::initial(active, stack).frame;
+        frame.context.rip = 0x400080;
+        frame.context.rsp = 0x404fd8;
+        frame.context.flags = 0x46;
+        frame.registers.rcx = frame.context.rip;
+        frame.registers.r11 = frame.context.flags;
+        frame.registers.rax = 0x1122334455667788;
+        frame.registers.rdx = 0x99;
+        let valid = SavedContext::continuation(active, stack, frame);
+        assert!(valid.valid(active, stack));
+        assert!(valid.continuation);
+        assert!(!valid.fresh);
+        let mut wrong_rcx = valid;
+        wrong_rcx.frame.registers.rcx += 1;
+        assert!(!wrong_rcx.valid(active, stack));
+        let mut wrong_r11 = valid;
+        wrong_r11.frame.registers.r11 ^= 0x40;
+        assert!(!wrong_r11.valid(active, stack));
+        let mut preempt_mismatch = valid;
+        preempt_mismatch.preemptible = true;
+        assert!(!preempt_mismatch.valid(active, stack));
+        let mut interrupted = valid;
+        interrupted.interrupted = true;
+        interrupted.preemptible = true;
+        assert!(!interrupted.valid(active, stack));
+        let mut fabricated_fresh = valid;
+        fabricated_fresh.fresh = true;
+        assert!(!fabricated_fresh.valid(active, stack));
+        let mut yielded = SavedContext::yielded(active, stack, frame);
+        yielded.frame.registers.rax = 1;
+        assert!(!yielded.valid(active, stack));
+        yielded.frame.registers.rax = 0;
+        yielded.frame.registers.rdx = 1;
+        assert!(!yielded.valid(active, stack));
+        yielded.frame.registers.rdx = 0;
+        assert!(yielded.valid(active, stack));
+    }
+}

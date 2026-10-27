@@ -86,6 +86,37 @@ impl Queue {
         model.suspend_context(saved.active, saved)?;
         self.enqueue(model, saved.active.thread)
     }
+    pub fn block(
+        &mut self,
+        model: &mut Nodes,
+        active: ActiveContext,
+        saved: crate::context::SavedContext,
+    ) -> node::Result<()> {
+        if self.contains(active.thread) {
+            return Err(node::Error::InUse);
+        }
+        model.block(active, saved)
+    }
+    pub fn reblock(
+        &mut self,
+        model: &mut Nodes,
+        active: ActiveContext,
+        saved: crate::context::SavedContext,
+    ) -> node::Result<()> {
+        if self.contains(active.thread) {
+            return Err(node::Error::InUse);
+        }
+        model.reblock(active, saved)
+    }
+    /// Admission of a woken blocked Thread. No duplicate enqueue and no stale
+    /// generation can pass because the model validates identity and state.
+    pub fn wake(&mut self, model: &mut Nodes, id: ThreadId) -> node::Result<()> {
+        if self.contains(id) || self.len == MAX_THREADS {
+            return Err(node::Error::InUse);
+        }
+        model.wake(id)?;
+        self.enqueue(model, id)
+    }
     pub fn finish(
         &mut self,
         model: &mut Nodes,
@@ -164,6 +195,18 @@ mod tests {
         frame.registers.rbx = 0x1122334455667788;
         frame.registers.r12 = 0xaabbccddeeff0001;
         frame
+    }
+    fn blocked(dispatch: &Dispatch) -> SavedContext {
+        let mut frame = dispatch.saved.frame;
+        frame.context.rip = 0x400080;
+        frame.context.rsp = 0x404fd8;
+        frame.context.flags = 0x46;
+        frame.registers.rcx = frame.context.rip;
+        frame.registers.r11 = frame.context.flags;
+        // A blocking continuation returns a real SYSCALL result, not yielded zeros.
+        frame.registers.rax = 0x55;
+        frame.registers.rdx = 0x66;
+        SavedContext::continuation(dispatch.active, dispatch.saved.stack, frame)
     }
     fn release(model: &mut Nodes, spaces: &mut Registry, id: ThreadId) {
         let t = model.thread(id).unwrap();
@@ -386,5 +429,69 @@ mod tests {
             }
         );
         assert_eq!(abi::ABI_INFO, 0x100000003);
+    }
+    #[test]
+    fn running_thread_transitions_to_blocked_and_leaves_the_runnable_fifo() {
+        let (mut m, _, mut q, a, _) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        assert_eq!(d.active.thread, a);
+        let saved = blocked(&d);
+        q.block(&mut m, d.active, saved).unwrap();
+        let t = m.thread(a).unwrap();
+        assert_eq!(t.state, ThreadState::Blocked);
+        assert_eq!(t.saved, Some(saved));
+        assert!(!t.queued);
+        assert!(!q.contains(a));
+        assert_eq!(q.len(), 1);
+        assert!(m.active().is_none());
+        assert_eq!(m.node(t.node).unwrap().state, NodeState::Active);
+    }
+    #[test]
+    fn blocked_thread_becomes_runnable_only_through_one_wake_admission() {
+        let (mut m, _, mut q, a, _) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        let saved = blocked(&d);
+        q.block(&mut m, d.active, saved).unwrap();
+        q.wake(&mut m, a).unwrap();
+        assert_eq!(m.thread(a).unwrap().state, ThreadState::Runnable);
+        assert!(q.contains(a));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.wake(&mut m, a), Err(node::Error::InUse));
+        assert_eq!(q.len(), 2);
+        let mut admissions = 0;
+        for _ in 0..2 {
+            let next = q.next(&mut m).unwrap().unwrap();
+            if next.active.thread == a {
+                admissions += 1;
+                assert_eq!(next.saved, saved);
+            }
+            q.yielded(&mut m, next.active, yielded(&next)).unwrap();
+        }
+        assert_eq!(admissions, 1);
+    }
+    #[test]
+    fn a_blocked_thread_is_never_selected_while_another_thread_runs() {
+        let (mut m, _, mut q, a, _) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        q.block(&mut m, d.active, blocked(&d)).unwrap();
+        for _ in 0..3 {
+            let next = q.next(&mut m).unwrap().unwrap();
+            assert_ne!(next.active.thread, a);
+            q.yielded(&mut m, next.active, yielded(&next)).unwrap();
+        }
+    }
+    #[test]
+    fn all_blocked_threads_leave_a_stably_empty_queue_not_a_timeout() {
+        let (mut m, _, mut q, a, b) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        q.block(&mut m, d.active, blocked(&d)).unwrap();
+        let d = q.next(&mut m).unwrap().unwrap();
+        assert_eq!(d.active.thread, b);
+        q.block(&mut m, d.active, blocked(&d)).unwrap();
+        assert!(q.is_empty());
+        assert!(q.next(&mut m).unwrap().is_none());
+        assert_eq!(m.thread(a).unwrap().state, ThreadState::Blocked);
+        assert_eq!(m.thread(b).unwrap().state, ThreadState::Blocked);
+        assert_eq!(q.len(), 0);
     }
 }

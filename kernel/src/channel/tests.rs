@@ -338,3 +338,21 @@ fn corrupt_fifo_and_discard_overflow_refuse_before_retirement_mutates() {
     assert_eq!(c.retire(eb), Err(Error::Terminal));
     assert_eq!(c.snapshot(), before);
 }
+
+#[test]
+fn recycled_endpoint_generations_cannot_satisfy_a_stale_pending_identity() {
+    let mut c = Channels::new();
+    let [a, b] = owners();
+    let [ea, eb] = c.pair([a, b]).unwrap();
+    let stale = ea.id();
+    let stale_channel = c.info(stale).unwrap().channel;
+    c.retire(ea).unwrap();
+    c.retire(eb).unwrap();
+    let [ea, eb] = c.pair([a, b]).unwrap();
+    assert_ne!(ea.id(), stale);
+    assert_ne!(c.info(ea.id()).unwrap().channel, stale_channel);
+    assert_eq!(c.info(stale), Err(Error::Object));
+    assert_eq!(c.receive(stale, a), Err(Error::Object));
+    assert_eq!(c.send(stale, a, 1), Err(Error::Object));
+    assert_eq!(c.receive(eb.id(), b), Err(Error::Empty));
+}

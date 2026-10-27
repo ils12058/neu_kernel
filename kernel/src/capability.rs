@@ -1,6 +1,7 @@
 //! Fixed-capacity Node-local authority. Handles are scalars; object storage and
 //! reference accounting stay in this kernel-owned registry. No public factory.
 use crate::node::{ActiveContext, NodeId};
+use crate::wait::{Kind, WAITERS, Waiter, Waits};
 pub const HANDLES: usize = 8;
 pub const OBJECTS: usize = 4;
 pub const CHANNEL_OBJECTS: usize = 6;
@@ -108,6 +109,17 @@ pub enum Error {
     Terminal = -35,
 }
 pub type Result<T> = core::result::Result<T, Error>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitStart {
+    Committed(u64),
+    Blocked,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settle {
+    Committed(u64),
+    Retry,
+    Failed(Error),
+}
 enum Value {
     Endpoint(crate::channel::EndpointRef),
     Counter(u64),
@@ -166,6 +178,7 @@ pub struct Objects {
     slots: [Object; CHANNEL_OBJECTS],
     limit: usize,
     channels: crate::channel::Channels,
+    waits: Waits,
 }
 impl Default for Objects {
     fn default() -> Self {
@@ -178,6 +191,7 @@ impl Objects {
             slots: [const { Object::EMPTY }; CHANNEL_OBJECTS],
             limit: OBJECTS,
             channels: crate::channel::Channels::new(),
+            waits: Waits::new(),
         }
     }
     pub const fn with_channels() -> Self {
@@ -188,6 +202,247 @@ impl Objects {
     }
     pub fn channel_state(&self) -> &crate::channel::Channels {
         &self.channels
+    }
+    pub fn wait_stats(&self) -> crate::wait::Stats {
+        self.waits.stats()
+    }
+    pub fn node_wait_count(&self, node: NodeId) -> usize {
+        self.waits.node_count(node)
+    }
+    pub fn pins_outside_node(&self, node: NodeId) -> u32 {
+        self.waits.pinned_outside(node)
+    }
+    pub fn wait_snapshot(&self) -> [u64; 64] {
+        self.waits.snapshot()
+    }
+    #[cfg(feature = "channel-wait-test")]
+    fn wait_event(
+        &self,
+        event: u64,
+        waiter: Option<Waiter>,
+        result: i64,
+        saved: crate::wait::witness::Saved,
+    ) {
+        crate::wait::witness::write(
+            event,
+            waiter,
+            result,
+            0,
+            self.waits.stats(),
+            waiter.map_or(0, |w| self.waits.node_count(w.active.node)),
+            self.slots.iter().map(|o| o.pins).sum(),
+            saved,
+        );
+    }
+    pub fn wait_waiter(&self, thread: crate::node::ThreadId) -> Option<Waiter> {
+        self.waits.by_thread(thread)
+    }
+    pub fn take_ready_waits(&mut self) -> [Option<Waiter>; WAITERS] {
+        self.waits.take_ready()
+    }
+    pub fn retry_wait(&mut self, token: u64) -> bool {
+        self.waits.retry(token)
+    }
+    fn endpoint_of(&self, id: ObjectId) -> Option<(crate::channel::EndpointInfo, ObjectId)> {
+        match self.slots.get(id.slot)?.value.as_ref()? {
+            Value::Endpoint(reference) => self
+                .channels
+                .info(reference.id())
+                .ok()
+                .map(|info| (info, id)),
+            _ => None,
+        }
+    }
+    /// Wakes one receive waiter after a committed send. The notification is
+    /// stored by the exclusive registry transaction that committed the enqueue.
+    fn wake_receive(&mut self, info: crate::channel::EndpointInfo) {
+        self.waits
+            .wake(info.channel, 1 - info.side, Kind::Receive, false);
+    }
+    /// A committed receive created capacity in the peer's send queue.
+    fn wake_send(&mut self, info: crate::channel::EndpointInfo) {
+        self.waits
+            .wake(info.channel, 1 - info.side, Kind::Send, false);
+    }
+    fn begin_wait(
+        &mut self,
+        active: ActiveContext,
+        object: ObjectId,
+        info: crate::channel::EndpointInfo,
+        kind: Kind,
+        payload: u64,
+    ) -> Result<u64> {
+        if !self.waits.can_register(active.thread) {
+            return Err(if self.waits.by_thread(active.thread).is_some() {
+                Error::InUse
+            } else {
+                Error::Capacity
+            });
+        }
+        self.pin(object)?;
+        match self.waits.register(
+            active,
+            info.id,
+            info.channel,
+            object,
+            info.side,
+            info.owner,
+            kind,
+            payload,
+        ) {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                self.unpin(object);
+                Err(error)
+            }
+        }
+    }
+    /// Rechecks and commits one woken operation inside the same exclusive
+    /// transaction that owns handle lookup. Retry keeps the original pin.
+    pub fn settle_wait(&mut self, thread: crate::node::ThreadId) -> Settle {
+        let Some(waiter) = self.waits.by_thread(thread) else {
+            return Settle::Failed(Error::Object);
+        };
+        if waiter.state != crate::wait::State::Queued {
+            return Settle::Failed(Error::Stale);
+        }
+        let Some(waiter) = self.waits.remove(waiter.token) else {
+            return Settle::Failed(Error::Object);
+        };
+        if let Some(error) = waiter.terminal {
+            if waiter.pinned {
+                self.unpin(waiter.object);
+            }
+            #[cfg(feature = "channel-wait-test")]
+            self.wait_event(
+                crate::wait::witness::FAILED,
+                Some(waiter),
+                error as i64,
+                crate::wait::witness::Saved::NONE,
+            );
+            return Settle::Failed(error);
+        }
+        let outcome = match waiter.kind {
+            Kind::Send => self
+                .channels
+                .send(waiter.endpoint, waiter.owner, waiter.payload)
+                .map(|()| 0),
+            Kind::Receive => self.channels.receive(waiter.endpoint, waiter.owner),
+        };
+        match outcome {
+            Ok(value) => {
+                if waiter.pinned {
+                    self.unpin(waiter.object);
+                }
+                let info = self
+                    .endpoint_of(waiter.object)
+                    .map(|(info, _)| info)
+                    .unwrap_or(crate::channel::EndpointInfo {
+                        id: waiter.endpoint,
+                        channel: waiter.channel,
+                        side: waiter.side,
+                        owner: waiter.owner,
+                    });
+                match waiter.kind {
+                    Kind::Send => self.wake_receive(info),
+                    Kind::Receive => self.wake_send(info),
+                }
+                #[cfg(feature = "channel-wait-test")]
+                self.wait_event(
+                    crate::wait::witness::COMMIT,
+                    Some(waiter),
+                    value as i64,
+                    crate::wait::witness::Saved::NONE,
+                );
+                Settle::Committed(value)
+            }
+            Err(Error::Full) if waiter.kind == Kind::Send => {
+                #[cfg(feature = "channel-wait-test")]
+                self.wait_event(
+                    crate::wait::witness::RETRY,
+                    Some(waiter),
+                    Error::Full as i64,
+                    crate::wait::witness::Saved::NONE,
+                );
+                if self.waits.restore(waiter) {
+                    Settle::Retry
+                } else {
+                    Settle::Failed(Error::Capacity)
+                }
+            }
+            Err(Error::Empty) if waiter.kind == Kind::Receive => {
+                #[cfg(feature = "channel-wait-test")]
+                self.wait_event(
+                    crate::wait::witness::RETRY,
+                    Some(waiter),
+                    Error::Empty as i64,
+                    crate::wait::witness::Saved::NONE,
+                );
+                if self.waits.restore(waiter) {
+                    Settle::Retry
+                } else {
+                    Settle::Failed(Error::Capacity)
+                }
+            }
+            Err(error) => {
+                if waiter.pinned {
+                    self.unpin(waiter.object);
+                }
+                #[cfg(feature = "channel-wait-test")]
+                self.wait_event(
+                    crate::wait::witness::FAILED,
+                    Some(waiter),
+                    error as i64,
+                    crate::wait::witness::Saved::NONE,
+                );
+                Settle::Failed(error)
+            }
+        }
+    }
+    /// Removes every wait owned by a Node before fault/reclamation. The caller
+    /// has not yet cleared the owning Threads' saved contexts.
+    pub fn cancel_node_waits(&mut self, node: NodeId) -> usize {
+        let mut count = 0;
+        for token in self.waits.tokens().into_iter().flatten() {
+            let Some(waiter) = self.waits.by_token(token) else {
+                continue;
+            };
+            if waiter.node() != node {
+                continue;
+            }
+            self.waits.remove(token);
+            if waiter.pinned {
+                self.unpin(waiter.object);
+            }
+            #[cfg(feature = "channel-wait-test")]
+            self.wait_event(
+                crate::wait::witness::CANCEL,
+                Some(waiter),
+                0,
+                crate::wait::witness::Saved::NONE,
+            );
+            count += 1;
+        }
+        count
+    }
+    fn terminate_endpoint(&mut self, object: ObjectId) {
+        let Some((info, _)) = self.endpoint_of(object) else {
+            return;
+        };
+        for token in self.waits.tokens().into_iter().flatten() {
+            let Some(waiter) = self.waits.by_token(token) else {
+                continue;
+            };
+            if waiter.object == object {
+                if self.waits.mark_terminal(token, Error::PeerClosed)
+                    && self.waits.release_pin(token)
+                {
+                    self.slots[object.slot].pins = self.slots[object.slot].pins.saturating_sub(1);
+                }
+            } else if waiter.channel == info.channel {
+                self.waits.mark_ready(token);
+            }
+        }
     }
     pub fn counter(&mut self, value: u64) -> Result<ObjectRef> {
         self.create(Value::Counter(value))
@@ -390,6 +645,9 @@ impl Objects {
             .checked_sub(1)
             .ok_or(Error::Object)?;
         self.slots[id.slot].references = references;
+        if references == 0 {
+            self.terminate_endpoint(id);
+        }
         self.collect(id.slot);
         Ok(())
     }
@@ -651,18 +909,66 @@ impl Guard<'_> {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
-        self.objects.channels.send(info.id, self.caller, payload)
+        self.objects.channels.send(info.id, self.caller, payload)?;
+        self.objects.wake_receive(info);
+        Ok(())
     }
     pub fn channel_receive(&mut self) -> Result<u64> {
         if !self.rights.contains(Rights::RECEIVE) {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
-        self.objects.channels.receive(info.id, self.caller)
+        let value = self.objects.channels.receive(info.id, self.caller)?;
+        self.objects.wake_send(info);
+        Ok(value)
+    }
+    /// Commits immediately when possible; otherwise registers the Thread's one
+    /// pending operation and returns `Blocked` without touching the queue count.
+    pub fn channel_send_wait(&mut self, active: ActiveContext, payload: u64) -> Result<WaitStart> {
+        if !self.rights.contains(Rights::SEND) {
+            return Err(Error::Rights);
+        }
+        let info = self.endpoint_info()?;
+        match self.objects.channels.send(info.id, self.caller, payload) {
+            Ok(()) => {
+                self.objects.wake_receive(info);
+                Ok(WaitStart::Committed(0))
+            }
+            Err(Error::Full) => self
+                .objects
+                .begin_wait(active, self.id, info, Kind::Send, payload)
+                .map(|_| WaitStart::Blocked),
+            Err(error) => Err(error),
+        }
+    }
+    pub fn channel_receive_wait(&mut self, active: ActiveContext) -> Result<WaitStart> {
+        if !self.rights.contains(Rights::RECEIVE) {
+            return Err(Error::Rights);
+        }
+        let info = self.endpoint_info()?;
+        match self.objects.channels.receive(info.id, self.caller) {
+            Ok(value) => {
+                self.objects.wake_send(info);
+                Ok(WaitStart::Committed(value))
+            }
+            Err(Error::Empty) => self
+                .objects
+                .begin_wait(active, self.id, info, Kind::Receive, 0)
+                .map(|_| WaitStart::Blocked),
+            Err(error) => Err(error),
+        }
     }
     #[cfg(feature = "channel-test")]
     pub fn registry_stats(&self) -> Stats {
         self.objects.stats()
+    }
+    #[cfg(feature = "channel-test")]
+    pub fn wait_stats(&self) -> crate::wait::Stats {
+        self.objects.wait_stats()
+    }
+    #[cfg(feature = "channel-test")]
+    pub fn wait_snapshot(&self) -> [u64; 64] {
+        self.objects.wait_snapshot()
     }
     pub fn channel_snapshot(&self) -> [u64; 22] {
         self.objects.channels.snapshot()

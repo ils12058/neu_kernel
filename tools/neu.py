@@ -64,9 +64,12 @@ AS_CASES=('address-space','address-space-xapic','address-space-a-fault','address
 FEATURES.update({name:'test-'+name for name in AS_CASES})
 FEATURES['native-abi02-disabled']='test-native-abi02-disabled'
 NATIVE_CASES['native-abi02-disabled']=1
-IPC_CASES=('channels','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback','channels-stress')
+IPC_CASES=('channels','channels-legacy','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback','channels-stress')
+WAIT_CASES=('channels-wait','channels-wait-send','channels-wait-fifo','channels-wait-close-receive','channels-wait-close-send','channels-wait-fault','channels-wait-deadlock','channels-wait-xapic')
+IPC_CASES+=WAIT_CASES
 FEATURES.update({name:'test-'+name for name in IPC_CASES})
 FEATURES['native-abi03-disabled']='test-native-abi03-disabled';NATIVE_CASES['native-abi03-disabled']=1
+FEATURES['native-abi04-disabled']='test-native-abi04-disabled';NATIVE_CASES['native-abi04-disabled']=1
 AS_CASES+=('address-space-channel-disabled',)
 FEATURES['address-space-channel-disabled']='test-address-space-channel-disabled'
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
@@ -168,7 +171,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -1221,13 +1224,13 @@ def check_address_space(case,text,symbols,members,state):
 
 
 def observe_ipc_request(qmp,cpu,symbols,record):
-    reg=lambda k:native_register(cpu,k);w=debug_words(qmp,symbols['neu_ipc_witness'],64)
+    reg=lambda k:native_register(cpu,k);w=debug_words(qmp,symbols['neu_ipc_witness'],64);wait='neu_wait_witness' in symbols
     if w[1:6]!=[record[k] for k in ('node','thread','space','root')]+[record['node']] or 'CPL=0' not in cpu or reg('CS')!=8 or reg('SS')!=0x10 or reg('CR3')!=record['root'] or reg('RFL')&0x77700 or not record['bottom']<=reg('RSP')<record['top']-160:raise Failure('Channel operation lost trusted caller/root/privilege binding.')
     if reg('CR0')&10!=10 or reg('CR4')&0x50600 or reg('EFER')&1!=1:raise Failure('Unsupported Channel CPU state.')
     tr=re.search(r'TR =0018 ([0-9a-fA-F]+)',cpu)
     if not tr or debug_words(qmp,int(tr[1],16)+4,1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_selected_top'],1)[0]!=record['top'] or debug_words(qmp,symbols['neu_native_busy'],1)[0]!=1:raise Failure('Channel TSS/native ownership mismatch.')
     frame=debug_words(qmp,w[21],20)
-    if w[20:22]!=[record['top'],record['top']-160] or w[22]&0x600 or w[23]!=1 or frame[14]!=w[6] or frame[8:10]!=w[7:9] or frame[15:17]!=[w[18],0x3b] or frame[18:]!=[w[19],0x33] or frame[17]&0x202!=0x202 or w[18]!=multi_site(symbols,'neu_ipc_syscall_resume'):raise Failure('Missing actual Ring 3 Channel SYSCALL frame.')
+    if w[20:22]!=[record['top'],record['top']-160] or w[22]&0x600 or (w[23]&1 if wait else w[23])!=1 or frame[14]!=w[6] or frame[8:10]!=w[7:9] or frame[15:17]!=[w[18],0x3b] or frame[18:]!=[w[19],0x33] or frame[17]&0x202!=0x202 or w[18]!=multi_site(symbols,'neu_ipc_syscall_resume'):raise Failure('Missing actual Ring 3 Channel SYSCALL frame.')
     queues=[];walks=[]
     if w[26]==w[27] or not w[26] or not w[27]:raise Failure('Directional queues alias or have no real storage.')
     for i,address in enumerate(w[26:28]):
@@ -1236,8 +1239,451 @@ def observe_ipc_request(qmp,cpu,symbols,record):
         actual=debug_words(qmp,address,5)
         if actual!=w[34+5*i:39+5*i]:raise Failure('Actual FIFO head/tail/length/payload differs from operation witness.')
         queues.append(actual);walks.append(walk)
-    if w[15] and (w[15]!=1 or w[12]!=4 or w[24]>1 or w[25]!=record['node']):raise Failure('Authorized Channel operation did not pin its owned typed endpoint.')
+    if w[15] and ((not wait and w[15]!=1) or (wait and not 1<=w[15]<=3) or w[12]!=4 or w[24]>1 or w[25]!=record['node']):raise Failure('Authorized Channel operation did not pin its owned typed endpoint.')
     return {'cpu':cpu,'words':w,'frame':frame,'queues':queues,'walks':walks}
+
+
+def check_wait_multi(case,text,symbols,observations,kernel_root,qmp):
+    calibrated=re.search(r'Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=10000',text)
+    if not calibrated:raise Failure('Missing three-Thread 10 ms calibration.')
+    hz,ref,a,b,c,divided,initial=map(int,calibrated.groups());samples=(a,b,c)
+    if hz!=1193182 or ref!=11932 or divided!=sorted(samples)[1]*hz//ref or initial!=(divided*10000+500000)//1000000 or max(samples)-min(samples)>sorted(samples)[1]//4:raise Failure('Invalid three-Thread clockevent calibration.')
+    pattern=r'Multi Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) user_base=(0x[0-9a-f]+) initial_rsp=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_pa=(0x[0-9a-f]+) k0=(0x[0-9a-f]+) k1=(0x[0-9a-f]+) seed=(\d+)'
+    ready=list(re.finditer(pattern,text));keys=('label','node','thread','space','root','user_base','initial_rsp','bottom','top','data_pa','user_pa','k0','k1','seed')
+    if len(ready)!=3 or [int(m[1]) for m in ready]!=[1,3,2]:raise Failure('Three live member resources were not constructed before execution.')
+    records={int(m[1]):dict(zip(keys,map(lambda v:int(v,0),m.groups()))) for m in ready}
+    if any(records[1][key]!=records[2][key] for key in ('node','space','root','data_pa')) or any(records[1][key]==records[3][key] for key in ('node','space','root','data_pa')):raise Failure('Same-Node sharing or different-Node isolation is missing.')
+    if any(len({r[key] for r in records.values()})!=3 for key in ('thread','user_base','initial_rsp','bottom','top','user_pa','k0','k1')):raise Failure('Threads share a private stack or execution identity.')
+    all_stack_pa=[r[key] for r in records.values() for key in ('user_pa','k0','k1')]
+    if len(set(all_stack_pa))!=9 or set(all_stack_pa)&{records[1]['data_pa'],records[3]['data_pa']}:raise Failure('Private stacks alias shared data or another stack.')
+    for label,r in records.items():
+        slot=(r['thread']&0xffffffff)-1
+        if slot>=3 or r['bottom']!=0xffffc00000001000+slot*0x4000 or r['top']!=r['bottom']+8192 or r['user_base']!=0x404000+slot*0x4000 or r['initial_rsp']!=r['user_base']+4088 or r['seed']!={1:35,2:53,3:77}[label]:raise Failure('Invalid bounded member stack/generation binding.')
+    selected=list(re.finditer(r'Multi selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false) peer=(true|false)\n',text))
+    if not selected or ready[-1].end()>selected[0].start() or 'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000' not in text:raise Failure('The scheduler did not admit all three before dispatch.')
+    peak=re.search(r'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000 allocated=(\d+) free=(\d+) tables=(\d+)',text)
+    if not peak or int(peak[1])!=int(peak[3])+16 or int(peak[3])!=(42 if case=='channels-wait-xapic' else 33):raise Failure('Three-member capacity differs from its bounded accounting design.')
+    exits={'channels-wait':{1:33,2:34,3:49},'channels-wait-xapic':{1:33,2:34,3:49},'channels-wait-send':{1:35,2:34,3:52},'channels-wait-fifo':{1:65,2:66,3:69},'channels-wait-close-receive':{1:37,2:34,3:53},'channels-wait-close-send':{1:38,2:34,3:55},'channels-wait-fault':{2:0,3:56},'channels-wait-deadlock':{}}[case]
+    fault_label=2 if case=='channels-wait-fault' else None;deadlock=case=='channels-wait-deadlock'
+    by_thread={r['thread']:label for label,r in records.items()}
+    woken_events=[(m.start(),int(m[1]),int(m[2]),int(m[3]),int(m[4],0)) for m in re.finditer(r'Multi woken: thread=(\d+) wait=(\d+) kind=(\d+) RIP=(0x[0-9a-f]+)',text)]
+    calendar=[];fifo=[1,3,2];saved={};blocked={};waiting=set();settled={};outcomes={};retired=set();captures={1:0,2:0,3:0};last_work={1:0,2:0,3:0};suspended_counts={};events=[];order=[];shared_audits=[];user_samples=[];code_frames={};blocked_events=[];woken_records=[];wi=0
+    def retire_line(m,node):
+        nonlocal retired
+        label=int(m[1]);thread=int(m[2]);freed=int(m[3]);pins=int(m[4]);root=int(m[5],16)
+        if label not in records or label in retired or thread!=records[label]['thread'] or freed<3 or root!=records[label]['root']:raise Failure('Thread exit/cancellation retired a foreign or duplicate identity.')
+        remaining=sum(records[o]['node']==node and o not in retired and o!=label for o in records)
+        if pins!=remaining:raise Failure('Thread retirement pin count does not match surviving same-Node members.')
+        retired.add(label)
+    for i,m in enumerate(selected):
+        seq,label,node,thread,space,root=map(lambda v:int(v,0),m.groups()[:6]);r=records[label]
+        while wi<len(woken_events) and woken_events[wi][0]<m.start():
+            position,wt,widx,kind,rip=woken_events[wi];wi+=1
+            owner=by_thread.get(wt)
+            if owner is None or owner not in blocked or owner in outcomes:raise Failure('Wake notification named a non-blocked/terminal Thread.')
+            if owner in fifo:raise Failure('A wake duplicated a runnable Thread in the scheduler queue.')
+            waiting.discard(owner)
+            fifo.append(owner);woken_records.append({'thread':wt,'wait':widx,'kind':kind,'rip':rip,'label':owner})
+        if seq!=i+1 or not fifo or fifo.pop(0)!=label or (node,thread,space,root)!=tuple(r[k] for k in ('node','thread','space','root')):raise Failure('Member selection violated Thread FIFO/lifecycle ownership.')
+        if label in outcomes or label in retired:raise Failure('A terminal Thread was selected again.')
+        order.append(label);episode=text[m.end():selected[i+1].start() if i+1<len(selected) else len(text)]
+        taken=logged_frames(episode,'multi-taken')
+        if len(taken)!=1 or taken[0][0]!=thread:raise Failure('Missing unique member context consumption.')
+        frame=taken[0][1];continuation=label in blocked
+        if continuation:
+            expected_frame=blocked[label]
+        elif label in saved:
+            expected_frame=saved[label]
+        else:
+            expected_frame=[0]*15+[USER_CODE,0x3b,0x202,r['initial_rsp'],0x33]
+        if frame!=expected_frame:raise Failure('A member restarted or lost its complete interrupted/blocked state.')
+        fresh=label not in blocked and label not in saved and label not in outcomes and label not in retired
+        if (m[7]=='true')!=fresh:raise Failure('A client selected a fabricated fresh member context.')
+        if (m[8]=='true')!=bool(fifo):raise Failure('Selection peer flag disagrees with the actual runnable queue.')
+        settles=list(re.finditer(r'Multi settled: thread=(\d+)(?: result=(0x[0-9a-f]+)| error=(-?\d+))\n',episode))
+        if 'Multi retry blocked:' in episode:raise Failure('Unexpected retry remains outside the selected wait scenarios.')
+        if continuation:
+            if len(settles)!=1 or int(settles[0][1])!=thread:raise Failure('A blocked Thread resumed without exactly one settle transaction.')
+            settle=settles[0];status=int(settle[3]) if settle[3] else 0;scalar=int(settle[2],16) if settle[2] else 0
+            settled[seq]={'label':label,'status':status,'scalar':scalar}
+            del blocked[label];waiting.discard(label)
+        else:
+            if settles:raise Failure('An unblocked Thread fabricated a wait settlement.')
+        if seq not in observations or 'restore' not in observations[seq]:raise Failure('Missing actual selected restore-frame observation.')
+        obs=observations[seq];restore=obs['restore']['frame']
+        if continuation:
+            expected=list(frame);expected[11]=scalar;expected[14]=status&((1<<64)-1)
+            if restore!=expected:raise Failure('Blocked continuation restore frame differs from its committed post-syscall result.')
+        elif restore!=frame:raise Failure('Actual selected restore frame differs from saved owner state.')
+        code_pa=obs['restore']['code_walk']['physical']
+        if node not in code_frames:
+            code_frames[node]=code_pa
+        elif code_frames[node]!=code_pa:raise Failure('Sibling Threads did not share Node RX backing.')
+        for slot in range(3):
+            owner=next(k for k,v in records.items() if (v['thread']&0xffffffff)-1==slot)
+            expected=records[owner]['node']==node and owner not in retired
+            if obs['restore']['all_user_stacks'][str(slot)]['present']!=expected or obs['restore']['all_kernel_stacks'][str(slot)]['present']!=expected:raise Failure('Retired/foreign member stack is mapped or a healthy sibling was unmapped.')
+        for stage in ('user','irq'):
+            if stage not in obs:continue
+            sample=obs[stage];words=sample['words'];total=0
+            for owner,record in records.items():
+                if record['node']!=node:continue
+                stored=words[8+(owner-1)*4]
+                count=outcomes[owner]['committed'] if owner in outcomes else multi_committed(stored,sample['frame'] if owner==label else saved.get(owner),symbols)
+                if count<stored or count-stored>1:raise Failure('Atomic completion witness is outside one interruptible instruction sequence.')
+                total+=count
+            if total!=words[0]:raise Failure('QMP shared counter differs from actual committed atomic increments.')
+            if stage=='user':user_samples.append({'sequence':seq,'label':label,'work':words[8+(label-1)*4],'shared_total':words[0]})
+        irq=list(re.finditer(r'Preempt IRQ: tick=(\d+) sequence=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) flags=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) handler=(0x[0-9a-f]+) vector=48 ISR_before=1 ISR_after=0 switch=(true|false)\n',episode))
+        irq_frames=logged_frames(episode,'irq')
+        if len(irq)!=len(irq_frames):raise Failure('Member IRQ event/frame count mismatch.')
+        for event,(owner,words) in zip(irq,irq_frames):
+            tick,sequence,n,t,s,cr3,rip,rsp,flags,cs,ss,handler=map(lambda v:int(v,0),event.groups()[:-1]);switched=event[13]=='true'
+            if sequence!=seq or (n,t,s,cr3)!=(node,thread,space,root) or tick!=(events[-1]['tick']+1 if events and events[-1]['sequence']==seq else tick) or owner!=thread or words[15:]!=[rip,cs,flags,rsp,ss] or cs!=0x3b or ss!=0x33 or flags&0x202!=0x202 or flags&~0x10ad7 or not r['user_base']<=rsp<=r['initial_rsp'] or not r['bottom']<=handler<r['top']-176 or switched!=bool(fifo):raise Failure('Member IRQ used wrong CPU/root/stack/acknowledgment ownership.')
+            if events and tick<=events[-1]['tick']:raise Failure('Hardware event accounting is not monotonic.')
+            multi_registers(words,r,symbols);events.append({'tick':tick,'sequence':seq,'label':label,'frame':words,'switched':switched})
+        if 'irq' in obs and (thread,obs['irq']['frame']) not in irq_frames:raise Failure('Recorded member handoff was not the actual QMP hardware frame.')
+        yielded=logged_frames(episode,'multi-saved')
+        if yielded:
+            if len(yielded)!=1 or not fifo or not irq_frames or yielded[0]!=(thread,irq_frames[-1][1]) or seq not in observations or 'irq' not in observations[seq]:raise Failure('Member scheduling lacks a real copied timer context.')
+            saved[label]=yielded[0][1];captures[label]+=1;fifo.append(label)
+            progress=re.search(r'Multi progress: label=(\d+) captures=(\d+) stored=(\d+) committed=(\d+) boots=1 total=(\d+)',episode)
+            if not progress or (int(progress[1]),int(progress[2]))!=(label,captures[label]) or int(progress[4])<last_work[label] or multi_committed(int(progress[3]),saved[label],symbols)!=int(progress[4]):raise Failure('A member failed to make independent atomic progress.')
+            actual_stored=observations[seq]['irq']['words'][8+(label-1)*4]
+            if actual_stored!=int(progress[3]):raise Failure('Saved member progress was not the actual observed IRQ memory.')
+            suspended_counts[label]=multi_committed(actual_stored,saved[label],symbols);last_work[label]=int(progress[4])
+        blocks=list(re.finditer(r'Multi blocked: label=(\d+) thread=(\d+) RIP=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) queue=(\d+)',episode))
+        if len(blocks)>1:raise Failure('A selection produced multiple incompatible wait suspensions.')
+        if blocks:
+            block=blocks[0];blocked_frames=logged_frames(episode,'multi-blocked')
+            if int(block[1])!=label or int(block[2])!=thread or len(blocked_frames)!=1 or blocked_frames[0][0]!=thread:raise Failure('Blocked continuation lacks one actual saved syscall frame.')
+            bframe=blocked_frames[0][1]
+            if (int(block[3],16),int(block[4],16))!=(bframe[15],bframe[18]):raise Failure('Blocked report differs from the saved continuation frame.')
+            if int(block[5])!=len(fifo):raise Failure('Blocked suspension queue length differs from the runnable set.')
+            if label in saved:saved.pop(label)
+            if label in fifo:fifo.remove(label)
+            blocked[label]=bframe;waiting.add(label);blocked_events.append({'seq':seq,'label':label,'frame':bframe,'queue':int(block[5])})
+        cancelled=list(re.finditer(r'Multi cancelled: label=(\d+) thread=(\d+) by=(\d+) committed=(\d+) saved=false queued=false',episode))
+        outcome=re.search(r'Multi outcome: label=(\d+) thread=(\d+) reason=(normal|fault) status=(\d+) committed=(\d+) node_state=(Active|Exited)',episode)
+        if outcome:
+            if int(outcome[1])!=label or int(outcome[2])!=thread or label not in exits and fault_label!=label:raise Failure('Unexpected member terminal outcome.')
+            reason=outcome[3];status=int(outcome[4]);committed=int(outcome[5])
+            if reason=='fault':
+                if fault_label!=label or status!=0:raise Failure('Wrong Node fault disposition for the wait fixture.')
+                fault=re.search(r'Node user fault: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+)',episode)
+                if not fault:raise Failure('Missing actual wait-fixture fault frame.')
+                v=list(map(lambda x:int(x,0),fault.groups()))
+                if tuple(v[:7])!=(node,thread,space,root,6,0,multi_site(symbols,'neu_multi_ud_site')) or v[8:11]!=[0x3b,0x33,r['initial_rsp']-0xc0] or not r['bottom']<=v[12]<r['top']:raise Failure('Wait-fixture fault metadata does not match actual selected execution.')
+                waits=re.search(r'Multi waits canceled: node=(\d+) count=(\d+) reason=fault',episode)
+                expected_cancel=[o for o in waiting if records[o]['node']==node and o not in retired]
+                if not waits or int(waits[1])!=node or int(waits[2])!=len(expected_cancel):raise Failure('Node fault did not cancel exactly the blocked waits it owns.')
+                if {int(c[1]) for c in cancelled}!=set(expected_cancel):raise Failure('Node-wide fault did not cancel exactly its blocked waiters.')
+                for c in cancelled:
+                    owner=int(c[1])
+                    if int(c[2])!=records[owner]['thread'] or int(c[3])!=thread or int(c[4])!=suspended_counts.get(owner,last_work[owner]):raise Failure('Wait cancellation retired a foreign Thread identity.')
+                    blocked.pop(owner,None);waiting.discard(owner);outcomes[owner]={'reason':'cancelled','by':thread,'committed':int(c[4])}
+            else:
+                if label not in exits or status!=exits[label] or committed<last_work[label]:raise Failure('Normal wait-fixture exit status/progress was corrupted.')
+                if cancelled or re.search(r'Multi waits canceled:',episode):raise Failure('A healthy exit fabricated wait cancellation.')
+                if label in waiting:raise Failure('A waiting Thread reported a normal terminal outcome.')
+            remaining_same=any(records[o]['node']==node and o not in retired and o!=label and o not in {int(c[1]) for c in cancelled} for o in records)
+            if (outcome[6]=='Active')!=remaining_same:raise Failure('Node lifetime was equated with an individual Thread exit.')
+            retired_here=list(re.finditer(r'Multi Thread retired: label=(\d+) thread=(\d+) freed=(\d+) pins=(\d+) root=(0x[0-9a-f]+) outcome=retained',episode))
+            expected_retired={label}|{int(c[1]) for c in cancelled}
+            if {int(t[1]) for t in retired_here}!=expected_retired:raise Failure('Thread exit/cancellation did not retire exactly its own stack resources.')
+            for t in retired_here:retire_line(t,node)
+            outcomes[label]={'reason':reason,'status':status,'committed':committed}
+            saved.pop(label,None)
+            reclaimed=f'Multi Node reclaimed: node={node} final_outcome=retained' in episode
+            if reclaimed!= (not remaining_same):raise Failure('Shared root was freed before its last Thread or leaked afterward.')
+        audits=re.findall(r'Multi shared audit: node=(\d+) total=(\d+) committed=(\d+) pending=(\d+) pins=(\d+)',episode)
+        if len(audits)!=1 or int(audits[0][0])!=node or audits[0][1]!=audits[0][2] or not 0<=int(audits[0][3])<=2:raise Failure('Shared atomic sum was not reconciled before resource release.')
+        shared_audits.append(list(map(int,audits[0])))
+    if wi!=len(woken_events):raise Failure('A wake notification was emitted after the final dispatch.')
+    quiesced=list(re.finditer(r'Multi Node quiesced: node=(\d+) waits_canceled=(\d+) reason=no-runnable',text))
+    no_runnable=re.search(r'Multi no-runnable classification: quiesced=(\d+) dispatches=(\d+)',text)
+    if deadlock:
+        if set(outcomes) or not code_frames or set(blocked)!={1,2,3} or len(quiesced)!=2 or sum(int(q[2]) for q in quiesced)!=3 or {int(q[1]) for q in quiesced}!={records[1]['node'],records[3]['node']} or not no_runnable or tuple(map(int,no_runnable.groups()))!=(3,len(selected)):raise Failure('No-runnable state was not explicitly classified and canceled.')
+        quiesce_retired=list(re.finditer(r'Multi Thread retired: label=(\d+) thread=(\d+) freed=(\d+) pins=(\d+) root=(0x[0-9a-f]+) outcome=retained',text))
+        if {int(t[1]) for t in quiesce_retired}!={1,2,3}:raise Failure('Quiescence did not retire every blocked Thread exactly once.')
+        for t in quiesce_retired:retire_line(t,records[int(t[1])]['node'])
+        blocked.clear()
+    else:
+        if quiesced or no_runnable:raise Failure('A completing wait scenario claimed deadlock quiescence.')
+        if fifo or set(outcomes)!={1,2,3} or retired!={1,2,3} or blocked:raise Failure('Missing terminal/empty completion of all wait members.')
+        if len(re.findall(r'Multi Node reclaimed:',text))!=2:raise Failure('Both Node roots were not reclaimed after their last Threads.')
+    drains=re.findall(r'Preempt deferred drained: before=(\d+) after=(\d+) eois=(\d+) root=(0x[0-9a-f]+) IF=0 kernel_switch=false',text)
+    for before,after,eois,root in drains:
+        if int(after)!=int(before)+1 or after!=eois or int(root,16)!=kernel_root:raise Failure('Deferred kernel drain changed scheduling or violated acknowledgment.')
+    stopped=re.search(r'Preempt timer stopped: ticks=(\d+) eois=(\d+) user=(\d+) drain=(\d+) ISR=0 IRR=0 initial=0 current=0 SVR=disabled IF=0',text)
+    done=re.search(r'Multiple Thread test passed: dispatches=(\d+) captures=(\d+) queue=empty running=none IF=0',text)
+    baseline=re.search(r'Multi baseline: allocated=(\d+) free=(\d+) tables=(\d+) root=(0x[0-9a-f]+)',text);restored=re.search(r'Multi accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)',text)
+    if not stopped or not done or not baseline or not restored or baseline.groups()[:3]!=restored.groups() or int(baseline[4],16)!=kernel_root:raise Failure('Missing exact final shared-root accounting.')
+    ticks,eois,user,drain=map(int,stopped.groups())
+    if ticks!=eois or user!=len(events) or ticks!=user+drain or not len(drains)<=drain<=len(drains)+1 or tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('User IRQs, safe drains, EOIs and selections were conflated.')
+    if deadlock and (ticks!=0 or captures!={1:0,2:0,3:0}):raise Failure('No-runnable quiescence fabricated timer progress.')
+    observed_ticks={e['tick'] for e in events}|{int(row[1]) for row in drains}
+    if observed_ticks!={*range(1,ticks+1)} and not (drain==len(drains)+1 and observed_ticks==set(range(1,ticks))):raise Failure('Missing hardware event accounting between user and kernel windows.')
+    final=qmp.call('human-monitor-command',{'command-line':'info lapic'})
+    if not re.search(r'LVTT\s+0x00010030.*masked',final) or 'APIC disabled' not in final or 'TPR 0xff' not in final or not re.search(r'ISR\s+\(none\)',final) or not re.search(r'IRR\s+\(none\)',final) or not re.search(r'initial_count = 0 current_count = 0',final):raise Failure('Three-Thread timer did not quiesce before the controlled halt.')
+    for name in ('neu_native_busy','neu_native_selected_top','neu_native_saved_user_rsp','neu_user_saved_rsp'):
+        if debug_words(qmp,symbols[name],1)[0]!=0:raise Failure('Stale native/shared-root entry state at final halt.')
+    if debug_words(qmp,symbols['neu_preempt_busy'],1)[0]&255 or int(re.search(r'EFER=([0-9a-fA-F]+)',qmp.call('human-monitor-command',{'command-line':'info registers'}))[1],16)&1:raise Failure('Stale IRQ busy state or SCE at halt.')
+    witness_address=symbols['neu_wait_witness'];header=debug_words(qmp,witness_address,2)
+    if header[0]!=header[1] or not 0<header[1]<=48:raise Failure('Wait witness publication cursor/count is inconsistent.')
+    witness=[debug_words(qmp,witness_address+16+i*28*8,28) for i in range(header[1])]
+    if any(r[1]!=i+1 for i,r in enumerate(witness)) or any(r[0] not in range(1,14) for r in witness):raise Failure('Wait witness records lost publication order or event identity.')
+    return {'threads':records,'peak':list(map(int,peak.groups())),'calibration':{'samples':list(samples),'divided_hz':divided,'initial':initial},'order':order,'captures':captures,'events':events,'outcomes':outcomes,'blocked':blocked_events,'woken':woken_records,'settled':settled,'retired':sorted(retired),'quiesced':[list(map(int,q.groups())) for q in quiesced],'shared_audits':shared_audits,'user_samples':user_samples,'observations':observations,'ticks':ticks,'eois':eois,'drain_ticks':drain,'accounting':list(map(int,restored.groups())),'final_lapic':final,'wait_witness':witness}
+
+
+def check_ipc_wait(case,text,symbols,members,state):
+    a=members['threads'][1]['node'];b=members['threads'][3]['node'];owners=[a,b]
+    if f'IPC bootstrap: A={a} B={b} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI=0.4' not in text:raise Failure('Missing complete trusted blocking Channel bootstrap.')
+    records=[list(map(lambda v:int(v,0),s.split(','))) for s in re.findall(r'IPC record: words=([^\n]+)',text)]
+    witness=members.get('wait_witness')
+    if not witness:raise Failure('Missing QMP wait-registry witness.')
+    info=members['threads'];by_thread={int(r['thread']):label for label,r in info.items()}
+    ends=[0x101,0x102];queues=[[0,0,0,0,0],[0,0,0,0,0]];sent=[0,0];received=[0,0];discard=[0,0];refs=[4,4]
+    caps={node:{(1<<32)|(slot+1):slot for slot in range(8)} for node in owners}
+    waits={};settling={};token_thread={};registered=[];commits=[];failed=[];canceled=[];quiesces=[];wi=0;last_seq=0;last_token=0
+    blocked_seen=[];woken_seen=[];closed=set();cancel_epoch=0
+    def sgn(v):return v-(1<<64) if v>>63 else v
+    def obj_of(ep):return 0x40000000104+(ep-0x100)
+    def ends_word():return int(bool(ends[0]))+2*int(bool(ends[1]))
+    def qwords():return queues[0]+queues[1]
+    def snap():return [0x101,int(any(ends)),*ends,a,b,*queues[0],*queues[1],*sent,*received,*discard]
+    def counts():
+        c=[0,0,0,0]
+        for x in waits.values():
+            c[x['state']-1]+=1
+            if x['terminal']:c[3]+=1
+        return c
+    def pin_count():return sum(1 for x in waits.values() if x['pinned'])
+    def node_count(node):return sum(1 for x in waits.values() if x['node']==node)
+    def need(cond,message):
+        if not cond:raise Failure(message)
+    def retire(side):
+        discard[side]+=queues[side][2];queues[side]=[0,0,0,0,0];ends[side]=0
+        for x in waits.values():
+            if x['channel']!=0x101:continue
+            if x['ep']==0x101+side:
+                need(x['terminal'] is not None,'Same-endpoint wait survived endpoint retirement without a terminal mark.')
+            elif x['state']==1:
+                need(False,'Peer wait remained Waiting across endpoint retirement without a wake.')
+    def close_handle(node,handle):
+        slot=handle&0xffffffff;generation=handle>>32;entry=caps[node].get(handle)
+        if slot==0 or slot>8 or generation==0:return -16
+        if entry is None:return -17
+        del caps[node][handle]
+        if entry>=4:
+            side=owners.index(node);refs[side]-=1;need(refs[side]>=0,'Endpoint handle references underflowed.')
+            if refs[side]==0:
+                need(ends[side]!=0,'Endpoint retired twice.')
+                retire(side)
+        return 0
+    def process(limit,batch):
+        nonlocal wi,cancel_epoch,last_seq,last_token
+        while wi<limit:
+            w=witness[wi];wi+=1
+            need(len(w)==28 and w[1]==wi and w[27]==0,'Wait witness lost publication order or record shape.')
+            event=w[0];need(1<=event<=13,'Unknown wait witness event.')
+            thread=w[2];node=w[3];token=w[4];channel=w[5];ep=w[6];kind=w[7];st=w[8];pinned=w[9]
+            term=sgn(w[10]) if w[10] else 0;payload=w[11];side=w[12];wseq=w[13];result=sgn(w[14])
+            stats=list(w[15:19]);queue=w[19];obj=w[20];nw=w[21];pins=w[22];saved=w[23:27]
+            if event==1:
+                need(token>last_token and wseq>last_seq,'Wait token/sequence was reused or regressed.')
+                need(token not in waits and token not in settling,'A live wait token was registered twice.')
+                need(thread in by_thread and kind in (1,2) and side in (0,1) and channel==0x101 and ep==0x101+side and obj==obj_of(ep),'Wait registration used a foreign endpoint/Thread identity.')
+                need(node==owners[side] and by_thread[thread] in (1,2,3) and info[by_thread[thread]]['node']==node,'Wait registration crossed Node ownership.')
+                need(all(x['thread']!=thread for x in waits.values()),'A Thread registered more than one pending wait.')
+                need(st==1 and pinned==1 and term==0 and not saved[0],'A new wait was not Waiting/pinned or fabricated a saved context.')
+                waits[token]={'thread':thread,'node':node,'side':side,'kind':kind,'payload':payload,'ep':ep,'obj':obj,'channel':channel,'state':1,'wseq':wseq,'pinned':True,'terminal':None,'blocked':None}
+                last_token=token;last_seq=wseq;token_thread[token]=thread;registered.append(token);batch['new'].append(token)
+                need(stats==counts() and nw==node_count(node) and pins==0 and queue==0,'Wait registration statistics/Node count are inconsistent.')
+            elif event==2:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['node']==node and x['ep']==ep and x['kind']==kind and x['side']==side and x['obj']==obj and x['wseq']==wseq,'Wake named a foreign or removed wait.')
+                need(x['state']==1 and st==2 and term==0 and x['terminal'] is None,'Wake did not transition one Waiting wait to Ready.')
+                eligible=[t for t,y in waits.items() if y['channel']==channel and y['side']==side and y['kind']==kind and y['state']==1]
+                need(token==min(eligible,key=lambda t:waits[t]['wseq']),'Wake skipped the oldest FIFO waiter.')
+                x['state']=2
+                need(stats==counts() and nw==node_count(node) and pins==0 and not saved[0],'Wake statistics/Node count or saved-frame fields are inconsistent.')
+                batch['wakes'].append((kind,token,x['side']))
+            elif event==3:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['state']==1 and st==2 and term and x['terminal'] is None and pinned==1,'Terminal mark did not bind one Waiting identity.')
+                x['state']=2;x['terminal']=term
+                need(stats==counts() and nw==node_count(node) and pins==0 and not saved[0],'Terminal wait statistics are inconsistent.')
+            elif event==4:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['state']==2 and st==3,'Take did not consume exactly one Ready wait.')
+                ready=[t for t,y in waits.items() if y['state']==2]
+                need(token==min(ready,key=lambda t:waits[t]['wseq']),'Take skipped an older Ready waiter.')
+                x['state']=3
+                need(stats==counts() and nw==node_count(node) and pins==0 and not saved[0],'Take statistics/Node count are inconsistent.')
+            elif event==5:
+                if result:
+                    x=settling.get(token);need(x is not None and x['thread']==thread and x['state']==1,'Retry lost its removed waiting identity.')
+                    need(stats==counts() and nw==node_count(node) and pins==pin_count()+1 and not saved[0],'Restore retry statistics/pin ownership are inconsistent.')
+                else:
+                    x=waits.get(token)
+                    if x is None:
+                        x=settling.pop(token,None);need(x is not None and x['thread']==thread,'Retry named neither a live nor settling wait.')
+                        x['state']=1;waits[token]=x
+                    else:
+                        need(x['thread']==thread and x['state']==1 and st==1,'Retry restored a non-Waiting live registration.')
+                    need(stats==counts() and nw==node_count(node) and pins==0 and not saved[0],'Retry statistics are inconsistent.')
+            elif event==6:
+                x=settling.pop(token,None);need(x is not None and x['thread']==thread and x['node']==node and x['ep']==ep and x['kind']==kind and x['side']==side and x['obj']==obj,'Commit named a foreign wait.')
+                need(stats==counts() and nw==node_count(node) and pins==pin_count() and not saved[0],'Commit statistics/pin release are inconsistent.')
+                s=x['side']
+                if kind==1:
+                    need(result==0 and ends[1-s] and queues[1-s][2]<2,'Send commit lacked a live peer or FIFO capacity.')
+                    q=queues[1-s];q[3+q[1]]=x['payload'];q[1]=(q[1]+1)%2;q[2]+=1;sent[s]+=1
+                    commits.append((1,0,token))
+                else:
+                    q=queues[s];need(q[2] and result==q[3+q[0]],'Receive commit did not consume its FIFO head.')
+                    q[3+q[0]]=0;q[0]=(q[0]+1)%2;q[2]-=1;received[s]+=1
+                    commits.append((2,result,token))
+                batch['commits'].append((kind,token))
+            elif event==7:
+                x=settling.pop(token,None);need(x is not None and x['thread']==thread and x['kind']==kind and x['side']==side and result<0,'Failure named a foreign wait or wrong disposition.')
+                need(stats==counts() and nw==node_count(node) and pins==pin_count() and not saved[0],'Failure statistics/pin release are inconsistent.')
+                if x['terminal']:need(result==x['terminal'],'Terminal wait failure did not return its recorded cause.')
+                failed.append((kind,result,token))
+            elif event==8:
+                x=settling.pop(token,None);need(x is not None and x['thread']==thread and x['kind']==kind and x['side']==side and result==0,'Cancellation named a foreign wait.')
+                need(stats==counts() and nw==node_count(node) and pins==pin_count() and not saved[0],'Cancellation statistics/pin release are inconsistent.')
+                canceled.append((kind,token));cancel_epoch+=1
+            elif event==9:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['pinned'] and pinned==0 and x['terminal'] is not None,'Pin release named a foreign or unterminated wait.')
+                x['pinned']=False
+                need(stats==counts() and nw==node_count(node) and not saved[0],'Pin-release statistics are inconsistent.')
+            elif event==10:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['state']==1 and st==1 and term==0 and saved[0]==1,'Blocked event did not bind one Waiting continuation.')
+                need(saved[3]==0x246 and saved[1]==multi_site(symbols,'neu_ipc_syscall_resume') and saved[2]==info[by_thread[thread]]['initial_rsp']-0xc8,'Blocked continuation saved a fabricated or unsafe context.')
+                need(stats==counts() and nw==0 and pins==0,'Blocked event changed registry statistics or Node count.')
+                x['blocked']=list(saved);blocked_seen.append({'thread':thread,'token':token,'kind':kind,'queue':queue,'saved':list(saved)})
+            elif event==11:
+                x=waits.get(token);need(x is not None and x['thread']==thread and x['state']==3 and st==3 and term==0 and saved[0]==1 and x['blocked']==list(saved),'Woken event lost its saved queued continuation.')
+                need(stats==counts() and nw==0 and pins==0,'Woken event changed registry statistics or Node count.')
+                woken_seen.append({'thread':thread,'token':token,'kind':kind,'rip':saved[1],'queue':queue})
+            elif event==12:
+                need(thread==node==token==channel==ep==kind==st==0 and result>=0 and pinned==0 and term==0,'Quiesce summary named an individual wait.')
+                need(stats==counts() and nw==0 and pins==0 and not saved[0],'Quiesce statistics are inconsistent.')
+                need(result==cancel_epoch,'Quiesce count does not equal the Node cancellations that preceded it.')
+                quiesces.append(result);cancel_epoch=0
+            else:
+                x=waits.pop(token,None)
+                need(x is not None and x['thread']==thread and x['node']==node and x['ep']==ep and x['kind']==kind and x['side']==side and x['obj']==obj and x['state']==st and x['wseq']==wseq,'Remove did not retire one live wait.')
+                need(stats==counts() and nw==node_count(node) and pins==0 and not saved[0],'Remove statistics/pin fields are inconsistent.')
+                settling[token]=x
+    def wake_causes(batch,op,status,pre_ends):
+        if not batch['wakes']:return
+        need(pre_ends is not None,'Wake published without a committing transaction.')
+        send_cause=(op==0x15 and status==0) or any(k==1 for k,_ in batch['commits'])
+        receive_cause=(op==0x16 and status==0) or any(k==2 for k,_ in batch['commits'])
+        for kind,token,xside in batch['wakes']:
+            peer_closed=pre_ends[1-xside]!=0 and ends[1-xside]==0
+            need((send_cause if kind==2 else receive_cause) or peer_closed,'A wake had no send/receive/peer-close linearization point.')
+    expected={'channels-wait':([1,0],[0,1],[0,0],[(2,0x1111)],[],0),
+              'channels-wait-xapic':([1,0],[0,1],[0,0],[(2,0x1111)],[],0),
+              'channels-wait-send':([3,0],[0,3],[0,0],[(2,0xb1),(1,0),(2,0xb3)],[],0),
+              'channels-wait-fifo':([0,2],[2,0],[0,0],[(2,0xc1),(2,0xc2)],[],0),
+              'channels-wait-close-receive':([0,0],[0,0],[0,0],[],[(2,-34)],0),
+              'channels-wait-close-send':([2,0],[0,0],[0,2],[],[(1,-34)],0),
+              'channels-wait-fault':([0,0],[0,0],[0,0],[],[(2,-34)],1),
+              'channels-wait-deadlock':([0,0],[0,0],[0,0],[],[],3)}[case]
+    exp_sent,exp_received,exp_discard,exp_commits,exp_failed,exp_cancels=expected
+    wait_records=[r for r in records if r[6] in (0x15,0x16)]
+    lines=list(re.finditer(r'IPC wait: op=(0x[0-9a-f]+) thread=(\d+) status=(-?\d+) blocked=(true|false) waiting=(\d+) ready=(\d+) queued=(\d+) terminal=(\d+)',text))
+    need(len(lines)==len(wait_records),'Blocking syscall diagnostics do not match wait records.')
+    line_index=0
+    for seq,r in enumerate(records,1):
+        need(len(r)==64 and r[0]==seq,'Malformed blocking Channel transaction ledger.')
+        cursor=r[23]>>1;probe=r[23]&1
+        need(cursor>=wi and cursor<=len(witness) and bool(probe)==(seq in state['native']),'IPC record cursor/probe does not match QMP publication order.')
+        if probe:need(state['native'][seq]['words']==r,'Probed IPC record differs from the actual stopped-CPU witness.')
+        pre_ends=list(ends);batch={'new':[],'wakes':[],'commits':[]}
+        process(cursor,batch)
+        need(r[50:60]==qwords() and r[60]==ends_word(),'Channel request before-state differs from prior committed waits/messages.')
+        node,thread,space,root,table,op,h,value,status,scalar=r[1:11];status=sgn(status)
+        if op==(1<<64)-2:
+            need(node in owners and node not in closed and thread==space==root==table==0 and h==value==status==scalar==0,'Duplicate or malformed Node cleanup ledger entry.')
+            side=owners.index(node)
+            need(not any(x['node']==node for x in waits.values()),'Node cleanup began with a pending wait owned by that Node.')
+            for handle in sorted(caps[node]):need(close_handle(node,handle)==0,'Node cleanup handle drain failed.')
+            caps[node].clear()
+            need(refs[side]==0 and ends[side]==0,'Node cleanup left endpoint references live.')
+            need(not any(x['node']==node for x in waits.values()),'Node cleanup left a wait owned by that Node.')
+            closed.add(node)
+        else:
+            need(node in owners and node not in closed,'Channel operation used a closed/foreign Node.')
+            side=owners.index(node);label=by_thread.get(thread);owner=info[label] if label is not None else None
+            need(owner is not None and node==owner['node'] and space==owner['space'] and root==owner['root'] and table==node and r[20:22]==[owner['top'],owner['top']-160] and not r[22]&0x600 and r[18]==multi_site(symbols,'neu_ipc_syscall_resume') and r[19]==owner['initial_rsp']-0xc8,'IPC used foreign or terminal execution authority.')
+            slot=h&0xffffffff;generation=h>>32;entry=caps[node].get(h);error=0
+            if slot==0 or slot>8 or generation==0:error=-16
+            elif entry is None:error=-17
+            elif (op==0x15 and entry==7) or (op==0x16 and entry==6):error=-18
+            if op==0x11:
+                need(status==0 and error==0,'Close did not use one live handle.')
+                need(r[11]==obj_of(0x101+side) and r[12]==4 and r[13]=={4:0x60,5:0x60,6:0x20,7:0x40}[entry],'Close record described the wrong endpoint object/rights.')
+                need(close_handle(node,h)==status,'Close status differs from independent handle/reference model.')
+            elif op in (0x13,0x14,0x15,0x16):
+                send=op in (0x13,0x15);blocking=op in (0x15,0x16)
+                need(error==0 and entry>=4 and r[11]==obj_of(0x101+side) and r[12]==4 and r[13]=={4:0x60,5:0x60,6:0x20,7:0x40}[entry] and r[14]==refs[side] and r[15]==1+sum(1 for t,x in waits.items() if x['ep']==0x101+side and t not in batch['new'] and x['pinned']) and r[16]==0x101+side and r[17]==0x101 and r[24]==side and r[25]==node,'Blocking endpoint identity/rights/reference/pin/Node binding is wrong.')
+                target=queues[1-side] if send else queues[side];blocked_now=False;expected_scalar=0
+                if send:
+                    if not ends[1-side]:expected_status=-34
+                    elif target[2]<2:
+                        expected_status=0;target[3+target[1]]=value;target[1]=(target[1]+1)%2;target[2]+=1;sent[side]+=1
+                    else:
+                        need(blocking,'Nonblocking send did not report Full.')
+                        blocked_now=True
+                else:
+                    if target[2]:
+                        expected_status=0;expected_scalar=target[3+target[0]];target[3+target[0]]=0;target[0]=(target[0]+1)%2;target[2]-=1;received[side]+=1
+                    elif not ends[1-side]:expected_status=-34
+                    else:
+                        need(blocking,'Nonblocking receive did not report Empty.')
+                        blocked_now=True
+                if blocked_now:
+                    expected_status=0x100
+                    new=[t for t in batch['new'] if waits[t]['thread']==thread]
+                    need(len(new)==1,'Blocked syscall did not register exactly one wait.')
+                    x=waits[new[0]]
+                    need(x['kind']==(1 if send else 2) and x['side']==side and x['ep']==0x101+side and x['payload']==(value if send else 0),'Blocked wait registration encoded the wrong operation.')
+                else:
+                    need(not any(waits[t]['thread']==thread for t in batch['new']),'Immediate result fabricated a pending wait.')
+                need(status==expected_status and scalar==expected_scalar,'Blocking result differs from the independent capability/FIFO model.')
+                line=lines[line_index];line_index+=1
+                need(int(line[1],0)==op and int(line[2])==thread and int(line[3])==status and (line[4]=='true')==blocked_now and list(map(int,line.groups()[4:]))==counts(),'Blocking diagnostic disagrees with the witness registry.')
+            else:raise Failure('Unexpected Channel ABI operation in a blocking scenario.')
+        need(r[28:50]==snap() and r[61]==ends_word(),'Actual queue/endpoint state lost or invented a committed message.')
+        need(r[62]==sum(len(t) for t in caps.values()),'Capability reference accounting differs from live handles.')
+        wake_causes(batch,op,status,pre_ends)
+        for s in (0,1):need(sent[1-s]==received[s]+queues[s][2]+discard[s],'Directional message conservation failed.')
+    process(len(witness),{'new':[],'wakes':[],'commits':[]})
+    need(wi==len(witness),'Wait witness left unpublished events.')
+    need(not quiesces or cancel_epoch==0,'Quiesce left unmatched cancellations.')
+    need(line_index==len(lines),'Blocking syscall diagnostics were not fully consumed.')
+    need(not waits and not settling,'A pending wait or unsettled terminal wait survived teardown.')
+    need(len(registered)==len(blocked_seen),'Blocked operation/registration/suspension counts differ.')
+    need(len(commits)+len(failed)+len(canceled)==len(registered),'Wait lifecycle did not terminate every registration exactly once.')
+    need([(k,r) for k,r,_ in commits]==exp_commits and [(k,r) for k,r,_ in failed]==exp_failed and len(canceled)==exp_cancels,'Wait commit/failure/cancellation matrix differs from the selected scenario.')
+    need(len(quiesces)==(2 if case=='channels-wait-deadlock' else 0),'No-runnable classification published the wrong quiesce count.')
+    if case=='channels-wait-deadlock':need(quiesces==[q[1] for q in members['quiesced']] and not commits and not failed and not canceled[:0],'Deadlock quiescence fabricated a message or settlement.')
+    need(sent==exp_sent and received==exp_received and discard==exp_discard and refs==[0,0] and not any(ends) and closed=={a,b} and not any(caps.values()),'Message/endpoint/handle teardown differs from the selected scenario.')
+    expected_blocked=[(int(x['label']),x['queue'],x['frame'][15],x['frame'][18],x['frame'][17]) for x in members['blocked']]
+    actual_blocked=[(by_thread[x['thread']],x['queue'],x['saved'][1],x['saved'][2],x['saved'][3]) for x in blocked_seen]
+    need(actual_blocked==expected_blocked,'Witness blocked frames differ from the actual saved scheduler contexts.')
+    expected_woken=[(x['thread'],x['wait'],x['kind'],x['rip']) for x in members['woken']]
+    actual_woken=[(x['thread'],x['token'],x['kind'],x['rip']) for x in woken_seen]
+    need(actual_woken==expected_woken,'Witness woken continuations differ from controller drain observations.')
+    settled=[members['settled'][key] for key in sorted(members['settled'],key=int)]
+    actual_settled=[(by_thread[token_thread[x]],0,(r if k==2 else 0)) for k,r,x in commits]+[(by_thread[token_thread[x]],r,0) for k,r,x in failed]
+    need([(x['label'],x['status'],x['scalar']) for x in settled]==actual_settled,'Witness commits/failures differ from the QMP-verified resumed results.')
+    cleanups=list(re.finditer(r'AS cleanup: node=(\d+) handles=(\d+) objects_before=(\d+) after=(\d+) references_before=(\d+) after=(\d+) pins=0 root_ref=released lease=none',text))
+    need(len(cleanups)==2 and {int(m[1]) for m in cleanups}=={a,b} and int(cleanups[-1][4])==0 and int(cleanups[-1][6])==0,'Endpoint/wait pins or references survived Node reclamation.')
+    need(f'IPC accounting restored: channels=0 endpoints=0 queued=0 references=0 pins=0 requests={len(records)}' in text,'Missing exact final blocking-Channel accounting.')
+    return {'records':records,'wait_witness':witness,'registered':registered,'commits':commits,'failed':failed,'canceled':canceled,'quiesces':quiesces,'sent':sent,'received':received,'discarded':discard,'blocked':blocked_seen,'woken':woken_seen,'settled':settled,'errors':sorted({x[1] for x in failed}),'final_channels':0,'final_endpoints':0,'final_messages':0}
 
 
 def check_ipc(case,text,symbols,members,state):
@@ -1318,6 +1764,11 @@ def check_ipc(case,text,symbols,members,state):
     if case=='channels-b-fault' and not after_fault:raise Failure('Healthy A2 did not drain the pending reply after B fault cleanup.')
     if case=='channels-a-fault' and not any(w[1]==b and w[9]==(1<<64)-34 and a in closed for w in records):raise Failure('Healthy B did not observe A closure.')
     if 'RDX=0x30000003f' not in text or f'IPC accounting restored: channels=0 endpoints=0 queued=0 references=0 pins=0 requests={len(records)}' not in text:raise Failure('Missing ABI 0.3 features or final accounting.')
+    if case=='channels-legacy':
+        if 'ABI=0.3' not in text:raise Failure('Scenario H did not boot the legacy ABI 0.3 image.')
+        if not any(w[6]==0x14 and w[9]==(1<<64)-32 and w[10]==0 for w in records):raise Failure('Scenario H must reject an empty nonblocking receive immediately.')
+        if not any(w[6]==0x13 and w[9]==(1<<64)-33 and w[10]==0 for w in records):raise Failure('Scenario H must reject a full nonblocking send immediately.')
+        if any(w[9]==0x100 for w in records) or 'IPC wait:' in text or 'Multi blocked:' in text or 'Multi woken:' in text:raise Failure('Legacy ABI 0.3 operation entered the blocking wait path.')
     if case=='channels-rollback' and 'IPC rollback: table=full pair=unpublished queues=unchanged references=restored' not in text:raise Failure('Missing initial grant rollback.')
     return {'records':records,'native':native,'committed':successful,'sent':sent,'received':received,'discarded':discard,'errors':sorted(errors),'after_a1_exit':after_exit,'after_b_fault':after_fault,'final_channels':0,'final_endpoints':0,'final_messages':0}
 
@@ -1741,7 +2192,7 @@ def check_native(case, text, symbols, observed):
     contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
     canaries = re.findall(r"Native canaries: RBX=(0x[0-9a-f]+) RBP=(0x[0-9a-f]+) R12=(0x[0-9a-f]+) R13=(0x[0-9a-f]+) R14=(0x[0-9a-f]+) R15=(0x[0-9a-f]+)", text)
     query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
-    operations = [query, query, exit_op] if kind == 0 else ([query, (0x13 if case=="native-abi03-disabled" else (0x12 if case=="native-abi02-disabled" else (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1))), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
+    operations = [query, query, exit_op] if kind == 0 else ([query, (0x13 if case=="native-abi03-disabled" else (0x15 if case=="native-abi04-disabled" else (0x12 if case=="native-abi02-disabled" else (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1)))), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
     arguments = [11, 11, 0] if kind == 0 else ([11, 11, 11, 0] if kind == 1 else ([11, 256, 11, 0] if kind == 2 else ([] if kind == 7 else [11])))
     if len(entries) != len(operations) or len(contexts) != len(entries) or len(canaries) != len(entries):
         raise Failure("Incorrect native entry/context count.")
@@ -1985,7 +2436,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -2114,13 +2565,16 @@ def run_case(case, esp, timeout):
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
                 member_case={'capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault','channels-xapic':'threads-xapic','channels-a-fault':'threads-a1-fault','channels-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES or case in IPC_CASES else case)
-                members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES or case in IPC_CASES) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else None
+                if case in WAIT_CASES:
+                    members=check_wait_multi(case,text,symbols,multi_observations,paging["root"],qmp)
+                else:
+                    members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES or case in IPC_CASES) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else None
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
                 capabilities=check_capabilities(case,text,symbols,members,cap_state) if case in CAP_CASES else None
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
-                ipc=check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
+                ipc=check_ipc_wait(case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)

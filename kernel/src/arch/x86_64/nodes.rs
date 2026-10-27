@@ -174,7 +174,7 @@ fn execute(paging: &mut Paging<'_, '_>, model: &mut Nodes, node: &Bootstrap) -> 
             ))
             .map_err(|_| Error::Corrupt)?;
         }
-        ExitReason::ConstructionFailure | ExitReason::Cancelled { .. } => {
+        ExitReason::ConstructionFailure | ExitReason::Cancelled { .. } | ExitReason::Quiesced => {
             return Err(Error::Corrupt);
         }
     }

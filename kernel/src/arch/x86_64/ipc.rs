@@ -7,12 +7,15 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use neu_kernel::{
-    capability::{self as cap, Handle, Lease, ObjectType, Objects, Rights},
+    capability::{self as cap, Handle, Lease, ObjectType, Objects, Rights, WaitStart},
     node::{ActiveContext, NodeId},
-    syscall::{Frame, Outcome, v03},
+    syscall::{Frame, Outcome, v03, v04},
 };
 const LIMIT: usize = 112;
 const CLEANUP: u64 = u64::MAX - 1;
+/// Internal diagnostic marker for a registered blocking request. Not an ABI
+/// status: the user frame is resumed only by the pre-entry settle transaction.
+const BLOCKED: i64 = 0x100;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Record {
@@ -80,7 +83,7 @@ pub fn bootstrap(a: NodeId, b: NodeId, objects: &Objects) -> cap::Result<()> {
         }
         s.a = Some(a);
         s.b = Some(b);
-        serial::write(format_args!("[NEU] IPC bootstrap: A={} B={} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI=0.3\n",a.raw(),b.raw())).map_err(|_|cap::Error::Object)
+        serial::write(format_args!("[NEU] IPC bootstrap: A={} B={} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI={}\n",a.raw(),b.raw(),if cfg!(feature = "channel-wait-test") {"0.4"} else {"0.3"})).map_err(|_|cap::Error::Object)
     })
 }
 unsafe extern "C" {
@@ -95,6 +98,12 @@ fn publish(s: &mut State, mut record: Record, bit: Option<u8>) -> cap::Result<()
         s.probes |= 1 << bit.unwrap();
     }
     record.words[23] = probe as u64;
+    #[cfg(feature = "channel-wait-test")]
+    {
+        // Upper bits carry the wait-ledger publication order. The low bit keeps
+        // the existing probe-observation contract for both ABI profiles.
+        record.words[23] |= neu_kernel::wait::witness::cursor() << 1;
+    }
     s.records[s.count] = record;
     s.count += 1;
     // SAFETY: Exclusive diagnostics transaction; supervisor-only stable witness.
@@ -176,16 +185,17 @@ pub fn request(
             r.words[12] = id.kind() as u64;
             r.words[13] = rights.bits();
         }
-        let result = (|| -> Result<u64, cap::Error> {
+        let result = (|| -> Result<Outcome, cap::Error> {
             if op == neu_kernel::syscall::v02::CAP_CLOSE {
                 lease.table_mut().close(objects, active.node, h)?;
-                return Ok(0);
+                return Ok(Outcome::Return {
+                    status: 0,
+                    scalar: 0,
+                });
             }
-            let rights = if op == v03::CHANNEL_SEND {
-                Rights::SEND
-            } else {
-                Rights::RECEIVE
-            };
+            let blocking = op == v04::CHANNEL_SEND_WAIT || op == v04::CHANNEL_RECEIVE_WAIT;
+            let send = op == v03::CHANNEL_SEND || op == v04::CHANNEL_SEND_WAIT;
+            let rights = if send { Rights::SEND } else { Rights::RECEIVE };
             let mut guard = lease.table().lookup(
                 objects,
                 active.node,
@@ -200,15 +210,38 @@ pub fn request(
             r.words[17] = info.channel.raw();
             r.words[24] = info.side as u64;
             r.words[25] = info.owner.raw();
-            let outcome = if op == v03::CHANNEL_SEND {
-                guard.channel_send(payload).map(|_| 0)
+            let outcome = if send {
+                if blocking {
+                    guard.channel_send_wait(active, payload)
+                } else {
+                    guard.channel_send(payload).map(|_| WaitStart::Committed(0))
+                }
+            } else if blocking {
+                guard.channel_receive_wait(active)
             } else {
-                guard.channel_receive()
+                guard.channel_receive().map(WaitStart::Committed)
             };
-            let (status, scalar) = match outcome {
-                Ok(v) => (0, v),
-                Err(e) => (e as i64, 0),
+            let (status, scalar, blocked) = match outcome {
+                Ok(WaitStart::Committed(v)) => (0, v, false),
+                Ok(WaitStart::Blocked) => (BLOCKED, 0, true),
+                Err(e) => (e as i64, 0, false),
             };
+            #[cfg(feature = "channel-wait-test")]
+            if blocking {
+                let ws = guard.wait_stats();
+                serial::write(format_args!(
+                    "[NEU] IPC wait: op={:#x} thread={} status={} blocked={} waiting={} ready={} queued={} terminal={}\n",
+                    op,
+                    active.thread.raw(),
+                    status,
+                    blocked,
+                    ws.waiting,
+                    ws.ready,
+                    ws.queued,
+                    ws.terminal
+                ))
+                .map_err(|_| cap::Error::Object)?;
+            }
             r.words[9] = status as u64;
             r.words[10] = scalar;
             let stats = guard.registry_stats();
@@ -224,6 +257,9 @@ pub fn request(
                 } else {
                     s.gates |= 1 << info.side;
                 }
+            }
+            if blocked {
+                s.gates |= 1 << 25;
             }
             if status == 0 && info.side == 1 && op == v03::CHANNEL_SEND && payload == 55 {
                 s.gates |= 8;
@@ -255,14 +291,25 @@ pub fn request(
             // Stop instead; no caller can retry an allegedly uncommitted send.
             publish(s, r, bit).unwrap_or_else(|_| super::halt());
             // The guard pin remains live during the QMP observation above.
-            outcome
+            Ok(if blocked {
+                Outcome::Blocked
+            } else {
+                Outcome::Return { status, scalar }
+            })
         })();
-        let (status, scalar) = match result {
-            Ok(v) => (0, v),
-            Err(e) => (e as i64, 0),
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => Outcome::Return {
+                status: e as i64,
+                scalar: 0,
+            },
+        };
+        let (status, scalar) = match outcome {
+            Outcome::Return { status, scalar } => (status, scalar),
+            _ => (0, 0),
         };
         // Guarded operations already published; lookup failures and close did not.
-        if op == 0x11 || r.words[15] == 0 {
+        if (op == 0x11 || r.words[15] == 0) && !matches!(outcome, Outcome::Blocked) {
             r.words[9] = status as u64;
             r.words[10] = scalar;
             snapshot(&mut r, objects);
@@ -275,7 +322,7 @@ pub fn request(
             };
             publish(s, r, bit)?;
         }
-        Ok(Outcome::Return { status, scalar })
+        Ok(outcome)
     })
 }
 pub fn gates(_objects: &Objects) -> cap::Result<u64> {

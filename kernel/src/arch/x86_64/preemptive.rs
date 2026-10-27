@@ -518,7 +518,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     bootstrap::survivor(paging, &nodes, &queue, &b)?;
                 }
             }
-            SliceEvent::Yield(_) => return Err(Error::Corrupt),
+            SliceEvent::Yield(_) | SliceEvent::Blocked(_) => return Err(Error::Corrupt),
         }
     }
     if nodes.active().is_some()

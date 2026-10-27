@@ -1,60 +1,165 @@
 # Neu Kernel implementation status
 
-## K6 / Phase 6A — scoped hardening in progress (2026-10-27)
+## K6 / Phases 6A–6B — blocking Channel waits implemented (2026-10-27)
 
-Phase 6A remains **incomplete** pending the full required fault-timing and QMP
-stress matrix. [ADR 0018](adr/0018-channel-conservation-and-retirement.md)
-clarifies the existing nonblocking contract; architecture v0.2 and experimental
-ABI 0.3 are unchanged. The historical Phase 5C results below remain evidence for
-that earlier revision, not a claim that the new revision passed those tests.
+Phase 6A hardening and Phase 6B blocking Channel waits are **complete for the
+scoped single-CPU model**. K6 as an architecture milestone is not declared
+complete: capability transport/moves, derivation, revocation, public object
+creation, deadlines, shared memory and SMP remain future work. Architecture v0.2
+is unchanged (SHA-256 `dede67c23c5b3044454e07356d262af2d8392b5e5a15a35651c0f960296b5cbd`).
+[ADR 0019](adr/0019-blocking-channel-waits.md) records the wait design, and
+[experimental ABI 0.4](abi/experimental-v0.4.md) records the blocking operations.
+ABI 0.1/0.2/0.3 versions, masks and rejection behavior are unchanged.
+
+### Phase 6A carry-over
 
 The production ring validates head, tail, length and their relationship before
 indexing. Retirement checks discard accumulation before mutation; its caller
 fail-stops if a corrupt retirement cannot complete. Counters are indexed by
 sender for sends and by receiver for queued, received and discarded messages;
-they reset only on trusted construction of a new Channel generation. As before,
-last reference and pin release retire only that endpoint, discarding its inbound
-messages and preserving the peer's queued messages. No capacity, ABI, kernel
-preemption or queue size changed.
+they reset only on trusted construction of a new Channel generation. Last
+reference and pin release retire only that endpoint, discarding its inbound
+messages and preserving the peer's queued messages. FIFO capacity remains two.
 
-The host suite now includes 128 deterministic xorshift seeds, eight generations
-per seed, and 120 modeled operations per generation, using the real Channel code
-and an independent logical FIFO, with invariants checked after each operation.
-Additional tests cover repeated bidirectional Full/Empty cycles, malformed ring
-metadata, discard overflow, both owners' bootstrap capacity failures, and both
-peer cleanup directions. Reconstruction evidence here is host-side trusted
-mechanism testing, not userspace Channel creation. The new `channels-stress`
-fixture uses three Full/recovery cycles through Ring 3 before the existing
-three-Thread scenario; the host independently reconciles each ledger entry and
-QMP observes actual FIFO storage at selected first/last-cycle native entries.
-The fixture's test-only gates order observations and do not carry payloads.
-A four-cycle prototype first passed, but a later run with six extra QMP probes
-exhausted the 96-dispatch limit and failed; it is not counted as a pass. The
-fixture was reduced to three cycles while retaining the unchanged 112-record
-(57,344-byte) allocation, 96-dispatch limit and 30-second deadline.
+The host suite includes 128 deterministic xorshift seeds, eight generations per
+seed, and 120 modeled operations per generation against the real Channel code
+and an independent logical FIFO. The carried-over fault-timing matrix exercises,
+for **both** Node A and Node B as the failing owner: fault before any commit,
+after one commit, after a Full rejection, after a successful receive with
+messages pending in both directions, and after closing one of several endpoint
+references. Each case independently rechecks ADR 0018 conservation and drains
+the surviving peer's committed messages in order. The pre-existing
+`channels-stress` fixture retains its three Full/recovery cycles, 112-record
+(57,344-byte) allocation and 30-second deadline.
 
-Validation: `make doctor`, `make check`, `make build`, and the final `make test`
-passed: **164 host tests and 105 QEMU scenarios**, including all 104 prior
-scenarios. The revised stress run accounted for 10 A-to-B and 6 B-to-A sends,
-all received, 65 records and 23 QMP native observations. Three additional
-revised stress QMP runs passed. The earlier four-cycle full-suite attempt failed
-after 102 passes by exhausting its dispatch bound; it is not a suite pass.
-The original fault and xAPIC images also passed repeated QMP runs; those repeats
-preceded the final fixture-constant revision, while the final full suite rebuilt
-and passed those profiles on the final code.
+The old 96-dispatch controller guard was a bounded liveness ceiling, not a
+Channel limit. The revised stress fixture intermittently reached exactly 96 and
+failed after all messages had been committed. The ceiling is now 128 for Channel
+builds (64 otherwise); it remains a hard failure, and the final stress runs
+complete at 95 dispatches. The fixture was not simplified and FIFO capacity was
+not changed.
 
-A separate clean source/target directory built and QMP-booted the default and
-revised stress images successfully. Their ELF hashes differ from the main
-workspace builds; each pair has identical loadable segments and identical hashes
-after stripping debug sections. The clean debug data includes its source path.
-This is one independent directory and two builds, not two independent source
-directories or evidence of physical hardware support.
+### Phase 6B blocking design
 
-Future blocking
-operations require atomic enqueue-and-sleep, explicit wait ownership and wake
-policy, close/fault/timeout cancellation, lifetime pins, scheduler integration,
-and priority-inversion analysis. There is no current wait queue, sleeping,
-wake-up, transfer, derivation or revocation implementation.
+`ThreadState` gains `Blocked`. A blocked Thread is absent from the runnable
+FIFO; `Queue::wake` is the only path that marks it `Ready` and appends it once.
+`kernel/src/wait.rs` is a fixed three-entry registry owned by
+`capability::Objects`, so condition check, registration, wake and
+terminalization share one exclusive IF=0 transaction. A registration is a plain
+generation-checked record: exact ActiveContext, endpoint/Channel/object
+identities, side, kind, pending payload, FIFO sequence, monotonic token, state,
+terminal error and pin ownership. It stores no pointer, borrow, `Guard` or
+controller-stack reference.
+
+A blocking `0x15`/`0x16` first performs the real nonblocking send/receive. Only
+Empty/Full with a live peer preflights capacity, takes one extra object pin,
+registers the wait and returns `Outcome::Blocked`; the native entry stores a
+validated post-SYSCALL continuation and the Thread suspends. A committed send
+wakes the oldest waiting receiver; a committed receive wakes the oldest waiting
+sender. Endpoint retirement marks same-endpoint waiters terminal `PeerClosed`,
+releases their pins once, and wakes other Channel waiters. No wake reserves a
+message or capacity.
+
+A wake grants eligibility only. Before re-entry, `settle_wait` rechecks under
+the same registry transaction: commit once, or restore the same token/sequence/
+pin to `Waiting` and return to `Blocked`. Registration and restore happen in the
+same transaction as the failed observation, preventing lost wakeups, duplicate
+admission and double enqueue. Stale Thread, endpoint, object, Channel and
+recycled generations are rejected by the existing typed identities.
+
+On Node fault, the controller returns the active execution lease, cancels every
+wait owned by that Node, releases pins, then completes/cancels Threads, drains
+handles and reclaims stacks, saved contexts, tables and the root. If the FIFO
+empties with live blocked members, the topology has no external producer; the
+controller classifies bounded quiescence, cancels waits, marks Threads/Nodes
+`Quiesced`, verifies cleanup and stops. This is a deadlock classification, never
+a successful transfer, endless spin or a QEMU-timeout pass. No idle-HLT protocol
+or fabricated wake was added.
+
+### K6 files
+
+Created:
+
+- `kernel/src/wait.rs`: bounded registrations, FIFO wake, restore/retry,
+  terminal states, pin accounting, statistics and the supervisor-only witness
+  ring.
+- [ADR 0019](adr/0019-blocking-channel-waits.md) and
+  [experimental ABI 0.4](abi/experimental-v0.4.md): decision, linearization
+  points, statuses, limits and deferred work.
+
+Modified:
+
+- `capability.rs`, `capability/tests.rs`, `channel/tests.rs`: blocking
+  orchestration, pin/close/retirement terminalization, Node cancellation,
+  settlement, conservation and the 25 required behavior tests plus the K6A
+  fault-timing matrix.
+- `node.rs`, `scheduler.rs`, `context.rs`: `Blocked`/`Quiesced` transitions,
+  block/reblock/wake/cancel, single admission, continuation validation and
+  `SliceEvent::Blocked`.
+- `arch/x86_64/address_space.rs`, `ipc.rs`, `ipc.S`, `native.rs`, `native.S`,
+  `multithread.rs`: ABI 0.4 routing, Ring 3 fixtures A–H, blocked suspension and
+  resume, drain/settle/quiesce/fault cancellation, and QMP witness export.
+  `nodes.rs`, `cooperative.rs` and `preemptive.rs` gained explicit rejection
+  arms for impossible blocking events.
+- `syscall.rs`, `Cargo.toml`, `tools/neu.py`: ABI 0.4 definitions, ten feature
+  profiles, wait-specific QMP checks and witness reconciliation.
+- `README.md`, ADR index, this status: current evidence and links.
+
+### Validation
+
+| Gate | Result |
+| --- | --- |
+| `make doctor` | Pass; unchanged Rust 1.95.0, QEMU 11.0.0, pinned OVMF hashes |
+| `make check` | Pass; formatting and clippy `-D warnings` for every feature profile |
+| `make build` | Pass; ordinary ELF64/x86-64 UEFI image, four LOAD segments |
+| Host | **190 pass**: baseline 164 + 25 required + K6A fault-timing matrix |
+| QEMU full suite | **115 pass**: baseline 105 + eight blocking + legacy + ABI-0.4 rejection |
+| K6A repeats | **15/15 pass**: three rounds each of `channels`, `channels-xapic`, `channels-a-fault`, `channels-b-fault`, `channels-stress` |
+| Blocking repeats | **15/15 pass**: three rounds each of `channels-wait`, `-fifo`, `-fault`, `-deadlock`, `-xapic` |
+| Clean-directory builds | **4/4 pass**: independent empty target directories for `boot`, `channels`, `channels-wait`, `channels-wait-fault`; each QMP-verified |
+
+The final full suite ran 115 scenarios in 526.1 seconds with no failure. A
+one-shot dispatch ceiling on `channels-stress` had previously failed at 96; the
+cause, resolution and retained hard bound are described above. No timeout or
+dispatch failure is reported as a wait pass.
+
+### QEMU and QMP evidence
+
+The blocking scenarios verify, from stopped-CPU QMP state and the production
+tables rather than serial claims alone:
+
+- CPL=3 SYSCALL origin, CPL=0 trusted native entry, correct Node/Thread/Space/
+  root, per-Node CR3 and TSS.RSP0, and the selected guarded kernel stack.
+- The saved blocking continuation (`RCX == RIP`, `R11 == flags`, valid stack)
+  equals the QMP-observed blocked frame, and the resumed RIP/RSP and preserved
+  GPRs match. The blocked Thread is absent from the runnable queue until a
+  witnessed wake.
+- Registration, wake, terminal, take, retry, commit, cancel and pin events in
+  the 48-record `neu_wait_witness` ring match controller and IPC records.
+- Committed results: A/xAPIC receive `0x1111`; B receives `0xb1`,`0xb3` after
+  the third send commits; C receives `0xc1`,`0xc2`; D/E/F return `-34`; G
+  quiesces. Expected directional conservation: A `[1,0]/[0,1]`, B
+  `[3,0]/[0,3]`, C `[0,2]/[2,0]`, E `[2,0]/[0,2]`, D/F/G zero.
+- F cancels one A wait on fault and keeps B alive; G cancels `[2,1]` and marks
+  both Nodes quiesced. Blocked/take records are A 1, B 3, C 2, D 1, E 1,
+  F 2, G 3; every blocked registration is balanced by a commit, terminal
+  failure or cancellation.
+- Final cleanup: handles, objects, endpoint references, wait pins, queued
+  messages, tables and roots all restore exactly; `channels=0 endpoints=0
+  queued=0 references=0 pins=0`.
+- xAPIC runs observe real timer ISR/EOI and LAPIC state across blocking
+  scheduler transitions.
+
+### Limits
+
+The model is one CPU at IF=0, with no kernel preemption and no SMP claim. The
+wait registry is fixed at three entries and each Thread owns at most one wait.
+Waits are indefinite: there is no public timeout or deadline argument, no
+priority donation, and both-blocked/no-producer topologies end in classified
+quiescence rather than progress. Public Channel/Node/Thread creation, capability
+transport/moves, derivation, revocation, shared memory, events, priority
+scheduling and variable-length/zero-copy payloads remain unimplemented.
+Physical hardware, hosted CI and production IPC guarantees remain unverified.
 
 
 **Verified:** 2026-10-26. **Milestone:** K5 / Phase 5C — capability-backed endpoints

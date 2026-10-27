@@ -199,3 +199,14 @@ Earlier ADR rationale and ABI 0.1/0.2 configurations remain intact.
 
 This clarifies ADR 0017; wait/wake, capability movement and revocation remain
 future work.
+
+## Phase 6B record — blocking Channel waits
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0019: Blocking Channel waits, suspension and wakeup](0019-blocking-channel-waits.md) | Accepted, single-CPU IF=0 transactions, experimental ABI 0.4 | NEU-005/006/007/008/009/010/011/013/014/021/023/024 scoped subsets |
+
+ADR 0019 extends ADR 0017/0018 with a real `Blocked` Thread state, owned wait
+registrations, lost-wakeup-safe check/register/wake ordering, continuation-based
+resume, peer-close and Node-fault cancellation, and bounded no-runnable
+quiescence. Capability movement and revocation remain future work.

@@ -19,3 +19,5 @@ pub mod capability;
 pub mod inspection;
 
 pub mod channel;
+
+pub mod wait;

@@ -10,6 +10,11 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
+#[cfg(feature = "channel-wait-test")]
+use neu_kernel::{
+    capability::Settle,
+    wait::{WAITERS, Waiter},
+};
 use neu_kernel::{
     capability::{self as cap, Handle, Lease, ObjectType, Objects, Rights},
     node::{ActiveContext, NodeId, Nodes},
@@ -232,6 +237,45 @@ pub fn leave(active: ActiveContext) -> cap::Result<Lease> {
         s.lease.take().ok_or(cap::Error::InUse)
     })
 }
+/// Controller-side wake admission. Registrations stay owned by the registry
+/// while the Thread is queued; the pre-entry settle is the single commit point.
+#[cfg(feature = "channel-wait-test")]
+pub fn take_ready_waits() -> cap::Result<[Option<Waiter>; WAITERS]> {
+    tx(|s| Ok(s.objects.take_ready_waits()))
+}
+#[cfg(feature = "channel-wait-test")]
+pub fn settle(active: ActiveContext) -> cap::Result<Settle> {
+    tx(|s| {
+        if s.reader.is_some() {
+            return Err(cap::Error::InUse);
+        }
+        let lease = s.lease.take().ok_or(cap::Error::Owner)?;
+        let result = if lease.active() != active || lease.table().id().owner() != active.node {
+            Err(cap::Error::Owner)
+        } else {
+            Ok(s.objects.settle_wait(active.thread))
+        };
+        s.lease = Some(lease);
+        result
+    })
+}
+#[cfg(feature = "channel-wait-test")]
+pub fn cancel_node_waits(node: NodeId) -> cap::Result<usize> {
+    tx(|s| {
+        if s.reader.is_some() {
+            return Err(cap::Error::InUse);
+        }
+        Ok(s.objects.cancel_node_waits(node))
+    })
+}
+#[cfg(feature = "channel-wait-test")]
+pub fn wait_stats() -> cap::Result<neu_kernel::wait::Stats> {
+    tx(|s| Ok(s.objects.wait_stats()))
+}
+#[cfg(feature = "channel-wait-test")]
+pub fn wait_waiter(thread: neu_kernel::node::ThreadId) -> cap::Result<Option<Waiter>> {
+    tx(|s| Ok(s.objects.wait_waiter(thread)))
+}
 unsafe fn read(
     pointer: *const (),
     active: ActiveContext,
@@ -335,7 +379,10 @@ pub fn request(active: ActiveContext, frame: Frame, address: u64, top: u64) -> O
             interrupts::flags(),
         ]);
         #[cfg(feature = "channel-test")]
-        if neu_kernel::syscall::v03::owns(op) || (op == v02::CAP_CLOSE && (h.raw() as u32) >= 5) {
+        if neu_kernel::syscall::v03::owns(op)
+            || (cfg!(feature = "channel-wait-test") && neu_kernel::syscall::v04::owns(op))
+            || (op == v02::CAP_CLOSE && (h.raw() as u32) >= 5)
+        {
             let outcome =
                 super::ipc::request(&mut s.objects, &mut lease, active, frame, address, top)?;
             s.lease = Some(lease);
@@ -472,7 +519,11 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
         if s.reader.is_some()
             || s.lease.is_some()
             || nodes.active().is_some()
-            || model(nodes.node(node))?.state != neu_kernel::node::NodeState::Exited
+            || !matches!(
+                model(nodes.node(node))?.state,
+                neu_kernel::node::NodeState::Exited | neu_kernel::node::NodeState::Quiesced
+            )
+            || s.objects.node_wait_count(node) != 0
         {
             return Err(cap::Error::InUse);
         }
@@ -488,7 +539,8 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
                 .map_err(|_| cap::Error::Object)?;
         }
         let after = s.objects.stats();
-        if before.references - after.references != count as u32 || after.pins != 0 {
+        let node_pins = after.pins.saturating_sub(s.objects.pins_outside_node(node));
+        if before.references - after.references != count as u32 || node_pins != 0 {
             return Err(cap::Error::Object);
         }
         serial::write(format_args!("[NEU] AS cleanup: node={} handles={} objects_before={} after={} references_before={} after={} pins=0 root_ref=released lease=none\n",node.raw(),count,before.live,after.live,before.references,after.references)).map_err(|_|cap::Error::Object)

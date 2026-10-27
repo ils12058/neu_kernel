@@ -6,6 +6,8 @@ use super::{
     preemptive, serial, userspace,
 };
 use core::{arch::global_asm, ptr};
+#[cfg(feature = "channel-wait-test")]
+use neu_kernel::wait::{self, Waiter};
 use neu_kernel::{
     context::{SavedContext, SliceEvent, StackBinding},
     node::{
@@ -16,7 +18,7 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_wait=const cfg!(feature="channel-wait-test") as u8,ipc_legacy=const cfg!(feature="test-channels-legacy") as u8,wait_mode=const if cfg!(feature="test-channels-wait-send") {1} else if cfg!(feature="test-channels-wait-fifo") {2} else if cfg!(feature="test-channels-wait-close-receive") {3} else if cfg!(feature="test-channels-wait-close-send") {4} else if cfg!(feature="test-channels-wait-fault") {5} else if cfg!(feature="test-channels-wait-deadlock") {6} else {0},ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="channel-wait-test") {abi::v04::INFO}else if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
@@ -276,10 +278,12 @@ fn survivor(
         .filter(|m| m.active.node == domain.id && m.outcome.is_none())
     {
         let t = check(nodes.thread(m.active.thread))?;
-        if !queue.contains(t.id)
-            || !t.queued
+        let blocked = t.state == ThreadState::Blocked
+            && !t.queued
+            && t.saved.is_some_and(|saved| saved.continuation);
+        let runnable = t.state == ThreadState::Runnable && queue.contains(t.id) && t.queued;
+        if (!runnable && !blocked)
             || t.saved.is_none()
-            || t.state != ThreadState::Runnable
             || check(nodes.node(domain.id))?.space != Some(m.active.context.space)
         {
             return Err(Error::Corrupt);
@@ -415,6 +419,109 @@ fn stale(
     ))
     .map_err(|_| Error::Corrupt)
 }
+#[cfg(feature = "channel-wait-test")]
+fn wait_event(event: u64, waiter: Option<Waiter>, result: i64, queue: usize, saved: Option<Frame>) {
+    let stats = super::address_space::wait_stats().unwrap_or_default();
+    let saved = saved.map_or(wait::witness::Saved::NONE, |frame| wait::witness::Saved {
+        present: true,
+        rip: frame.context.rip,
+        rsp: frame.context.rsp,
+        flags: frame.context.flags,
+    });
+    wait::witness::write(event, waiter, result, queue, stats, 0, 0, saved);
+}
+#[cfg(feature = "channel-wait-test")]
+fn drain_ready(nodes: &mut Nodes, queue: &mut Queue) -> Result<()> {
+    let ready = super::address_space::take_ready_waits().map_err(|_| Error::Corrupt)?;
+    for waiter in ready.into_iter().flatten() {
+        check(queue.wake(nodes, waiter.active.thread))?;
+        let saved = check(nodes.thread(waiter.active.thread))?
+            .saved
+            .map(|s| s.frame);
+        wait_event(wait::witness::WOKEN, Some(waiter), 0, queue.len(), saved);
+        serial::write(format_args!(
+            "[NEU] Multi woken: thread={} wait={} kind={} RIP={:#x}\n",
+            waiter.active.thread.raw(),
+            waiter.token,
+            match waiter.kind {
+                neu_kernel::wait::Kind::Send => 1,
+                neu_kernel::wait::Kind::Receive => 2,
+            },
+            check(nodes.thread(waiter.active.thread))?
+                .saved
+                .map_or(0, |s| s.frame.context.rip)
+        ))
+        .map_err(|_| Error::Corrupt)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "channel-wait-test")]
+fn settle_retry(
+    nodes: &mut Nodes,
+    queue: &mut Queue,
+    active: ActiveContext,
+    saved: SavedContext,
+) -> Result<()> {
+    check(queue.reblock(nodes, active, saved))?;
+    Ok(())
+}
+
+#[cfg(feature = "channel-wait-test")]
+fn quiesce(
+    paging: &mut Paging<'_, '_>,
+    nodes: &mut Nodes,
+    a: &mut Domain,
+    b: &mut Domain,
+    members: &mut [Member; 3],
+) -> Result<()> {
+    for domain in [&mut *a, &mut *b] {
+        if domain.space.is_none() {
+            continue;
+        }
+        let canceled =
+            super::address_space::cancel_node_waits(domain.id).map_err(|_| Error::Corrupt)?;
+        wait_event(wait::witness::QUIESCE, None, canceled as i64, 0, None);
+        for id in nodes.blocked_threads(domain.id).into_iter().flatten() {
+            check(nodes.cancel_blocked(id, ExitReason::Quiesced))?;
+        }
+        if check(nodes.node(domain.id))?.state == NodeState::Active {
+            check(nodes.quiesce(domain.id))?;
+        }
+        for m in members
+            .iter_mut()
+            .filter(|m| m.active.node == domain.id && m.outcome.is_none())
+        {
+            m.outcome = Some(ExitReason::Quiesced);
+            m.last = None;
+            m.committed = 0;
+        }
+        let domain_id = domain.id;
+        for m in members
+            .iter_mut()
+            .filter(|m| m.active.node == domain_id && m.stack.is_some())
+        {
+            retire(paging, nodes, domain, m)?;
+        }
+        if paging.member_pins(space(domain)?)? != 0 {
+            return Err(Error::InUse);
+        }
+        super::address_space::cleanup(nodes, domain.id, paging).map_err(|_| Error::Corrupt)?;
+        let s = domain.space.take().ok_or(Error::NotOwned)?;
+        let id = s.id();
+        paging.destroy_user(s)?;
+        check(nodes.release_space(domain.id, id))?;
+        check(nodes.reclaim(domain.id))?;
+        serial::write(format_args!(
+            "[NEU] Multi Node quiesced: node={} waits_canceled={} reason=no-runnable\n",
+            domain.id.raw(),
+            canceled
+        ))
+        .map_err(|_| Error::Corrupt)?;
+    }
+    Ok(())
+}
+
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     let before = paging.stats();
     let tables = paging.table_count();
@@ -448,6 +555,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         if cfg!(feature = "test-threads-a2-fault")
             || cfg!(feature = "test-capabilities-a2-fault")
             || cfg!(feature = "test-address-space-a2-fault")
+            || cfg!(feature = "test-channels-wait-fault")
         {
             1
         } else if cfg!(feature = "test-threads-user-guard") {
@@ -503,11 +611,15 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         peak.allocated, peak.free, peak_tables
     ))
     .map_err(|_| Error::Corrupt)?;
-    while let Some(mut dispatch) = check(queue.next(&mut nodes))? {
+    while let Some(mut dispatch) = {
+        #[cfg(feature = "channel-wait-test")]
+        drain_ready(&mut nodes, &mut queue)?;
+        check(queue.next(&mut nodes))?
+    } {
         dispatches += 1;
         if dispatches
             > if cfg!(feature = "channel-test") {
-                96
+                128
             } else {
                 64
             }
@@ -547,6 +659,48 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         #[cfg(feature = "abi-02")]
         super::address_space::enter(check(nodes.take_authority(active))?)
             .map_err(|_| Error::Corrupt)?;
+        #[cfg(feature = "channel-wait-test")]
+        if dispatch.saved.continuation {
+            use neu_kernel::capability::Settle;
+            match super::address_space::settle(active).map_err(|_| Error::Corrupt)? {
+                Settle::Committed(value) => {
+                    dispatch.saved.frame.registers.rax = 0;
+                    dispatch.saved.frame.registers.rdx = value;
+                    members[index].last = Some(dispatch.saved.frame);
+                    serial::write(format_args!(
+                        "[NEU] Multi settled: thread={} result={:#x}\n",
+                        active.thread.raw(),
+                        value
+                    ))
+                    .map_err(|_| Error::Corrupt)?;
+                }
+                Settle::Failed(error) => {
+                    dispatch.saved.frame.registers.rax = error as i64 as u64;
+                    dispatch.saved.frame.registers.rdx = 0;
+                    members[index].last = Some(dispatch.saved.frame);
+                    serial::write(format_args!(
+                        "[NEU] Multi settled: thread={} error={}\n",
+                        active.thread.raw(),
+                        error as i64
+                    ))
+                    .map_err(|_| Error::Corrupt)?;
+                }
+                Settle::Retry => {
+                    preemptive::terminal(publication)?;
+                    check(nodes.restore_authority(
+                        super::address_space::leave(active).map_err(|_| Error::Corrupt)?,
+                    ))?;
+                    settle_retry(&mut nodes, &mut queue, active, dispatch.saved)?;
+                    serial::write(format_args!(
+                        "[NEU] Multi retry blocked: thread={} RIP={:#x}\n",
+                        active.thread.raw(),
+                        dispatch.saved.frame.context.rip
+                    ))
+                    .map_err(|_| Error::Corrupt)?;
+                    continue;
+                }
+            }
+        }
         #[cfg(feature = "channel-test")]
         {
             let gates = super::address_space::channel_gates().map_err(|_| Error::Corrupt)?
@@ -685,6 +839,17 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                         cancels[other] = Some(committed(words[8 + other * 4], m.last)?);
                     }
                 }
+                #[cfg(feature = "channel-wait-test")]
+                if matches!(reason, ExitReason::UserFault(_)) {
+                    let canceled = super::address_space::cancel_node_waits(active.node)
+                        .map_err(|_| Error::Corrupt)?;
+                    serial::write(format_args!(
+                        "[NEU] Multi waits canceled: node={} count={} reason=fault\n",
+                        active.node.raw(),
+                        canceled
+                    ))
+                    .map_err(|_| Error::Corrupt)?;
+                }
                 check(queue.finish(&mut nodes, active, reason))?;
                 for (other, count) in cancels.into_iter().enumerate() {
                     if let Some(count) = count {
@@ -778,8 +943,44 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     survivor(paging, &nodes, &queue, &b, &members)?;
                 }
             }
+            #[cfg(feature = "channel-wait-test")]
+            SliceEvent::Blocked(frame) => {
+                preemptive::terminal(publication)?;
+                members[index].last = Some(frame);
+                let saved = SavedContext::continuation(active, binding, frame);
+                check(queue.block(&mut nodes, active, saved))?;
+                let waiter =
+                    super::address_space::wait_waiter(active.thread).map_err(|_| Error::Corrupt)?;
+                wait_event(wait::witness::BLOCKED, waiter, 0, queue.len(), Some(frame));
+                cooperative::frame_log("multi-blocked", active.thread, frame)?;
+                serial::write(format_args!(
+                    "[NEU] Multi blocked: label={} thread={} RIP={:#x} RSP={:#x} queue={}\n",
+                    members[index].label,
+                    active.thread.raw(),
+                    frame.context.rip,
+                    frame.context.rsp,
+                    queue.len()
+                ))
+                .map_err(|_| Error::Corrupt)?;
+                audit(paging, owner_node, &members)?;
+            }
+            #[cfg(not(feature = "channel-wait-test"))]
+            SliceEvent::Blocked(_) => return Err(Error::Corrupt),
             SliceEvent::Yield(_) => return Err(Error::Corrupt),
         }
+    }
+    #[cfg(feature = "channel-wait-test")]
+    if members.iter().any(|m| m.outcome.is_none()) {
+        quiesce(paging, &mut nodes, &mut a, &mut b, &mut members)?;
+        serial::write(format_args!(
+            "[NEU] Multi no-runnable classification: quiesced={} dispatches={}\n",
+            members
+                .iter()
+                .filter(|m| m.outcome == Some(ExitReason::Quiesced))
+                .count(),
+            dispatches
+        ))
+        .map_err(|_| Error::Corrupt)?;
     }
     if nodes.active().is_some()
         || !queue.is_empty()

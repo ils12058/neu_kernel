@@ -107,7 +107,17 @@ const _: () = assert!(
         + cfg!(feature = "test-channels-b-fault") as u8
         + cfg!(feature = "test-channels-rollback") as u8
         + cfg!(feature = "test-native-abi03-disabled") as u8
-        + cfg!(feature = "test-address-space-channel-disabled") as u8)
+        + cfg!(feature = "test-native-abi04-disabled") as u8
+        + cfg!(feature = "test-channels-legacy") as u8
+        + cfg!(feature = "test-address-space-channel-disabled") as u8
+        + cfg!(feature = "test-channels-wait") as u8
+        + cfg!(feature = "test-channels-wait-send") as u8
+        + cfg!(feature = "test-channels-wait-fifo") as u8
+        + cfg!(feature = "test-channels-wait-close-receive") as u8
+        + cfg!(feature = "test-channels-wait-close-send") as u8
+        + cfg!(feature = "test-channels-wait-fault") as u8
+        + cfg!(feature = "test-channels-wait-deadlock") as u8
+        + cfg!(feature = "test-channels-wait-xapic") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

@@ -522,7 +522,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
             _ => return Err(Error::Corrupt),
         };
         match event {
-            SliceEvent::Preempted(_) => return Err(Error::Corrupt),
+            SliceEvent::Preempted(_) | SliceEvent::Blocked(_) => return Err(Error::Corrupt),
             SliceEvent::Yield(frame) => {
                 frame_log("saved", domain.thread, frame)?;
                 domain.last = Some(frame);

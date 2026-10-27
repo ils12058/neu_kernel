@@ -35,6 +35,7 @@ pub enum NodeState {
     Ready,
     Active,
     Exited,
+    Quiesced,
     Reclaimed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub enum ThreadState {
     Ready,
     Runnable,
     Running,
+    Blocked,
     Exited,
     Reclaimed,
 }
@@ -69,6 +71,7 @@ pub enum ExitReason {
     UserFault(Fault),
     ConstructionFailure,
     Cancelled { by: ThreadId },
+    Quiesced,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadContext {
@@ -524,6 +527,7 @@ impl Nodes {
                         | ThreadState::Ready
                         | ThreadState::Runnable
                         | ThreadState::Running
+                        | ThreadState::Blocked
                 )
         });
         // A normal Thread exit ends its Node only when no live Threads remain.
@@ -644,9 +648,144 @@ impl Nodes {
         self.active = None;
         Ok(())
     }
+    pub fn block(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
+        if self.active != Some(active) || self.tables[active.node.slot].is_none() {
+            return Err(Error::Association);
+        }
+        let mut t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        let stack = t.stack.ok_or(Error::State)?;
+        if t.state != ThreadState::Running
+            || t.queued
+            || t.saved.is_some()
+            || n.state != NodeState::Active
+            || !saved.continuation
+            || !saved.valid(active, stack)
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Blocked;
+        t.saved = Some(saved);
+        self.threads[t.id.slot] = Some(t);
+        self.active = None;
+        Ok(())
+    }
+    /// Returns a woken Thread that lost its condition to Blocked without losing
+    /// the notification or taking a second wait pin.
+    pub fn reblock(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
+        if self.active != Some(active) || self.tables[active.node.slot].is_none() {
+            return Err(Error::Association);
+        }
+        let mut t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        let stack = t.stack.ok_or(Error::State)?;
+        if t.state != ThreadState::Running
+            || t.queued
+            || t.saved.is_some()
+            || n.state != NodeState::Active
+            || !saved.continuation
+            || !saved.valid(active, stack)
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Blocked;
+        t.saved = Some(saved);
+        self.threads[t.id.slot] = Some(t);
+        self.active = None;
+        Ok(())
+    }
+    pub fn wake(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        if t.state != ThreadState::Blocked
+            || t.queued
+            || t.saved.is_none()
+            || self.active.is_some()
+            || n.state != NodeState::Active
+        {
+            return Err(Error::State);
+        }
+        t.state = ThreadState::Ready;
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    /// Cancels one blocked Thread before Node fault cleanup. The caller has
+    /// already removed its registry wait and released its endpoint pin.
+    pub fn cancel_blocked(&mut self, id: ThreadId, outcome: ExitReason) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        if t.state != ThreadState::Blocked || t.queued || self.active.is_some() {
+            return Err(Error::State);
+        }
+        t.state = ThreadState::Exited;
+        t.outcome = Some(outcome);
+        t.saved = None;
+        self.threads[id.slot] = Some(t);
+        if !self.threads.iter().flatten().any(|other| {
+            other.node == n.id
+                && !matches!(other.state, ThreadState::Exited | ThreadState::Reclaimed)
+        }) {
+            let mut n = n;
+            n.state = NodeState::Exited;
+            n.outcome = Some(outcome);
+            self.tables[n.id.slot]
+                .as_mut()
+                .ok_or(Error::InUse)?
+                .terminate();
+            self.nodes[n.id.slot] = Some(n);
+        }
+        Ok(())
+    }
+    /// Terminal no-runnable classification. Waits must already be canceled so
+    /// no pinned object or dangling continuation survives this transition.
+    pub fn quiesce(&mut self, id: NodeId) -> Result<()> {
+        let mut n = self.node(id)?;
+        if self.active.is_some()
+            || n.state != NodeState::Active
+            || self.threads.iter().flatten().any(|t| {
+                t.node == id
+                    && (t.queued
+                        || matches!(
+                            t.state,
+                            ThreadState::Running | ThreadState::Runnable | ThreadState::Ready
+                        ))
+            })
+        {
+            return Err(Error::State);
+        }
+        for t in self.threads.iter_mut().flatten().filter(|t| t.node == id) {
+            if !matches!(t.state, ThreadState::Exited | ThreadState::Reclaimed) {
+                t.state = ThreadState::Exited;
+                t.outcome = Some(ExitReason::Quiesced);
+                t.saved = None;
+                t.queued = false;
+            }
+        }
+        n.state = NodeState::Quiesced;
+        n.outcome = Some(ExitReason::Quiesced);
+        self.tables[n.id.slot]
+            .as_mut()
+            .ok_or(Error::InUse)?
+            .terminate();
+        self.nodes[n.id.slot] = Some(n);
+        Ok(())
+    }
+    pub fn blocked_threads(&self, id: NodeId) -> [Option<ThreadId>; MAX_THREADS] {
+        let mut result = [None; MAX_THREADS];
+        for (slot, t) in self
+            .threads
+            .iter()
+            .flatten()
+            .filter(|t| t.node == id && t.state == ThreadState::Blocked)
+            .enumerate()
+        {
+            result[slot] = Some(t.id);
+        }
+        result
+    }
     pub fn release_stack(&mut self, id: ThreadId, stack: StackBinding) -> Result<()> {
         let mut t = self.thread(id)?;
-        if t.state != ThreadState::Exited
+        if !matches!(t.state, ThreadState::Exited)
             || t.queued
             || t.saved.is_some()
             || t.stack != Some(stack)
@@ -678,7 +817,7 @@ impl Nodes {
     }
     pub fn release_space(&mut self, id: NodeId, space: SpaceId) -> Result<()> {
         let mut n = self.node(id)?;
-        if n.state != NodeState::Exited
+        if !matches!(n.state, NodeState::Exited | NodeState::Quiesced)
             || self
                 .threads
                 .iter()
@@ -696,7 +835,7 @@ impl Nodes {
     }
     pub fn reclaim(&mut self, id: NodeId) -> Result<()> {
         let mut n = self.node(id)?;
-        if n.state != NodeState::Exited
+        if !matches!(n.state, NodeState::Exited | NodeState::Quiesced)
             || n.space.is_some()
             || self.active.is_some_and(|a| a.node == id)
         {
@@ -755,7 +894,10 @@ impl StackEdit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paging::Registry;
+    use crate::{
+        context::{SavedContext, StackBinding},
+        paging::Registry,
+    };
     fn ready(nodes: &mut Nodes, spaces: &mut Registry, root: u64) -> (NodeId, ThreadId, SpaceId) {
         let space = spaces.create_space().unwrap();
         spaces.bind_root(space, root).unwrap();
@@ -985,6 +1127,84 @@ mod tests {
         );
         assert!(exhausted.threads.iter().all(Option::is_none));
         assert_eq!(exhausted.node(node).unwrap().state, NodeState::Configuring);
+    }
+    #[test]
+    fn stale_thread_generation_cannot_wake_cancel_or_resume_a_replacement() {
+        let mut n = Nodes::new();
+        let mut s = Registry::new();
+        let (a, old, space) = ready(&mut n, &mut s, 0x1000);
+        let active = n.start(old).unwrap();
+        n.complete(active, ExitReason::Normal(0)).unwrap();
+        n.release_space(a, space).unwrap();
+        n.reclaim(a).unwrap();
+        let (replacement, fresh, _) = ready(&mut n, &mut s, 0x3000);
+        assert_eq!(n.node(a).err(), Some(Error::Identity));
+        assert_ne!(fresh, old);
+        assert_eq!(n.wake(old), Err(Error::Identity));
+        assert_eq!(
+            n.cancel_blocked(old, ExitReason::Normal(0)),
+            Err(Error::Identity)
+        );
+        assert_eq!(n.thread(fresh).unwrap().state, ThreadState::Ready);
+        assert_eq!(n.node(replacement).unwrap().state, NodeState::Ready);
+    }
+    #[test]
+    fn sibling_exit_preserves_a_blocked_thread_and_its_saved_continuation() {
+        let mut n = Nodes::new();
+        let mut s = Registry::new();
+        let (a, first, space) = ready(&mut n, &mut s, 0x1000);
+        let second = n
+            .member_thread(
+                a,
+                ThreadContext {
+                    space,
+                    root: 0x1000,
+                    entry: 0x400000,
+                    rsp: 0x402ff8,
+                },
+            )
+            .unwrap();
+        let first_ctx = ActiveContext {
+            node: a,
+            thread: first,
+            context: n.thread(first).unwrap().context,
+        };
+        let first_stack = StackBinding::new(first_ctx);
+        n.install_execution(first, SavedContext::initial(first_ctx, first_stack))
+            .unwrap();
+        let second_ctx = ActiveContext {
+            node: a,
+            thread: second,
+            context: n.thread(second).unwrap().context,
+        };
+        let second_stack = StackBinding::new(second_ctx);
+        n.install_execution(second, SavedContext::initial(second_ctx, second_stack))
+            .unwrap();
+        let mut q = crate::scheduler::Queue::new();
+        q.enqueue(&mut n, first).unwrap();
+        q.enqueue(&mut n, second).unwrap();
+        let active = q.next(&mut n).unwrap().unwrap().active;
+        let stack = StackBinding::new(active);
+        let mut frame = SavedContext::initial(active, stack).frame;
+        frame.context.rip = 0x400080;
+        frame.context.rsp = 0x404fd8;
+        frame.context.flags = 0x46;
+        frame.registers.rcx = frame.context.rip;
+        frame.registers.r11 = frame.context.flags;
+        frame.registers.rax = 7;
+        frame.registers.rdx = 9;
+        let saved = SavedContext::continuation(active, stack, frame);
+        n.block(active, saved).unwrap();
+        let active = q.next(&mut n).unwrap().unwrap().active;
+        n.complete(active, ExitReason::Normal(3)).unwrap();
+        assert_eq!(n.node(a).unwrap().state, NodeState::Active);
+        let blocked = n.thread(first).unwrap();
+        assert_eq!(blocked.state, ThreadState::Blocked);
+        assert_eq!(blocked.saved, Some(saved));
+        assert_eq!(n.thread(second).unwrap().state, ThreadState::Exited);
+        n.wake(first).unwrap();
+        assert_eq!(n.thread(first).unwrap().state, ThreadState::Ready);
+        assert_eq!(n.thread(first).unwrap().saved, Some(saved));
     }
 }
 

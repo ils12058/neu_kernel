@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     context::{SavedContext, StackBinding},
-    node::{self, Nodes, ThreadContext},
+    node::{self, Nodes, ThreadContext, ThreadId},
     paging::Registry,
     scheduler::Queue,
 };
@@ -849,6 +849,115 @@ fn channels() -> (Nodes, Objects, NodeId, NodeId) {
     }
     (n, o, a, b)
 }
+fn node_with_thread(
+    n: &mut Nodes,
+    spaces: &mut Registry,
+    root: u64,
+    rsp: u64,
+) -> (NodeId, ThreadId, ActiveContext) {
+    let space = spaces.create_space().unwrap();
+    spaces.bind_root(space, root).unwrap();
+    let node = n.create().unwrap();
+    n.configure(node).unwrap();
+    n.bind_space(node, space).unwrap();
+    let context = ThreadContext {
+        space,
+        root,
+        entry: 0x400000,
+        rsp,
+    };
+    let thread = n.initial_thread(node, context).unwrap();
+    n.ready(node).unwrap();
+    (
+        node,
+        thread,
+        ActiveContext {
+            node,
+            thread,
+            context,
+        },
+    )
+}
+/// Three real Thread identities in the supported two-Node topology: A has two
+/// members sharing authority, B has one peer Thread.
+fn waiters() -> (Nodes, Objects, ActiveContext, ActiveContext, ActiveContext) {
+    let mut n = Nodes::new();
+    let mut spaces = Registry::new();
+    let (a, _, a1) = node_with_thread(&mut n, &mut spaces, 0x1000, 0x404ff8);
+    let a2 = n
+        .member_thread(
+            a,
+            ThreadContext {
+                space: a1.context.space,
+                root: 0x1000,
+                entry: 0x400000,
+                rsp: 0x402ff8,
+            },
+        )
+        .unwrap();
+    let a2 = ActiveContext {
+        node: a,
+        thread: a2,
+        context: n.thread(a2).unwrap().context,
+    };
+    let (b, _, b1) = node_with_thread(&mut n, &mut spaces, 0x2000, 0x404ff8);
+    let mut o = Objects::with_channels();
+    n.bootstrap_channel(&mut o, a, b).unwrap();
+    for id in [a, b] {
+        n.authority_mut(id).unwrap().seal_bootstrap();
+    }
+    (n, o, a1, a2, b1)
+}
+fn receive_start(
+    n: &Nodes,
+    o: &mut Objects,
+    active: ActiveContext,
+    handle: Handle,
+) -> Result<WaitStart> {
+    n.authority(active.node)
+        .unwrap()
+        .lookup(
+            o,
+            active.node,
+            handle,
+            ObjectType::ChannelEndpoint,
+            Rights::RECEIVE,
+        )?
+        .channel_receive_wait(active)
+}
+fn send_start(
+    n: &Nodes,
+    o: &mut Objects,
+    active: ActiveContext,
+    handle: Handle,
+    payload: u64,
+) -> Result<WaitStart> {
+    n.authority(active.node)
+        .unwrap()
+        .lookup(
+            o,
+            active.node,
+            handle,
+            ObjectType::ChannelEndpoint,
+            Rights::SEND,
+        )?
+        .channel_send_wait(active, payload)
+}
+fn queued(o: &mut Objects) -> ([Option<crate::wait::Waiter>; 3], usize) {
+    let ready = o.take_ready_waits();
+    let count = ready.iter().flatten().count();
+    (ready, count)
+}
+fn close_all(n: &mut Nodes, o: &mut Objects, node: NodeId) {
+    for index in 4..8 {
+        let h = n
+            .authority(node)
+            .unwrap()
+            .bootstrap_get(o, node, index)
+            .unwrap();
+        n.authority_mut(node).unwrap().close(o, node, h).unwrap();
+    }
+}
 fn endpoint(n: &Nodes, o: &Objects, node: NodeId, index: u64) -> Handle {
     n.authority(node)
         .unwrap()
@@ -1330,4 +1439,489 @@ fn each_faulted_owner_discards_only_its_inbound_and_preserves_peer_fifo() {
         assert_eq!(o.stats(), Stats::default());
         assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
     }
+}
+
+/// ADR 0018's per-direction invariant, read from the production registry.
+fn assert_channel_conservation(o: &mut Objects) {
+    let s = o.channel_state().snapshot();
+    let queued = [s[8], s[13]];
+    let sent = [s[16], s[17]];
+    let received = [s[18], s[19]];
+    let discarded = [s[20], s[21]];
+    for side in 0..2 {
+        assert_eq!(
+            sent[1 - side],
+            received[side] + queued[side] + discarded[side],
+            "direction {side} conservation"
+        );
+    }
+}
+
+fn fault_owner(n: &mut Nodes, o: &mut Objects, dead: NodeId) {
+    n.authority_mut(dead).unwrap().terminate();
+    n.authority_mut(dead).unwrap().drain(o, dead).unwrap();
+}
+
+fn drain_peer_after_fault(
+    n: &mut Nodes,
+    o: &mut Objects,
+    live: NodeId,
+    handle: Handle,
+    expected: &[u64],
+) {
+    for value in expected {
+        assert_eq!(receive(n, o, live, handle), Ok(*value));
+    }
+    assert_eq!(receive(n, o, live, handle), Err(Error::PeerClosed));
+    assert_eq!(send(n, o, live, handle, 0xdead), Err(Error::PeerClosed));
+    n.authority_mut(live).unwrap().drain(o, live).unwrap();
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+}
+
+#[test]
+fn fault_timing_matrix_preserves_conservation_and_restores_accounting() {
+    for dead_side in 0..2 {
+        let dead_side = dead_side as usize;
+        // Fault before any committed message.
+        {
+            let (mut n, mut o, a, b) = channels();
+            let nodes = [a, b];
+            fault_owner(&mut n, &mut o, nodes[dead_side]);
+            assert_channel_conservation(&mut o);
+            let live = 1 - dead_side;
+            let live_handle = endpoint(&n, &o, nodes[live], 4);
+            drain_peer_after_fault(&mut n, &mut o, nodes[live], live_handle, &[]);
+        }
+        // Fault after one successful commit; live peer drains it first.
+        {
+            let (mut n, mut o, a, b) = channels();
+            let nodes = [a, b];
+            let dead_handle = endpoint(&n, &o, nodes[dead_side], 4);
+            let live_handle = endpoint(&n, &o, nodes[1 - dead_side], 4);
+            send(&n, &mut o, nodes[dead_side], dead_handle, 0x51).unwrap();
+            assert_channel_conservation(&mut o);
+            fault_owner(&mut n, &mut o, nodes[dead_side]);
+            assert_channel_conservation(&mut o);
+            drain_peer_after_fault(&mut n, &mut o, nodes[1 - dead_side], live_handle, &[0x51]);
+        }
+        // Fault after a Full rejection with a full peer FIFO.
+        {
+            let (mut n, mut o, a, b) = channels();
+            let nodes = [a, b];
+            let dead_handle = endpoint(&n, &o, nodes[dead_side], 4);
+            let live_handle = endpoint(&n, &o, nodes[1 - dead_side], 4);
+            send(&n, &mut o, nodes[dead_side], dead_handle, 0x61).unwrap();
+            send(&n, &mut o, nodes[dead_side], dead_handle, 0x62).unwrap();
+            assert_eq!(
+                send(&n, &mut o, nodes[dead_side], dead_handle, 0x63),
+                Err(Error::Full)
+            );
+            assert_channel_conservation(&mut o);
+            fault_owner(&mut n, &mut o, nodes[dead_side]);
+            assert_channel_conservation(&mut o);
+            drain_peer_after_fault(
+                &mut n,
+                &mut o,
+                nodes[1 - dead_side],
+                live_handle,
+                &[0x61, 0x62],
+            );
+        }
+        // Fault after a successful receive, with messages pending both ways.
+        {
+            let (mut n, mut o, a, b) = channels();
+            let nodes = [a, b];
+            let dead_send = endpoint(&n, &o, nodes[dead_side], 4);
+            let dead_recv = endpoint(&n, &o, nodes[dead_side], 5);
+            let live_send = endpoint(&n, &o, nodes[1 - dead_side], 4);
+            let live_recv = endpoint(&n, &o, nodes[1 - dead_side], 5);
+            send(&n, &mut o, nodes[dead_side], dead_send, 0x71).unwrap();
+            send(&n, &mut o, nodes[1 - dead_side], live_send, 0x72).unwrap();
+            assert_eq!(receive(&n, &mut o, nodes[dead_side], dead_recv), Ok(0x72));
+            assert_channel_conservation(&mut o);
+            fault_owner(&mut n, &mut o, nodes[dead_side]);
+            assert_channel_conservation(&mut o);
+            drain_peer_after_fault(&mut n, &mut o, nodes[1 - dead_side], live_recv, &[0x71]);
+        }
+        // Fault after closing one of several endpoint references.
+        {
+            let (mut n, mut o, a, b) = channels();
+            let nodes = [a, b];
+            let first = endpoint(&n, &o, nodes[dead_side], 4);
+            let second = endpoint(&n, &o, nodes[dead_side], 6);
+            let live_handle = endpoint(&n, &o, nodes[1 - dead_side], 4);
+            n.authority_mut(nodes[dead_side])
+                .unwrap()
+                .close(&mut o, nodes[dead_side], first)
+                .unwrap();
+            assert_eq!(
+                send(&n, &mut o, nodes[dead_side], first, 0x81),
+                Err(Error::Stale)
+            );
+            send(&n, &mut o, nodes[dead_side], second, 0x82).unwrap();
+            assert_channel_conservation(&mut o);
+            fault_owner(&mut n, &mut o, nodes[dead_side]);
+            assert_channel_conservation(&mut o);
+            drain_peer_after_fault(&mut n, &mut o, nodes[1 - dead_side], live_handle, &[0x82]);
+        }
+    }
+}
+
+#[test]
+fn blocking_receive_after_a_committed_send_never_registers_a_wait() {
+    let (n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    send(&n, &mut o, b1.node, bh, 0x1111).unwrap();
+    assert_eq!(
+        receive_start(&n, &mut o, a1, ah),
+        Ok(WaitStart::Committed(0x1111))
+    );
+    assert!(o.wait_stats() == crate::wait::Stats::default());
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn blocked_send_is_rechecked_and_commits_once_capacity_exists() {
+    let (n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 4);
+    let bh = endpoint(&n, &o, b1.node, 4);
+    send(&n, &mut o, a1.node, ah, 1).unwrap();
+    send(&n, &mut o, a1.node, ah, 2).unwrap();
+    assert_eq!(send_start(&n, &mut o, a1, ah, 3), Ok(WaitStart::Blocked));
+    assert_eq!(o.channel_state().snapshot()[13], 2);
+    assert_eq!(o.wait_stats().waiting, 1);
+    assert_eq!(o.stats().pins, 1);
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(1));
+    let (ready, count) = queued(&mut o);
+    assert_eq!(count, 1);
+    let waiter = ready[0].unwrap();
+    assert_eq!(waiter.kind, crate::wait::Kind::Send);
+    assert_eq!(waiter.payload, 3);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(2));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(3));
+    assert_eq!(o.channel_state().snapshot()[16..22], [3, 0, 0, 3, 0, 0]);
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn woken_receiver_that_finds_the_queue_empty_is_restored_without_losing_its_pin() {
+    let (n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    send(&n, &mut o, b1.node, bh, 10).unwrap();
+    assert_eq!(o.wait_stats().ready, 1);
+    assert_eq!(queued(&mut o).1, 1);
+    // A different Thread on the same Node consumes the only message before the
+    // woken Thread reaches its recheck.
+    assert_eq!(receive(&n, &mut o, a2.node, ah), Ok(10));
+    assert_eq!(o.settle_wait(a1.thread), Settle::Retry);
+    let waiter = o.wait_waiter(a1.thread).unwrap();
+    assert_eq!(waiter.state, crate::wait::State::Waiting);
+    assert!(waiter.pinned);
+    assert_eq!(o.stats().pins, 1);
+    send(&n, &mut o, b1.node, bh, 11).unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(11));
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn woken_sender_that_finds_the_queue_full_is_restored_without_duplicate_pin() {
+    let (n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 4);
+    let bh = endpoint(&n, &o, b1.node, 4);
+    send(&n, &mut o, a1.node, ah, 1).unwrap();
+    send(&n, &mut o, a1.node, ah, 2).unwrap();
+    assert_eq!(send_start(&n, &mut o, a1, ah, 3), Ok(WaitStart::Blocked));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(1));
+    // A2 refills the receiver FIFO before A1's recheck.
+    send(&n, &mut o, a2.node, ah, 4).unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Retry);
+    assert!(o.wait_waiter(a1.thread).unwrap().pinned);
+    assert_eq!(o.stats().pins, 1);
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(2));
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(4));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(3));
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn blocked_send_preserves_the_full_width_payload_until_commit() {
+    let (n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 4);
+    let bh = endpoint(&n, &o, b1.node, 4);
+    send(&n, &mut o, a1.node, ah, 0).unwrap();
+    send(&n, &mut o, a1.node, ah, 1).unwrap();
+    assert_eq!(
+        send_start(&n, &mut o, a1, ah, u64::MAX),
+        Ok(WaitStart::Blocked)
+    );
+    assert_eq!(o.wait_waiter(a1.thread).unwrap().payload, u64::MAX);
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(0));
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(1));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Ok(u64::MAX));
+    assert_eq!(o.channel_state().snapshot()[16..22], [3, 0, 0, 3, 0, 0]);
+}
+
+#[test]
+fn receive_delivers_exactly_one_scalar_and_never_wakes_an_already_ready_waiter_twice() {
+    let (n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    send(&n, &mut o, b1.node, bh, 0xaa).unwrap();
+    let token = o.wait_waiter(a1.thread).unwrap().token;
+    let stats = o.wait_stats();
+    send(&n, &mut o, b1.node, bh, 0xbb).unwrap();
+    assert_eq!(o.wait_stats(), stats);
+    assert!(!o.waits.mark_ready(token));
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0xaa));
+    assert_eq!(receive(&n, &mut o, a2.node, ah), Ok(0xbb));
+    assert_eq!(receive(&n, &mut o, a2.node, ah), Err(Error::Empty));
+    assert_eq!(o.channel_state().snapshot()[18], 2);
+}
+
+#[test]
+fn peer_close_wakes_all_affected_waiters_and_reports_peer_closed() {
+    let (mut n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    close_all(&mut n, &mut o, b1.node);
+    let stats = o.wait_stats();
+    assert_eq!(stats.ready, 2);
+    assert_eq!(stats.waiting, 0);
+    assert_eq!(o.stats().pins, 2);
+    let (ready, count) = queued(&mut o);
+    assert_eq!(count, 2);
+    assert_eq!(ready[0].unwrap().thread(), a1.thread);
+    assert_eq!(ready[1].unwrap().thread(), a2.thread);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Failed(Error::PeerClosed));
+    assert_eq!(o.settle_wait(a2.thread), Settle::Failed(Error::PeerClosed));
+    assert_eq!(o.stats().pins, 0);
+    assert_eq!(o.channel_state().stats().endpoints, 1);
+}
+
+#[test]
+fn closing_the_waited_endpoint_during_an_in_flight_wait_is_safe() {
+    let (mut n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    for index in 4..7 {
+        let h = n
+            .authority(a1.node)
+            .unwrap()
+            .bootstrap_get(&o, a1.node, index)
+            .unwrap();
+        n.authority_mut(a1.node)
+            .unwrap()
+            .close(&mut o, a1.node, h)
+            .unwrap();
+    }
+    assert_eq!(o.wait_stats().waiting, 1);
+    assert_eq!(o.stats().pins, 1);
+    n.authority_mut(a1.node)
+        .unwrap()
+        .close(&mut o, a1.node, ah)
+        .unwrap();
+    let stats = o.wait_stats();
+    assert_eq!(stats.ready, 1);
+    assert_eq!(stats.terminal, 1);
+    assert_eq!(o.stats().pins, 0);
+    assert_eq!(o.channel_state().stats().endpoints, 1);
+    let (_, count) = queued(&mut o);
+    assert_eq!(count, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Failed(Error::PeerClosed));
+    assert!(o.wait_waiter(a1.thread).is_none());
+    close_all(&mut n, &mut o, b1.node);
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+}
+
+#[test]
+fn node_cancellation_removes_all_owned_waits_and_preserves_a_surviving_peer_pin() {
+    let (mut n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 7);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, b1, bh), Ok(WaitStart::Blocked));
+    assert_eq!(o.node_wait_count(a1.node), 2);
+    assert_eq!(o.node_wait_count(b1.node), 1);
+    assert_eq!(o.pins_outside_node(a1.node), 1);
+    assert_eq!(o.cancel_node_waits(a1.node), 2);
+    assert_eq!(o.node_wait_count(a1.node), 0);
+    assert_eq!(o.node_wait_count(b1.node), 1);
+    assert_eq!(o.pins_outside_node(a1.node), 1);
+    assert_eq!(o.pins_outside_node(b1.node), 0);
+    assert_eq!(o.stats().pins, 1);
+    assert_eq!(o.cancel_node_waits(b1.node), 1);
+    assert_eq!(o.stats().pins, 0);
+    close_all(&mut n, &mut o, a1.node);
+    close_all(&mut n, &mut o, b1.node);
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+}
+
+#[test]
+fn wait_registration_capacity_failure_after_the_pin_rolls_back_cleanly() {
+    let (n, mut o, a1, _, _) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    o.waits.force_sequence_exhaustion();
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Err(Error::Capacity));
+    assert!(o.wait_stats() == crate::wait::Stats::default());
+    assert_eq!(o.stats().pins, 0);
+    assert!(!o.channel_state().snapshot()[16..18].iter().any(|v| *v != 0));
+}
+
+#[test]
+fn operation_pin_exhaustion_never_registers_or_suspends() {
+    let (n, mut o, a1, _, _) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let (id, _) = n.authority(a1.node).unwrap().describe(a1.node, ah).unwrap();
+    o.slots[id.slot].pins = u32::MAX;
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Err(Error::Capacity));
+    assert!(o.wait_stats() == crate::wait::Stats::default());
+    assert!(o.wait_waiter(a1.thread).is_none());
+    o.slots[id.slot].pins = 0;
+}
+
+#[test]
+fn rights_failure_and_duplicate_registration_happen_before_suspension() {
+    let (n, mut o, a1, _, _) = waiters();
+    let send_only = endpoint(&n, &o, a1.node, 6);
+    let receive_only = endpoint(&n, &o, a1.node, 7);
+    assert_eq!(receive_start(&n, &mut o, a1, send_only), Err(Error::Rights));
+    assert_eq!(o.stats().pins, 0);
+    assert_eq!(
+        receive_start(&n, &mut o, a1, receive_only),
+        Ok(WaitStart::Blocked)
+    );
+    let snapshot = o.wait_stats();
+    let pins = o.stats().pins;
+    assert_eq!(
+        receive_start(&n, &mut o, a1, receive_only),
+        Err(Error::InUse)
+    );
+    assert_eq!(o.wait_stats(), snapshot);
+    assert_eq!(o.stats().pins, pins);
+    let stale = Handle::from_raw(send_only.raw().wrapping_add(1 << 32));
+    assert_eq!(receive_start(&n, &mut o, a1, stale), Err(Error::Stale));
+    assert_eq!(o.wait_stats(), snapshot);
+}
+
+#[test]
+fn multiple_receivers_are_woken_in_registration_fifo_order_once_each() {
+    let (n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    send(&n, &mut o, b1.node, bh, 0xc1).unwrap();
+    assert_eq!(o.wait_stats().ready, 1);
+    assert_eq!(
+        o.wait_waiter(a1.thread).unwrap().state,
+        crate::wait::State::Ready
+    );
+    assert_eq!(
+        o.wait_waiter(a2.thread).unwrap().state,
+        crate::wait::State::Waiting
+    );
+    send(&n, &mut o, b1.node, bh, 0xc2).unwrap();
+    assert_eq!(o.wait_stats().ready, 2);
+    let (ready, count) = queued(&mut o);
+    assert_eq!(count, 2);
+    assert_eq!(ready[0].unwrap().thread(), a1.thread);
+    assert_eq!(ready[1].unwrap().thread(), a2.thread);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0xc1));
+    assert_eq!(o.settle_wait(a2.thread), Settle::Committed(0xc2));
+    assert_eq!(receive(&n, &mut o, a1.node, ah), Err(Error::Empty));
+    assert_eq!(o.channel_state().snapshot()[18], 2);
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn settling_a_wait_before_its_wake_is_rejected_without_touching_the_pin() {
+    let (n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(o.settle_wait(a1.thread), Settle::Failed(Error::Stale));
+    assert_eq!(o.wait_stats().waiting, 1);
+    assert_eq!(o.stats().pins, 1);
+    send(&n, &mut o, b1.node, bh, 0x51).unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(0x51));
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn cancelled_wait_tokens_cannot_be_settled_or_revived_into_a_new_channel() {
+    let (mut n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    let old = o.wait_waiter(a1.thread).unwrap().token;
+    assert_eq!(o.cancel_node_waits(a1.node), 2);
+    assert!(o.take_ready_waits().into_iter().all(|w| w.is_none()));
+    assert_eq!(o.settle_wait(a1.thread), Settle::Failed(Error::Object));
+    assert!(o.wait_waiter(a1.thread).is_none());
+    assert_eq!(o.stats().pins, 0);
+    send(&n, &mut o, b1.node, bh, 1).unwrap();
+    assert_eq!(receive(&n, &mut o, a1.node, ah), Ok(1));
+    assert!(o.wait_waiter(a1.thread).is_none());
+    assert!(o.wait_snapshot()[6..].iter().all(|w| *w == 0));
+    let _ = old;
+}
+
+#[test]
+fn retry_preserves_registration_fifo_for_the_next_wake() {
+    let (n, mut o, a1, a2, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    send(&n, &mut o, b1.node, bh, 1).unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(receive(&n, &mut o, a2.node, ah), Ok(1));
+    assert_eq!(o.settle_wait(a1.thread), Settle::Retry);
+    send(&n, &mut o, b1.node, bh, 2).unwrap();
+    let waiter = o.take_ready_waits();
+    assert_eq!(waiter[0].unwrap().thread(), a1.thread);
+    assert!(waiter[1].is_none());
+    assert_eq!(o.settle_wait(a1.thread), Settle::Committed(2));
+    send(&n, &mut o, b1.node, bh, 3).unwrap();
+    assert_eq!(o.take_ready_waits()[0].unwrap().thread(), a2.thread);
+    assert_eq!(o.settle_wait(a2.thread), Settle::Committed(3));
+    assert_eq!(o.stats().pins, 0);
+}
+
+#[test]
+fn a_woken_receiver_drains_a_committed_message_before_observing_peer_close() {
+    let (mut n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 6);
+    let bh = endpoint(&n, &o, b1.node, 7);
+    assert_eq!(receive_start(&n, &mut o, b1, bh), Ok(WaitStart::Blocked));
+    send(&n, &mut o, a1.node, ah, 0x77).unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    // The sending peer retires while the woken receiver has not yet been scheduled.
+    close_all(&mut n, &mut o, a1.node);
+    let stats = o.wait_stats();
+    assert_eq!(stats.queued, 1);
+    assert_eq!(stats.terminal, 0);
+    assert_eq!(o.settle_wait(b1.thread), Settle::Committed(0x77));
+    assert_eq!(receive(&n, &mut o, b1.node, bh), Err(Error::PeerClosed));
+    assert_eq!(o.stats().pins, 0);
+    close_all(&mut n, &mut o, b1.node);
+    assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
 }

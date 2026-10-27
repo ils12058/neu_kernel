@@ -51,6 +51,22 @@ pub mod v03 {
     }
 }
 
+/// Experimental blocking Channel extension. Legacy (0.1/0.2/0.3) dispatch,
+/// feature masks and results remain byte-for-byte unchanged.
+pub mod v04 {
+    pub const CHANNEL_SEND_WAIT: u64 = 0x15;
+    pub const CHANNEL_RECEIVE_WAIT: u64 = 0x16;
+    pub const FEATURE_CHANNEL_WAIT: u32 = 64;
+    pub const INFO: u64 = super::version(
+        0,
+        4,
+        super::FEATURE_QUERY | super::FEATURE_EXIT | 28 | 32 | FEATURE_CHANNEL_WAIT,
+    );
+    pub fn owns(number: u64) -> bool {
+        (CHANNEL_SEND_WAIT..=CHANNEL_RECEIVE_WAIT).contains(&number)
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
@@ -63,6 +79,7 @@ pub const USER_FLAGS: u64 = 0x8d7; // arithmetic flags plus required bit 1
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Return { status: i64, scalar: u64 },
+    Blocked,
     Exit(u8),
 }
 pub fn dispatch(number: u64, arguments: [u64; 6]) -> Outcome {
@@ -460,6 +477,14 @@ mod channel_abi_tests {
         assert_eq!((v03::CHANNEL_SEND, v03::CHANNEL_RECEIVE), (0x13, 0x14));
         assert!(v03::owns(0x13) && v03::owns(0x14));
         assert!(!v02::owns(0x13));
+        assert_eq!(v04::INFO, 0x000000040000007f);
+        assert_eq!(
+            (v04::CHANNEL_SEND_WAIT, v04::CHANNEL_RECEIVE_WAIT),
+            (0x15, 0x16)
+        );
+        assert!(v04::owns(0x15) && v04::owns(0x16));
+        assert!(!v03::owns(0x15) && !v04::owns(0x14));
+        assert_eq!(v04::INFO & 0x7f, 0x7f);
     }
     #[test]
     fn old_scalar_dispatch_rejects_both_channel_numbers_with_zero_results() {

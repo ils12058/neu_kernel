@@ -27,7 +27,7 @@ const CANARIES: [u64; 6] = [
     0x66778899aabbccdd,
 ];
 pub const PRIVATE_VALUE: u64 = 0x5152535461626364;
-global_asm!(include_str!("native.S"),abi03_disabled=const cfg!(feature="test-native-abi03-disabled") as u8,cap_disabled=const cfg!(feature="test-native-cap-disabled") as u8,abi02_disabled=const cfg!(feature="test-native-abi02-disabled") as u8,cooperative=const cfg!(feature="switch-test") as u8,
+global_asm!(include_str!("native.S"),abi03_disabled=const cfg!(feature="test-native-abi03-disabled") as u8,abi04_disabled=const cfg!(feature="test-native-abi04-disabled") as u8,cap_disabled=const cfg!(feature="test-native-cap-disabled") as u8,abi02_disabled=const cfg!(feature="test-native-abi02-disabled") as u8,cooperative=const cfg!(feature="switch-test") as u8,
     kernel_wait=const if cfg!(feature="preempt-test") { 16u64 } else if cfg!(feature="switch-test") { 0x02000000u64 } else { 0x10000000u64 },private_value=const PRIVATE_VALUE,user_ss=const abi::USER_SS,user_cs=const abi::USER_CS,
     kernel_ss=const abi::KERNEL_SS,star=const abi::STAR,fmask=const abi::ENTRY_MASK,query=const abi::ABI_QUERY,exit=const abi::THREAD_EXIT,
     info=const abi::ABI_INFO,unsupported=const abi::NOT_SUPPORTED,invalid=const abi::INVALID_ARGUMENT,
@@ -381,6 +381,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
             }),
         );
     }
+    #[cfg(not(feature = "channel-wait-test"))]
     serial::write(format_args!("[NEU] Native entry: seq={} op={:#x} arg1={:#x} RIP={:#x} RSP={:#x} R11={:#x}\n[NEU] Native kernel: CS={:#x} SS={:#x} RSP={:#x} frame={:#x} RFLAGS={:#x} CR3={:#x}\n[NEU] Native canaries: RBX={:#x} RBP={:#x} R12={:#x} R13={:#x} R14={:#x} R15={:#x}\n",s.entries,before.rax,before.rdi,frame.context.rip,frame.context.rsp,before.r11,cs,ss,kernel_rsp,address,flags,root,before.rbx,before.rbp,before.r12,before.r13,before.r14,before.r15)).unwrap_or_else(|_| super::halt());
     // Isolated corruption hooks never exist in ordinary or Phase 2A images.
     if s.entries == 1 {
@@ -451,6 +452,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     #[cfg(feature = "abi-02")]
     let dispatched = if abi::v02::owns(before.rax)
         || cfg!(feature = "channel-test") && abi::v03::owns(before.rax)
+        || cfg!(feature = "channel-wait-test") && abi::v04::owns(before.rax)
     {
         let active = s
             .binding
@@ -465,7 +467,9 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     } else if before.rax == abi::ABI_QUERY {
         Outcome::Return {
             status: 0,
-            scalar: if cfg!(feature = "channel-test") {
+            scalar: if cfg!(feature = "channel-wait-test") {
+                abi::v04::INFO
+            } else if cfg!(feature = "channel-test") {
                 abi::v03::INFO
             } else {
                 abi::v02::INFO
@@ -477,6 +481,32 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     #[cfg(not(any(feature = "cap-test", feature = "abi-02")))]
     let dispatched = abi::dispatch(before.rax, before.arguments());
     match dispatched {
+        #[cfg(feature = "channel-wait-test")]
+        Outcome::Blocked => {
+            let binding = s
+                .binding
+                .unwrap_or_else(|| fatal("blocked request without Thread publication"));
+            let _stack = s
+                .stack
+                .unwrap_or_else(|| fatal("blocked request without stack publication"));
+            if validate_native_return(frame.context, &contract, paging::current_root()).is_err() {
+                fatal("blocked continuation contract");
+            }
+            s.event = Some(neu_kernel::context::SliceEvent::Blocked(frame));
+            s.valid = true;
+            save(s);
+            serial::write(format_args!(
+                "[NEU] Switch blocked: thread={} RIP={:#x} RSP={:#x} flags={:#x}\n",
+                binding.thread.raw(),
+                frame.context.rip,
+                frame.context.rsp,
+                frame.context.flags
+            ))
+            .unwrap_or_else(|_| super::halt());
+            terminal_exit(s, 102, 0);
+        }
+        #[cfg(not(feature = "channel-wait-test"))]
+        Outcome::Blocked => fatal("blocked request without wait support"),
         Outcome::Exit(status) => {
             serial::write(format_args!(
                 "[NEU] Native thread_exit: status={}\n",
@@ -503,6 +533,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
     {
         fatal("return contract changed during dispatch");
     }
+    #[cfg(not(feature = "channel-wait-test"))]
     serial::write(format_args!("[NEU] Native return prepared: seq={} RAX={:#x} RDX={:#x} RIP={:#x} RSP={:#x} preserved=true\n",s.entries,frame.registers.rax,frame.registers.rdx,frame.context.rip,frame.context.rsp)).unwrap_or_else(|_| super::halt());
     // SAFETY: Only this kernel stack frame is written. Assembly restores all
     // registers then executes IRETQ using the validated immutable-root context.
@@ -568,6 +599,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         || cfg!(feature = "test-native-cap-disabled")
         || cfg!(feature = "test-native-abi02-disabled")
         || cfg!(feature = "test-native-abi03-disabled")
+        || cfg!(feature = "test-native-abi04-disabled")
     {
         1
     } else if cfg!(feature = "test-native-exit-invalid") {
