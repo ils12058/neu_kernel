@@ -1435,3 +1435,285 @@ fn inspection_applies_ancestor_permissions_and_accepts_hardware_accessed_dirty_b
     );
     r.release_space_ref(reference).unwrap();
 }
+
+fn object_fixture() -> (
+    Registry,
+    Model,
+    PageTree,
+    PageTree,
+    SpaceId,
+    SpaceId,
+    [FrameId; 2],
+    MemoryObjectId,
+) {
+    let mut registry = Registry::new();
+    let mut memory = Model::new();
+    let a = PageTree::new(&mut memory, 48).unwrap();
+    let b = PageTree::new(&mut memory, 48).unwrap();
+    let sa = registry.create_space().unwrap();
+    let sb = registry.create_space().unwrap();
+    registry.bind_root(sa, a.root).unwrap();
+    registry.bind_root(sb, b.root).unwrap();
+    let frames = [
+        registry.insert(0x100000).unwrap(),
+        registry.insert(0x101000).unwrap(),
+    ];
+    for id in frames {
+        registry.initialize(id).unwrap();
+    }
+    let object = registry.create_memory_object(&frames).unwrap();
+    (registry, memory, a, b, sa, sb, frames, object)
+}
+
+#[test]
+fn memory_object_shared_mapping_lifetime_is_independent_of_space() {
+    for reverse in [false, true] {
+        let (mut r, mut m, a, b, sa, sb, frames, obj) = object_fixture();
+        let aa = r.authorize_memory_mapping(obj, sa, true).unwrap();
+        let ab = r.authorize_memory_mapping(obj, sb, false).unwrap();
+        map_memory_object(&a, &mut m, &mut r, &aa, 0, 0x410000, 2, Permissions::RW).unwrap();
+        map_memory_object(&b, &mut m, &mut r, &ab, 0, 0x420000, 2, Permissions::R).unwrap();
+        assert_eq!(r.memory_object_counts(obj), Ok((1, 4, 2)));
+        assert_eq!(r.mapping_for(sb, 0x420000).unwrap().frame, frames[0]);
+        assert_eq!(
+            a.translate(&m, 0x410000).unwrap().unwrap().physical,
+            b.translate(&m, 0x420000).unwrap().unwrap().physical
+        );
+        assert_eq!(
+            b.translate(&m, 0x420000).unwrap().unwrap().permissions,
+            Permissions::R
+        );
+        r.release_memory_object(obj).unwrap();
+        assert_eq!(r.collect_memory_object(obj), Err(Error::InUse));
+        let (first, fs, fv, second, ss, sv) = if reverse {
+            (&b, sb, 0x420000, &a, sa, 0x410000)
+        } else {
+            (&a, sa, 0x410000, &b, sb, 0x420000)
+        };
+        for i in 0..2 {
+            unmap_memory_object(first, &mut m, &mut r, fs, fv + i * PAGE).unwrap();
+        }
+        assert_eq!(r.memory_object_counts(obj), Ok((0, 2, 2)));
+        assert!(second.translate(&m, sv).unwrap().is_some());
+        assert_eq!(r.releasable(frames[0]), Err(Error::InUse));
+        for i in 0..2 {
+            unmap_memory_object(second, &mut m, &mut r, ss, sv + i * PAGE).unwrap();
+        }
+        assert_eq!(
+            unmap_memory_object(second, &mut m, &mut r, ss, sv),
+            Err(Error::NotMapped)
+        );
+        assert_eq!(
+            r.collect_memory_object(obj),
+            Ok([Some(frames[0]), Some(frames[1])])
+        );
+        assert_eq!(r.collect_memory_object(obj), Err(Error::NotOwned));
+        for frame in frames {
+            r.retire(frame).unwrap();
+            assert_eq!(r.retire(frame), Err(Error::NotOwned));
+        }
+    }
+}
+
+#[test]
+fn memory_object_authority_and_private_isolation_are_enforced() {
+    let (mut r, mut m, a, b, sa, sb, frames, obj) = object_fixture();
+    let aa = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    let ab = r.authorize_memory_mapping(obj, sb, false).unwrap();
+    assert_eq!(
+        map_user_frames_for(&b, &mut m, &mut r, sb, 0x410000, &frames, Permissions::RW),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        map_memory_object(&b, &mut m, &mut r, &aa, 0, 0x410000, 1, Permissions::R),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(
+        map_memory_object(&b, &mut m, &mut r, &ab, 0, 0x410000, 1, Permissions::RW),
+        Err(Error::Flags)
+    );
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &aa, 0, 0x410000, 1, Permissions::RX),
+        Err(Error::Flags)
+    );
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &aa, 0, 0x410001, 1, Permissions::R),
+        Err(Error::Alignment)
+    );
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &aa,
+            usize::MAX,
+            0x410000,
+            1,
+            Permissions::R
+        ),
+        Err(Error::Address)
+    );
+    map_memory_object(&a, &mut m, &mut r, &aa, 1, 0x410000, 1, Permissions::R).unwrap();
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &aa, 0, 0x410000, 1, Permissions::R),
+        Err(Error::AlreadyMapped)
+    );
+    assert_eq!(r.remove_for(sa, 0x410000), Err(Error::NotOwned));
+    let private = r.insert_for(sa, 0x102000).unwrap();
+    r.initialize(private).unwrap();
+    assert_eq!(
+        map_user_frames_for(&b, &mut m, &mut r, sb, 0x420000, &[private], Permissions::R),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 1, 2)));
+}
+
+#[test]
+fn memory_object_second_page_failure_rolls_back_tables_and_records() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let authority = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    let before = m.pages.len();
+    m.budget = Some(3);
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &authority,
+            0,
+            0x5ff000,
+            2,
+            Permissions::RW
+        ),
+        Err(Error::Exhausted)
+    );
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(a.translate(&m, 0x5ff000), Ok(None));
+    assert_eq!(a.translate(&m, 0x600000), Ok(None));
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
+}
+
+#[test]
+fn memory_object_generation_and_construction_failures_preserve_ownership() {
+    let (mut r, _, _, _, _, _, frames, obj) = object_fixture();
+    assert_eq!(r.create_memory_object(&[]), Err(Error::Address));
+    assert_eq!(r.create_memory_object(&frames), Err(Error::NotOwned));
+    assert_eq!(r.frame_owner(frames[0]), Ok(FrameOwner::MemoryObject(obj)));
+    r.release_memory_object(obj).unwrap();
+    assert_eq!(r.release_memory_object(obj), Err(Error::NotOwned));
+    r.collect_memory_object(obj).unwrap();
+    let next = r.create_memory_object(&frames[..1]).unwrap();
+    assert_ne!(obj, next);
+    assert_eq!(r.memory_object_counts(obj), Err(Error::NotOwned));
+    assert_eq!(r.memory_object_frame(next, 1), Err(Error::Address));
+}
+
+#[test]
+fn memory_object_uses_the_actual_frame_allocator_and_reclaims_once() {
+    use crate::memory::{FrameAllocator, MemoryMap, Region, Reservation};
+    let regions = [Region {
+        base: 0x1000,
+        length: 16 * PAGE,
+        kind: 0,
+    }];
+    let map = MemoryMap::new(&regions, Reservation::new(0x100000, PAGE).unwrap()).unwrap();
+    let mut bitmap = [0u64; 1];
+    let mut allocator = FrameAllocator::new(&map, &mut bitmap).unwrap();
+    let mut r = Registry::new();
+    let pa = allocator.allocate().unwrap();
+    let pb = allocator.allocate().unwrap();
+    assert_ne!(pa, pb);
+    let a = r.insert(pa).unwrap();
+    let b = r.insert(pb).unwrap();
+    r.initialize(a).unwrap();
+    r.initialize(b).unwrap();
+    let obj = r.create_memory_object(&[a, b]).unwrap();
+    assert_eq!(allocator.stats().allocated, 2);
+    r.release_memory_object(obj).unwrap();
+    for id in r.collect_memory_object(obj).unwrap().into_iter().flatten() {
+        let physical = r.releasable(id).unwrap();
+        allocator.free(physical).unwrap();
+        r.retire(id).unwrap();
+        assert!(allocator.free(physical).is_err());
+    }
+    assert_eq!(allocator.stats().allocated, 0);
+}
+
+#[test]
+fn memory_object_capacity_rejection_is_atomic() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    for i in 0..MAPPINGS {
+        let frame = r.memory_object_frame(obj, 0).unwrap();
+        r.mappings[i] = Mapping {
+            space: sa,
+            address: 0x1000000 + i as u64 * PAGE,
+            frame,
+            permissions: Permissions::R,
+            object: Some(obj),
+            live: true,
+        };
+    }
+    let before = m.pages.len();
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 1, 0x410000, 1, Permissions::R),
+        Err(Error::Capacity)
+    );
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(r.memory_object_counts(obj), Ok((1, MAPPINGS, 2)));
+}
+
+#[test]
+fn memory_object_repeated_reuse_and_pool_exhaustion() {
+    let mut r = Registry::new();
+    let mut frames = Vec::new();
+    for i in 0..=MEMORY_OBJECTS {
+        let f = r.insert(0x100000 + i as u64 * PAGE).unwrap();
+        r.initialize(f).unwrap();
+        frames.push(f);
+    }
+    let mut objects = Vec::new();
+    for f in &frames[..MEMORY_OBJECTS] {
+        objects.push(r.create_memory_object(&[*f]).unwrap());
+    }
+    assert_eq!(
+        r.create_memory_object(&frames[MEMORY_OBJECTS..]),
+        Err(Error::Capacity)
+    );
+    assert_eq!(
+        r.frame_owner(frames[MEMORY_OBJECTS]),
+        Ok(FrameOwner::Space(SpaceId::KERNEL))
+    );
+    for obj in objects {
+        r.release_memory_object(obj).unwrap();
+        r.collect_memory_object(obj).unwrap();
+    }
+    let mut stale = None;
+    for _ in 0..100 {
+        let id = r.create_memory_object(&frames[..1]).unwrap();
+        if let Some(old) = stale {
+            assert_eq!(r.memory_object_counts(old), Err(Error::NotOwned));
+        }
+        r.release_memory_object(id).unwrap();
+        r.collect_memory_object(id).unwrap();
+        stale = Some(id);
+    }
+}
+
+#[test]
+fn memory_object_mapping_prevents_space_retirement_until_detached() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::RW).unwrap();
+    assert_eq!(r.has_memory_object_mappings(sa), Ok(true));
+    assert_eq!(r.clear_root(sa, a.root), Err(Error::InUse));
+    unmap_memory_object(&a, &mut m, &mut r, sa, 0x410000).unwrap();
+    assert_eq!(r.has_memory_object_mappings(sa), Ok(false));
+    r.clear_root(sa, a.root).unwrap();
+    r.retire_space(sa).unwrap();
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::R),
+        Err(Error::NotOwned)
+    );
+}

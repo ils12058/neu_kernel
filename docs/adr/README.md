@@ -233,3 +233,9 @@ It does not change the ABI or fixed limits. The separate terminal-order alias is
 not claimed by this historical record. Subsequent work routed and checked the
 queued-waiter ordering; see [implementation status](../IMPLEMENTATION_STATUS.md)
 for the exact evidence and the still-unverified Ready ordering.
+
+## K8 / Phase 8A-1 proposal
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Proposed; partial implementation | NEU-018; NEU-005; NEU-024 |

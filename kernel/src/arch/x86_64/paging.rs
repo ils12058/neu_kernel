@@ -8,8 +8,8 @@ use core::{
     ptr,
 };
 use neu_kernel::paging::{
-    self as logic, ADDRESS_FIELD, Error, FrameId, PAGE, PageTree, Permissions, Registry, Result,
-    SpaceId, TEST_BASE, TableMemory, Translation,
+    self as logic, ADDRESS_FIELD, Error, FrameId, MEMORY_OBJECT_PAGES, MemoryObjectId, PAGE,
+    PageTree, Permissions, Registry, Result, SpaceId, TEST_BASE, TableMemory, Translation,
 };
 
 const WINDOW: u64 = 0xffff_9000_0000_0000;
@@ -624,6 +624,53 @@ impl<'a, 'm> Paging<'a, 'm> {
     pub fn allocate_frame(&mut self) -> Result<FrameId> {
         self.allocate_frame_for(SpaceId::KERNEL)
     }
+    /// Trusted setup only; no userspace API is exposed. Each frame is zeroed
+    /// before the registry can publish the object. On ordinary allocation or
+    /// adoption failure, every successfully allocated frame is returned.
+    #[allow(dead_code)] // Used by the paging test image; future trusted setup will use it.
+    pub fn create_memory_object(&mut self, pages: usize) -> Result<MemoryObjectId> {
+        if pages == 0 || pages > MEMORY_OBJECT_PAGES {
+            return Err(Error::Address);
+        }
+        let mut frames = [None; MEMORY_OBJECT_PAGES];
+        for index in 0..pages {
+            match self.allocate_frame() {
+                Ok(frame) => frames[index] = Some(frame),
+                Err(error) => {
+                    for frame in frames.into_iter().flatten() {
+                        self.free_frame(frame)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut backing = [frames[0].ok_or(Error::Corrupt)?; MEMORY_OBJECT_PAGES];
+        for index in 0..pages {
+            backing[index] = frames[index].ok_or(Error::Corrupt)?;
+        }
+        match self.registry.create_memory_object(&backing[..pages]) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                for frame in frames.into_iter().flatten() {
+                    self.free_frame(frame)?;
+                }
+                Err(error)
+            }
+        }
+    }
+    /// Collect only after creator release and mapping removal. Unexpected
+    /// allocator corruption is fatal to the caller, as in free_frame.
+    #[allow(dead_code)] // Paired with trusted MemoryObject setup.
+    pub fn collect_memory_object(&mut self, id: MemoryObjectId) -> Result<()> {
+        if current_root() != self.tree.root {
+            return Err(Error::InUse);
+        }
+        let frames = self.registry.collect_memory_object(id)?;
+        for frame in frames.into_iter().flatten() {
+            self.free_frame(frame)?;
+        }
+        Ok(())
+    }
     fn allocate_frame_for(&mut self, owner: SpaceId) -> Result<FrameId> {
         self.registry.can_allocate(owner)?;
         if current_root() != self.tree.root {
@@ -721,6 +768,23 @@ impl<'a, 'm> Paging<'a, 'm> {
     pub fn self_test(&mut self) -> Result<()> {
         let before = self.stats();
         let tables = self.table_count();
+        let object = self.create_memory_object(2)?;
+        let first = self.registry.memory_object_frame(object, 0)?;
+        let second = self.registry.memory_object_frame(object, 1)?;
+        if self.registry.physical(first)? == self.registry.physical(second)?
+            || self.stats().allocated != before.allocated + 2
+            || self.registry.memory_object_counts(object)? != (1, 0, 2)
+            || !self.with_frame(first, |bytes| bytes.iter().all(|byte| *byte == 0))?
+            || !self.with_frame(second, |bytes| bytes.iter().all(|byte| *byte == 0))?
+            || self.free_frame(first) != Err(Error::InUse)
+        {
+            return Err(Error::Corrupt);
+        }
+        self.registry.release_memory_object(object)?;
+        self.collect_memory_object(object)?;
+        if self.collect_memory_object(object) != Err(Error::NotOwned) || self.stats() != before {
+            return Err(Error::Corrupt);
+        }
         let a = self.allocate_frame()?;
         let physical = self.registry.physical(a)?;
         if !self.with_frame(a, |bytes| bytes.iter().all(|b| *b == 0))? {
@@ -1212,6 +1276,11 @@ impl Paging<'_, '_> {
             return Err(Error::InUse);
         }
         self.registry.can_destroy_space(space.id)?; // execution pins and object references
+        // This phase does not yet integrate shared-leaf teardown with the
+        // UserSpace table inventory. Refuse before changing any page tables.
+        if self.registry.has_memory_object_mappings(space.id)? {
+            return Err(Error::InUse);
+        }
         #[cfg(feature = "switch-test")]
         if space.stacks.iter().any(Option::is_some) {
             return Err(Error::InUse);

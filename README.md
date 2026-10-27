@@ -16,7 +16,7 @@ remain accounted. No ABI, architecture or fixed resource limits changed.
 
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) records the executed
 validation, including the 190-host/115-QEMU K6B baseline and the later K7 runs.
-Current results are **210 host tests and 132 QEMU scenarios**, including the
+Current results are **218 host tests and 132 QEMU scenarios**, including the
 terminal-order case, which also passed two independent clean-directory builds
 and QMP boots.
 [Experimental ABI 0.5](docs/abi/experimental-v0.5.md) adds nonblocking capability
@@ -26,7 +26,7 @@ contract; [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md)
 records lifecycle and fault-boundary hardening. A subsequent terminal-order
 scenario verifies a queued waiter across endpoint retirement and peer delivery;
 the Ready-before-admission ordering remains unverified in QEMU. Phase 8A shared
-MemoryObjects remain incomplete. Architecture v0.2 and earlier accepted ADR
+MemoryObjects remain incomplete; a partial registry and trusted mapping foundation is described in [proposed ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md). Architecture v0.2 and earlier accepted ADR
 rationale remain intact.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel

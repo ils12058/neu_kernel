@@ -431,13 +431,43 @@ pub struct FrameId {
     slot: usize,
     generation: u64,
 }
+/// Physical backing has exactly one owner; a mapping is never an owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOwner {
+    Space(SpaceId),
+    MemoryObject(MemoryObjectId),
+}
+
+pub const MEMORY_OBJECTS: usize = 4;
+pub const MEMORY_OBJECT_PAGES: usize = 2;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryObjectId {
+    slot: usize,
+    generation: u64,
+}
+#[derive(Clone, Copy)]
+struct MemoryObject {
+    generation: u64,
+    live: bool,
+    creator: bool,
+    frames: [Option<FrameId>; MEMORY_OBJECT_PAGES],
+    pages: usize,
+}
+/// Trusted internal setup authority. Its fields cannot be supplied by userspace;
+/// it never grants access to a different generation, space or stronger rights.
+pub struct MemoryMapAuthority {
+    object: MemoryObjectId,
+    space: SpaceId,
+    writable: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Frame {
     physical: u64,
     generation: u64,
     live: bool,
     initialized: bool,
-    owner: SpaceId,
+    owner: FrameOwner,
     stack_owner: Option<(crate::node::ThreadId, StackKind)>,
 }
 #[derive(Clone, Copy)]
@@ -446,6 +476,7 @@ pub struct Mapping {
     pub address: u64,
     pub frame: FrameId,
     pub permissions: Permissions,
+    pub object: Option<MemoryObjectId>,
     live: bool,
 }
 /// Completion receipt is minted only after this generation has no tagged
@@ -461,6 +492,7 @@ impl StackRelease {
 pub struct Registry {
     frames: [Frame; DATA_FRAMES],
     mappings: [Mapping; MAPPINGS],
+    objects: [MemoryObject; MEMORY_OBJECTS],
     spaces: [Space; USER_SPACES],
     active: Option<SpaceId>,
 }
@@ -477,7 +509,7 @@ impl Registry {
                 generation: 0,
                 live: false,
                 initialized: false,
-                owner: SpaceId::KERNEL,
+                owner: FrameOwner::Space(SpaceId::KERNEL),
                 stack_owner: None,
             }; DATA_FRAMES],
             mappings: [Mapping {
@@ -488,8 +520,16 @@ impl Registry {
                     generation: 0,
                 },
                 permissions: Permissions::R,
+                object: None,
                 live: false,
             }; MAPPINGS],
+            objects: [MemoryObject {
+                generation: 0,
+                live: false,
+                creator: false,
+                frames: [None; MEMORY_OBJECT_PAGES],
+                pages: 0,
+            }; MEMORY_OBJECTS],
             spaces: [Space {
                 generation: 0,
                 live: false,
@@ -643,7 +683,7 @@ impl Registry {
             generation,
             live: true,
             initialized: false,
-            owner: edit.active().context.space,
+            owner: FrameOwner::Space(edit.active().context.space),
             stack_owner: Some((edit.active().thread, kind)),
         };
         Ok(FrameId { slot, generation })
@@ -657,7 +697,7 @@ impl Registry {
         let a = edit.active();
         let f = self.frame(id)?;
         if edit.terminal()
-            || f.owner != a.context.space
+            || f.owner != FrameOwner::Space(a.context.space)
             || f.stack_owner.is_some()
             || self
                 .mappings
@@ -684,7 +724,11 @@ impl Registry {
         let f = self.frame(id)?;
         let a = edit.active();
         match f.stack_owner {
-            Some((owner, kind)) if owner == a.thread && f.owner == a.context.space => Ok(kind),
+            Some((owner, kind))
+                if owner == a.thread && f.owner == FrameOwner::Space(a.context.space) =>
+            {
+                Ok(kind)
+            }
             _ => Err(Error::NotOwned),
         }
     }
@@ -792,7 +836,10 @@ impl Registry {
             || self.space(id)?.object_refs != 0
             || self.space(id)?.pins != 0
             || self.active == Some(id)
-            || self.frames.iter().any(|f| f.live && f.owner == id)
+            || self
+                .frames
+                .iter()
+                .any(|f| f.live && f.owner == FrameOwner::Space(id))
             || self.mappings.iter().any(|m| m.live && m.space == id)
         {
             return Err(Error::InUse);
@@ -806,7 +853,10 @@ impl Registry {
             || self.space(id)?.object_refs != 0
             || self.space(id)?.pins != 0
             || self.spaces[id.slot].root != 0
-            || self.frames.iter().any(|f| f.live && f.owner == id)
+            || self
+                .frames
+                .iter()
+                .any(|f| f.live && f.owner == FrameOwner::Space(id))
             || self.mappings.iter().any(|m| m.live && m.space == id)
         {
             return Err(Error::InUse);
@@ -834,7 +884,7 @@ impl Registry {
             generation,
             live: true,
             initialized: false,
-            owner,
+            owner: FrameOwner::Space(owner),
             stack_owner: None,
         };
         Ok(FrameId { slot, generation })
@@ -845,14 +895,157 @@ impl Registry {
             .get(id.slot)
             .filter(|f| f.live && f.generation == id.generation)
             .ok_or(Error::NotOwned)?;
-        self.valid_space(frame.owner)?;
+        match frame.owner {
+            FrameOwner::Space(owner) => self.valid_space(owner)?,
+            FrameOwner::MemoryObject(id) => {
+                self.object(id)?;
+            }
+        }
         Ok(frame)
+    }
+    fn object(&self, id: MemoryObjectId) -> Result<&MemoryObject> {
+        self.objects
+            .get(id.slot)
+            .filter(|o| o.live && o.generation == id.generation)
+            .ok_or(Error::NotOwned)
+    }
+
+    /// Trusted kernel setup transfers exclusively owned, initialized kernel
+    /// frames to a new object. On failure no ownership changes. The caller
+    /// must allocate and zero these frames and free them if construction fails.
+    /// This method is not a userspace object factory or authorization boundary.
+    pub fn create_memory_object(&mut self, frames: &[FrameId]) -> Result<MemoryObjectId> {
+        self.can_allocate(SpaceId::KERNEL)?;
+        if frames.is_empty() || frames.len() > MEMORY_OBJECT_PAGES {
+            return Err(Error::Address);
+        }
+        let slot = self
+            .objects
+            .iter()
+            .position(|o| !o.live && o.generation != u64::MAX)
+            .ok_or(Error::Capacity)?;
+        for (i, id) in frames.iter().copied().enumerate() {
+            let frame = self.frame(id)?;
+            if frame.owner != FrameOwner::Space(SpaceId::KERNEL)
+                || frame.stack_owner.is_some()
+                || frames[..i].contains(&id)
+            {
+                return Err(Error::NotOwned);
+            }
+            if !frame.initialized {
+                return Err(Error::Uninitialized);
+            }
+            self.releasable(id)?;
+        }
+        let id = MemoryObjectId {
+            slot,
+            generation: self.objects[slot].generation + 1,
+        };
+        let mut backing = [None; MEMORY_OBJECT_PAGES];
+        for (i, frame) in frames.iter().copied().enumerate() {
+            backing[i] = Some(frame);
+        }
+        self.objects[slot] = MemoryObject {
+            generation: id.generation,
+            live: true,
+            creator: true,
+            frames: backing,
+            pages: frames.len(),
+        };
+        for frame in frames {
+            self.frames[frame.slot].owner = FrameOwner::MemoryObject(id);
+        }
+        Ok(id)
+    }
+
+    /// Trusted bootstrap only: the caller has already decided which object and
+    /// destination may be paired. This is not exposed across a syscall boundary.
+    pub fn authorize_memory_mapping(
+        &self,
+        id: MemoryObjectId,
+        space: SpaceId,
+        writable: bool,
+    ) -> Result<MemoryMapAuthority> {
+        if !self.object(id)?.creator {
+            return Err(Error::NotOwned);
+        }
+        self.space(space)?;
+        Ok(MemoryMapAuthority {
+            object: id,
+            space,
+            writable,
+        })
+    }
+    pub fn memory_object_counts(&self, id: MemoryObjectId) -> Result<(usize, usize, usize)> {
+        let object = self.object(id)?;
+        Ok((
+            usize::from(object.creator),
+            self.mappings
+                .iter()
+                .filter(|m| m.live && m.object == Some(id))
+                .count(),
+            object.pages,
+        ))
+    }
+    /// Teardown must detach every object mapping while its tree is still live.
+    pub fn has_memory_object_mappings(&self, space: SpaceId) -> Result<bool> {
+        self.space(space)?;
+        Ok(self
+            .mappings
+            .iter()
+            .any(|m| m.live && m.space == space && m.object.is_some()))
+    }
+    pub fn memory_object_frame(&self, id: MemoryObjectId, index: usize) -> Result<FrameId> {
+        self.object(id)?
+            .frames
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(Error::Address)
+    }
+    pub fn frame_owner(&self, id: FrameId) -> Result<FrameOwner> {
+        Ok(self.frame(id)?.owner)
+    }
+    pub fn release_memory_object(&mut self, id: MemoryObjectId) -> Result<()> {
+        if !self.object(id)?.creator {
+            return Err(Error::NotOwned);
+        }
+        self.objects[id.slot].creator = false;
+        Ok(())
+    }
+    /// Return backing to trusted kernel ownership, without freeing it. The
+    /// caller must free every returned frame exactly once before reuse. All
+    /// validation occurs before any ownership changes.
+    pub fn collect_memory_object(
+        &mut self,
+        id: MemoryObjectId,
+    ) -> Result<[Option<FrameId>; MEMORY_OBJECT_PAGES]> {
+        self.can_allocate(SpaceId::KERNEL)?;
+        let object = *self.object(id)?;
+        if object.creator || self.mappings.iter().any(|m| m.live && m.object == Some(id)) {
+            return Err(Error::InUse);
+        }
+        for frame in object.frames.iter().flatten() {
+            if self.frame(*frame)?.owner != FrameOwner::MemoryObject(id)
+                || self.mappings.iter().any(|m| m.live && m.frame == *frame)
+            {
+                return Err(Error::Corrupt);
+            }
+        }
+        for frame in object.frames.iter().flatten() {
+            self.frames[frame.slot].owner = FrameOwner::Space(SpaceId::KERNEL);
+        }
+        self.objects[id.slot].live = false;
+        Ok(object.frames)
     }
     pub fn physical(&self, id: FrameId) -> Result<u64> {
         Ok(self.frame(id)?.physical)
     }
     pub fn owner(&self, id: FrameId) -> Result<SpaceId> {
-        Ok(self.frame(id)?.owner)
+        match self.frame(id)?.owner {
+            FrameOwner::Space(owner) => Ok(owner),
+            FrameOwner::MemoryObject(_) => Err(Error::NotOwned),
+        }
     }
     pub fn initialize(&mut self, id: FrameId) -> Result<()> {
         self.frame(id)?;
@@ -873,8 +1066,12 @@ impl Registry {
     }
     pub fn releasable(&self, id: FrameId) -> Result<u64> {
         let frame = self.frame(id)?;
-        if self.active == Some(frame.owner)
-            || (frame.owner != SpaceId::KERNEL && self.space(frame.owner)?.pins != 0)
+        let owner = match frame.owner {
+            FrameOwner::Space(owner) => owner,
+            FrameOwner::MemoryObject(_) => return Err(Error::InUse),
+        };
+        if self.active == Some(owner)
+            || (owner != SpaceId::KERNEL && self.space(owner)?.pins != 0)
             || self.mappings.iter().any(|m| m.live && m.frame == id)
         {
             return Err(Error::InUse);
@@ -943,7 +1140,7 @@ impl Registry {
         }
         for (index, id) in frames.iter().copied().enumerate() {
             let frame = self.frame(id)?;
-            if frame.owner != target.space
+            if frame.owner != FrameOwner::Space(target.space)
                 || target.thread.is_some_and(|owner| {
                     frame.stack_owner
                         != Some((
@@ -1022,6 +1219,7 @@ impl Registry {
                 address: base + index as u64 * PAGE,
                 frame,
                 permissions,
+                object: None,
                 live: true,
             };
         }
@@ -1052,6 +1250,9 @@ impl Registry {
             .iter()
             .position(|m| m.live && m.space == space && m.address == address)
             .ok_or(Error::NotMapped)?;
+        if self.mappings[slot].object.is_some() {
+            return Err(Error::NotOwned);
+        }
         self.mappings[slot].live = false;
         Ok(self.mappings[slot].frame)
     }
@@ -1217,6 +1418,131 @@ fn map_frames_kind(
         }
     }
     registry.commit_kind(target, base, frames, permissions)
+}
+
+/// Map under a trusted, generation-checked object-and-space grant. Mapping
+/// records are published only after every leaf has been installed. In the
+/// supported single-CPU non-preemptible transaction nothing observes the
+/// intermediate leaves. The caller must use the inactive, unpinned root.
+#[allow(clippy::too_many_arguments)] // Explicit backend, authority and mapping bounds.
+pub fn map_memory_object(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    authority: &MemoryMapAuthority,
+    offset: usize,
+    base: u64,
+    pages: usize,
+    permissions: Permissions,
+) -> Result<()> {
+    let object = *registry.object(authority.object)?;
+    if !object.creator {
+        return Err(Error::NotOwned);
+    }
+    registry.can_allocate(authority.space)?;
+    if registry.root(authority.space)? != tree.root {
+        return Err(Error::NotOwned);
+    }
+    permissions.validate()?;
+    if permissions.execute || (permissions.write && !authority.writable) {
+        return Err(Error::Flags);
+    }
+    user_range(base, pages)?;
+    let end = offset.checked_add(pages).ok_or(Error::Address)?;
+    if end > object.pages {
+        return Err(Error::Address);
+    }
+    if registry.mappings.iter().filter(|m| !m.live).count() < pages {
+        return Err(Error::Capacity);
+    }
+    for i in 0..pages {
+        let id = object.frames[offset + i].ok_or(Error::Corrupt)?;
+        let frame = registry.frame(id)?;
+        if frame.owner != FrameOwner::MemoryObject(authority.object) {
+            return Err(Error::NotOwned);
+        }
+        if !frame.initialized {
+            return Err(Error::Uninitialized);
+        }
+        if registry
+            .mapping_for(authority.space, base + i as u64 * PAGE)
+            .is_ok()
+        {
+            return Err(Error::AlreadyMapped);
+        }
+        if registry
+            .mappings
+            .iter()
+            .any(|m| m.live && m.frame == id && m.permissions.execute)
+        {
+            return Err(Error::Wx);
+        }
+    }
+    for i in 0..pages {
+        let frame = object.frames[offset + i].ok_or(Error::Corrupt)?;
+        if let Err(error) = tree.map_user(
+            memory,
+            base + i as u64 * PAGE,
+            registry.physical(frame)?,
+            permissions,
+        ) {
+            for previous in (0..i).rev() {
+                tree.unmap(memory, base + previous as u64 * PAGE)?;
+            }
+            return Err(error);
+        }
+    }
+    for i in 0..pages {
+        let slot = registry
+            .mappings
+            .iter()
+            .position(|m| !m.live)
+            .ok_or(Error::Corrupt)?;
+        registry.mappings[slot] = Mapping {
+            space: authority.space,
+            address: base + i as u64 * PAGE,
+            frame: object.frames[offset + i].ok_or(Error::Corrupt)?,
+            permissions,
+            object: Some(authority.object),
+            live: true,
+        };
+    }
+    Ok(())
+}
+
+/// Remove exactly one recorded leaf after validating its tree and backing.
+pub fn unmap_memory_object(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    space: SpaceId,
+    address: u64,
+) -> Result<()> {
+    registry.can_allocate(space)?;
+    if registry.root(space)? != tree.root {
+        return Err(Error::NotOwned);
+    }
+    let record = registry.mapping_for(space, address)?;
+    let id = record.object.ok_or(Error::NotOwned)?;
+    if registry.frame(record.frame)?.owner != FrameOwner::MemoryObject(id) {
+        return Err(Error::Corrupt);
+    }
+    let actual = tree.translate(memory, address)?.ok_or(Error::NotMapped)?;
+    if actual.physical != registry.physical(record.frame)?
+        || actual.page_size != PAGE
+        || !actual.user
+        || actual.permissions != record.permissions
+    {
+        return Err(Error::Corrupt);
+    }
+    tree.unmap(memory, address)?;
+    let slot = registry
+        .mappings
+        .iter()
+        .position(|m| m.live && m.space == space && m.address == address && m.object == Some(id))
+        .ok_or(Error::Corrupt)?;
+    registry.mappings[slot].live = false;
+    Ok(())
 }
 
 #[cfg(test)]

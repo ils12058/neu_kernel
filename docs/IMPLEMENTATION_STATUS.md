@@ -1,6 +1,52 @@
 # Neu Kernel implementation status
 
-## K8 / Phase 8A — K7 terminal-order gate; MemoryObject work incomplete
+## K8 / Phase 8A-1 — partial MemoryObject foundation
+
+The paging registry now distinguishes private Space-owned frames from frames
+owned by a generation-checked, one- or two-page MemoryObject. Trusted setup can
+adopt initialized, distinct kernel frames, issue object/space-specific read-only
+or read-write grants, and map the same object into separate inactive registered
+roots. Per-page records retain object provenance and keep backing alive after the
+creator reference is released. Private mapping checks continue to reject foreign
+frames. Shared mapping preflight enforces bounded offsets, NX permissions,
+capacity, root identity, and overlap checks. Multi-page leaf installation rolls
+back earlier leaves on ordinary allocation failure. The caller must provide
+frames already zeroed and retains them if adoption fails. Collection returns
+unmapped, creator-released frames to kernel ownership for explicit freeing.
+
+The kernel paging self-test exercises object adoption using two actual allocator
+frames checked zero through the existing scratch mapping, then returns them to
+the existing free path. Host tests use production registry/page-tree methods,
+including the real physical allocator, with simulated table memory. **Phase
+8A-1 remains incomplete:** physical collection is not recoverable if an allocator invariant fails mid-free;
+`destroy_user` safely refuses a
+space with object mappings rather than removing them; no QMP witness validates
+object state or actual cross-space mappings. Object operation pins are not
+independently modeled; current transactions rely on exclusive borrows and the
+single-CPU execution boundary. Back-end errors during rollback/unmap are not
+proven recoverable. No public capability or ABI is added. See [proposed ADR
+0022](adr/0022-memoryobject-backing-and-lifetime.md).
+
+Validation on the modified tree: `make doctor`, `make check`, `make build` and
+`make test` passed. The full run passed **218 host tests and 132 QEMU scenarios**;
+all 210 baseline host tests and the K7 terminal-order case are included. Eight
+new focused MemoryObject tests passed twice separately, including capacity and
+100 identity-reuse cycles. Two independent source and Cargo target directories
+built and booted the existing `paging` case sequentially, reusing the pinned
+bootloader cache. The paging case checks the new actual allocator, zero and
+collection self-test in the guest and verifies the normal halt through QMP;
+QMP does not independently inspect the new object state. The clean boots are
+repeats, not additional scenarios. Evidence: `build/k8a1-doctor.log`,
+`k8a1-check-final.log`, `k8a1-build-final.log`, `k8a1-test.log`,
+`k8a1-repeat-{1,2}.log`, and `k8a1-clean-{a,b}.log`. No hardware or hosted CI
+run is claimed. The previously intermittent `user-kernel` case passed here;
+its earlier failure's cause remains unconfirmed.
+
+The destructor currently consumes its `UserSpace` argument even when it rejects
+shared mappings, so this guard is fail-closed but is not a retryable teardown
+protocol. A future implementation must retain the teardown token on failure.
+
+## K8 / Phase 8A — K7 terminal-order gate (historical baseline)
 
 The previously unrouted `test-cap-moves-terminal-order` feature now has a
 dedicated guest sequence and the `cap-moves-terminal-order` runner case. A1
@@ -38,7 +84,7 @@ discard is covered separately by the existing `cap-moves-discard` scenario;
 it is not a second terminal-wait ordering. ADR 0021 records the historical K7B
 validation boundary and is retained unchanged.
 
-Phase 8A is **incomplete**: no MemoryObject, authorized cross-Node mapping,
+At that baseline Phase 8A was **incomplete**: no MemoryObject, authorized cross-Node mapping,
 shared-frame lifetime or Ring 3 protection-fault demonstration is implemented.
 The existing `map_shared_probe` maps a Node's own data frame into a second VA
 in the same `SpaceId`; `Registry::prepare_kind` rejects frames owned by another
