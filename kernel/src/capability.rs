@@ -256,6 +256,10 @@ impl Objects {
     pub fn wait_stats(&self) -> crate::wait::Stats {
         self.waits.stats()
     }
+    #[cfg(feature = "test-cap-moves-terminal-order")]
+    pub fn debug_wait_addresses(&self) -> [u64; 3] {
+        self.waits.debug_addresses()
+    }
     pub fn node_wait_count(&self, node: NodeId) -> usize {
         self.waits.node_count(node)
     }

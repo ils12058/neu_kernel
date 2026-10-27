@@ -143,6 +143,7 @@ pub enum Kind {
     Receive,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum State {
     Waiting,
     Ready,
@@ -197,6 +198,16 @@ impl Default for Waits {
     }
 }
 impl Waits {
+    #[cfg(feature = "test-cap-moves-terminal-order")]
+    pub fn debug_addresses(&self) -> [u64; 3] {
+        self.slots.iter().flatten().next().map_or([0; 3], |w| {
+            [
+                core::ptr::from_ref(&w.token) as u64,
+                core::ptr::from_ref(&w.state) as u64,
+                core::ptr::from_ref(&w.pinned) as u64,
+            ]
+        })
+    }
     #[cfg(feature = "channel-wait-test")]
     fn witness(&self, event: u64, waiter: Option<Waiter>, result: i64) {
         witness::write(

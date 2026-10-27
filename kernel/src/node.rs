@@ -21,6 +21,13 @@ impl NodeId {
     }
 }
 impl ThreadId {
+    #[cfg(feature = "test-cap-moves-terminal-order")]
+    pub fn debug_addresses(&self) -> [u64; 2] {
+        [
+            core::ptr::from_ref(&self.slot) as u64,
+            core::ptr::from_ref(&self.generation) as u64,
+        ]
+    }
     pub fn index(self) -> usize {
         self.slot
     }

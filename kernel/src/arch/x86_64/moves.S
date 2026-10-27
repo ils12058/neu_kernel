@@ -51,6 +51,77 @@ neu_ipc_user_steps:
     inc qword ptr [r14*8+0x4021a0]
     jmp .Lmove_done
 .Lmove_start:
+    .if {move_mode} == 6
+    cmp r14,3
+    je .Lterminal_b
+    cmp r14,2
+    je .Lterminal_a2
+    cmp qword ptr [r15+56],1
+    jne .Lmove_done
+    mov rax,1
+    shl rax,37
+    test qword ptr [0x402150],rax
+    jz .Lmove_done
+    ipc_call 0x13,"qword ptr [0x402130]",11,0,0
+    ipc_call 0x17,"qword ptr [0x402130]","qword ptr [0x402128]",0,0
+    # FIFO is full: retain a wait pin while the peer consumes the scalar.
+    mov eax,0x15
+    mov rdi,[0x402130]
+    mov esi,33
+    call neu_ipc_invoke
+    cmp rax,-34
+    jne neu_multi_failed
+    mov edi,0x21
+    mov eax,2
+    call neu_multi_invoke
+    jmp neu_multi_failed
+.Lterminal_a2:
+    cmp qword ptr [r15+56],1
+    jne .Lterminal_a2_finish
+    # Leave exactly one A endpoint handle before the wait is registered.
+    ipc_call 0x11,"qword ptr [0x402138]",0,0,0
+    ipc_call 0x11,"qword ptr [0x402140]",0,0,0
+    ipc_call 0x11,"qword ptr [0x402148]",0,0,0
+    mov qword ptr [r15+56],2
+    jmp .Lmove_done
+.Lterminal_a2_finish:
+    mov rax,1
+    shl rax,35
+    test qword ptr [0x402150],rax
+    jz .Lmove_done
+    # A1 has been admitted already; close the last A endpoint reference.
+    ipc_call 0x11,"qword ptr [0x402130]",0,0,0
+    mov edi,0x22
+    mov eax,2
+    call neu_multi_invoke
+    jmp neu_multi_failed
+.Lterminal_b:
+    cmp qword ptr [r15+56],1
+    jne .Lterminal_b_receive
+    test qword ptr [0x402150],0x2000000
+    jz .Lmove_done
+    ipc_call 0x14,"qword ptr [0x402130]",0,0,11
+    mov qword ptr [r15+56],2
+    jmp .Lmove_done
+.Lterminal_b_receive:
+    mov rax,1
+    shl rax,36
+    test qword ptr [0x402150],rax
+    jz .Lmove_done
+    ipc_call 0x11,"qword ptr [0x402120]",0,0,0
+    mov eax,0x18
+    mov rdi,[0x402130]
+    call neu_ipc_invoke
+    test rax,rax
+    jne neu_multi_failed
+    mov [0x402158],rdx
+    ipc_call 0xfffffffffffffc00,"qword ptr [0x402158]",0,0,1
+    ipc_call 0x11,"qword ptr [0x402158]",0,0,0
+    mov edi,0x31
+    mov eax,2
+    call neu_multi_invoke
+    jmp neu_multi_failed
+    .endif
     cmp r14,3
     je .Lmove_b
     cmp r14,2

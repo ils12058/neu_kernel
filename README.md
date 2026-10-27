@@ -16,14 +16,17 @@ remain accounted. No ABI, architecture or fixed resource limits changed.
 
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) records the executed
 validation, including the 190-host/115-QEMU K6B baseline and the later K7 runs.
-Current results are **210 host tests and 131 QEMU scenarios**, six selected
-repeat runs and two independent clean-directory builds/QMP boots.
+Current results are **210 host tests and 132 QEMU scenarios**, including the
+terminal-order case, which also passed two independent clean-directory builds
+and QMP boots.
 [Experimental ABI 0.5](docs/abi/experimental-v0.5.md) adds nonblocking capability
 send/receive while retaining ABI 0.1–0.4 configurations.
 [ADR 0020](docs/adr/0020-atomic-capability-moves.md) records the transfer
 contract; [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md)
-records lifecycle and fault-boundary hardening. The terminal-order test alias
-remains explicitly unverified. Architecture v0.2 and earlier accepted ADR
+records lifecycle and fault-boundary hardening. A subsequent terminal-order
+scenario verifies a queued waiter across endpoint retirement and peer delivery;
+the Ready-before-admission ordering remains unverified in QEMU. Phase 8A shared
+MemoryObjects remain incomplete. Architecture v0.2 and earlier accepted ADR
 rationale remain intact.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel

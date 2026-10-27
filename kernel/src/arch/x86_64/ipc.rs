@@ -59,6 +59,24 @@ unsafe impl Sync for MoveWitness {}
 #[cfg(feature = "cap-move-test")]
 #[unsafe(no_mangle)]
 static neu_move_witness: MoveWitness = MoveWitness(UnsafeCell::new([0; 170]));
+#[cfg(feature = "test-cap-moves-terminal-order")]
+struct TerminalWitness(UnsafeCell<[u64; 10]>);
+// SAFETY: The controller publishes queue addresses before user entry and the
+// single CPU updates waiter addresses with IF=0. Only stopped-CPU QMP reads
+// the addresses, and only during the bounded syscall probe; no Rust code
+// dereferences the suspended controller's Queue through these addresses.
+#[cfg(feature = "test-cap-moves-terminal-order")]
+unsafe impl Sync for TerminalWitness {}
+#[cfg(feature = "test-cap-moves-terminal-order")]
+#[unsafe(no_mangle)]
+static neu_ipc_terminal_witness: TerminalWitness = TerminalWitness(UnsafeCell::new([0; 10]));
+#[cfg(feature = "test-cap-moves-terminal-order")]
+pub fn publish_queue_addresses(queue: &neu_kernel::scheduler::Queue) {
+    // SAFETY: Single CPU, IF=0, before entering the selected user Thread.
+    unsafe {
+        (&mut *neu_ipc_terminal_witness.0.get())[..7].copy_from_slice(&queue.debug_addresses())
+    };
+}
 static BUSY: AtomicBool = AtomicBool::new(false);
 struct Borrow;
 impl Drop for Borrow {
@@ -470,6 +488,24 @@ fn move_request(
         // backpressure fixture. Scalar waits remain the only blocking ABI.
         s.gates |= 1 << 25;
     }
+    #[cfg(feature = "test-cap-moves-terminal-order")]
+    if status == 0 {
+        if active.node == s.b.unwrap() && op == 0x14 && scalar == 11 {
+            s.gates |= 1 << 35;
+        }
+        if active.node == s.a.unwrap() && op == 0x11 && frame.registers.rdi as u32 == 8 {
+            s.gates |= 1 << 37;
+        }
+        if active.node == s.a.unwrap() && op == 0x11 && frame.registers.rdi as u32 == 5 {
+            s.gates |= 1 << 36;
+            // SAFETY: The same exclusive IF=0 registry transaction owns the
+            // waiter until the observation probe completes.
+            unsafe {
+                (&mut *neu_ipc_terminal_witness.0.get())[7..]
+                    .copy_from_slice(&objects.debug_wait_addresses())
+            };
+        }
+    }
     if op == v05::CHANNEL_SEND_CAP && status == 0 {
         s.gates |= 1 << 26;
         // Distinguish the two movable Flag grants used by the double-transfer
@@ -490,6 +526,8 @@ fn move_request(
         };
     }
     let bit = match (op, status) {
+        #[cfg(feature = "test-cap-moves-terminal-order")]
+        (0x11, 0) if active.node == s.a.unwrap() && frame.registers.rdi as u32 == 5 => Some(41),
         (1, 0) => Some(37),
         (0x17, 0) => Some(26),
         (0x17, -33) => Some(27),

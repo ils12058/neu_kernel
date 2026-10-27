@@ -1,5 +1,53 @@
 # Neu Kernel implementation status
 
+## K8 / Phase 8A — K7 terminal-order gate; MemoryObject work incomplete
+
+The previously unrouted `test-cap-moves-terminal-order` feature now has a
+dedicated guest sequence and the `cap-moves-terminal-order` runner case. A1
+queues a scalar and a movable Flag, then blocks on a full FIFO. B consumes the
+scalar, waking A1; the controller admits A1 to the runnable FIFO. A2 then closes
+the last A endpoint handle while that waiter is already `Queued`. Terminalization
+preserves the wait token and `Queued` state, releases its pin once, and A1
+settles once with `PeerClosed`. The committed Flag stays in B's FIFO; B receives
+and reads it, and final cleanup leaves no object references or pins. The
+independent checker reconciles every move, handle, queue and reference transition;
+at the close probe QMP reads the live scheduler FIFO and waiter token/state/pin,
+as well as actual table, FIFO and registry fields. It checks normal Thread exits,
+the existing saved-context/stack/root invariants and final controlled halt.
+
+Validation: `make doctor`, `make check` and `make build` passed. A full
+`make test` retry passed **210 host tests and 132 QEMU scenarios**, including
+the earlier movement and blocking-wait profiles. A focused terminal-order run
+and two fresh source/target directories independently built and QMP-booted the
+same case; their runs are repeats, not additional scenarios. The first full
+attempt passed 210 host tests and 19 scenarios, then failed its `user-kernel`
+QMP entry-state assertion while a clean build was also running. A standalone
+`user-kernel` retry and the subsequent full run passed without a concurrent
+QEMU run; the exact cause of the earlier assertion remains unconfirmed.
+Evidence is in `build/k8-doctor.log`, `k8-check-final.log`, `k8-build-final.log`,
+`k8-test-final.log`, `k8-user-kernel-retry.log`, `k8-test-retry.log`,
+`k8-clean-a.log`, `k8-clean-b.log` and per-case QMP results under
+`build/test-logs/`. The clean builds reused the pinned bootloader cache, but not
+the source checkout or Cargo target directory. No hardware or hosted CI run is
+claimed.
+
+This is one ordering: **queued waiter, then own endpoint retirement, then peer
+delivery**. Terminalizing a `Ready` waiter before scheduler admission alongside a
+queued move has not been independently demonstrated in QEMU. Receiver teardown
+discard is covered separately by the existing `cap-moves-discard` scenario;
+it is not a second terminal-wait ordering. ADR 0021 records the historical K7B
+validation boundary and is retained unchanged.
+
+Phase 8A is **incomplete**: no MemoryObject, authorized cross-Node mapping,
+shared-frame lifetime or Ring 3 protection-fault demonstration is implemented.
+The existing `map_shared_probe` maps a Node's own data frame into a second VA
+in the same `SpaceId`; `Registry::prepare_kind` rejects frames owned by another
+space. User teardown removes its mappings and frees its owned frames. Reusing
+that alias across Nodes without changing ownership, mapping references and
+teardown would risk premature reclamation. Architecture v0.2 and ABI 0.5 are
+unchanged; an ADR for MemoryObject sharing is deferred until a concrete design
+is implemented and its lifetime and rollback rules are established.
+
 ## K7 / Phase 7B — capability-transfer lifecycle hardening (2026-10-27)
 
 Phase 7B hardens the Phase 7A ABI 0.5 move-only transfer across sender/receiver

@@ -651,6 +651,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         {
             return Err(Error::Corrupt);
         }
+        #[cfg(feature = "test-cap-moves-terminal-order")]
+        super::ipc::publish_queue_addresses(&queue);
         let publication = preemptive::arm(active, binding, !queue.is_empty())?;
         let reject = cfg!(feature = "test-threads-return-stack")
             && index == 1

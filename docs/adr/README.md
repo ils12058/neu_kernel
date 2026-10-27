@@ -230,4 +230,6 @@ AddressSpace/endpoint transfer, derivation or revocation proposals.
 ADR 0021 hardens fault/commit boundaries, mixed scalar and capability FIFO
 ordering, blocking scalar wait settlement and exactly-once scheduler admission.
 It does not change the ABI or fixed limits. The separate terminal-order alias is
-not routed or QMP-validated and is not claimed by this record.
+not claimed by this historical record. Subsequent work routed and checked the
+queued-waiter ordering; see [implementation status](../IMPLEMENTATION_STATUS.md)
+for the exact evidence and the still-unverified Ready ordering.

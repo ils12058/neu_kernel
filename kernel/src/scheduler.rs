@@ -16,6 +16,17 @@ impl Default for Queue {
     }
 }
 impl Queue {
+    #[cfg(feature = "test-cap-moves-terminal-order")]
+    pub fn debug_addresses(&self) -> [u64; 7] {
+        let mut result = [0; 7];
+        result[0] = core::ptr::from_ref(&self.len) as u64;
+        for (index, id) in self.entries.iter().enumerate() {
+            if let Some(id) = id {
+                result[1 + index * 2..3 + index * 2].copy_from_slice(&id.debug_addresses());
+            }
+        }
+        result
+    }
     pub const fn new() -> Self {
         Self {
             entries: [None; MAX_THREADS],
