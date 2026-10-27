@@ -224,8 +224,6 @@ fn survivor(paging: &mut Paging<'_, '_>, model: &Nodes, node: &Bootstrap) -> Res
     Ok(())
 }
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
-    #[cfg(feature = "test-nodes")]
-    paging.shared_backing_self_test(native::payload())?;
     let case = if cfg!(feature = "test-nodes-a-fault") {
         1
     } else if cfg!(feature = "test-nodes-b-fault") {

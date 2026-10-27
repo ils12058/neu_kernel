@@ -234,8 +234,8 @@ not claimed by this historical record. Subsequent work routed and checked the
 queued-waiter ordering; see [implementation status](../IMPLEMENTATION_STATUS.md)
 for the exact evidence and the still-unverified Ready ordering.
 
-## K8 / Phase 8A-1 proposal
+## K8 / Phase 8A-1 record
 
 | ADR | Status | Related register entries |
 | --- | --- | --- |
-| [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Proposed; teardown and batch reclamation implemented, independent QMP evidence pending | NEU-018; NEU-005; NEU-024 |
+| [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Accepted for bounded Phase 8A-1; dynamic inventory and independent QMP verified | NEU-018; NEU-005; NEU-024 |

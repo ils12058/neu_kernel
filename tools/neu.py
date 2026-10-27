@@ -18,6 +18,8 @@ import tarfile
 import tempfile
 import time
 
+import memory_object_qmp
+
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
 TARGET = "x86_64-unknown-none"
@@ -45,6 +47,8 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "switch-cross": "test-switch-cross", "switch-stack-user": "test-switch-stack-user",
             "switch-stack-guard": "test-switch-stack-guard", "switch-invalid-context": "test-switch-invalid-context",
             "switch-rollback": "test-switch-rollback", "switch-stale": "test-switch-stale"}
+MEMORY_OBJECT_CASES = memory_object_qmp.CASES
+FEATURES.update({name: "test-" + name for name in MEMORY_OBJECT_CASES})
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
@@ -183,7 +187,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -202,7 +206,9 @@ def elf_info(path):
         prefix = "neu_native" if "neu_native_payload" in symbols else "neu_user"
         # Terminal pre-entry Phase 4C negatives have no reachable user fixture;
         # the linker removes those payload sections. Earlier image checks stay strict.
-        if symbols.get("neu_preempt_image")==1 and prefix+"_payload_end" not in symbols:
+        if "neu_memory_witness" in symbols and "neu_memory_checkpoint_wait" in symbols:
+            prefix = None  # Dedicated trusted kernel test has no Ring 3 payload.
+        elif symbols.get("neu_preempt_image")==1 and prefix+"_payload_end" not in symbols:
             prefix=None
         elif not 0 < symbols[prefix + "_payload_end"] - symbols[prefix + "_payload"] <= 4096:
             raise Failure("Invalid embedded user fixture bounds.")
@@ -375,6 +381,12 @@ EXPECT["paging"] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Paging self-tes
     "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
 EXPECT["paging-bootstrap-failure"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Paging bootstrap rollback verified:"],
     ["[NEU] Kernel paging activated:", "[NEU] Kernel bootstrap successful", "[NEU] BOOT FAILURE:", "[NEU] PANIC:", "[NEU] EXCEPTION:"])
+for name in MEMORY_OBJECT_CASES:
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Memory checkpoint: stage=1 ",
+        "[NEU] MemoryObject lifecycle complete:", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+EXPECT['memory-object-fail-stop'] = (COMMON + PROTOCOL + OWNED + PAGING +
+    ['[NEU] Memory checkpoint: stage=8 ', '[NEU] PANIC:', 'memory-object mapping rollback failed'],
+    ['MemoryObject lifecycle complete:', '[NEU] Kernel bootstrap successful', '[NEU] BOOT FAILURE:'])
 FAULTS = {"invalid-opcode": (6, 0, "neu_test_ud_site"), "general-protection": (13, 0x28, "neu_test_gp_site"),
           "page-fault": (14, 3, "neu_test_pf_site"), "double-fault": (8, 0, None), "breakpoint": (3, 0, "neu_test_bp_resume"),
           "unmapped": (14, 0, "neu_test_unmapped_site"), "readonly": (14, 3, "neu_test_readonly_site"), "nx": (14, 17, TEST_ADDRESS),
@@ -422,24 +434,37 @@ def user_ready(text, case):
 
 def observe_user(qmp, text_path, case, symbols, deadline):
     ready = user_ready(transcript(text_path), case)
+    wait_low = USER_CODE + symbols['neu_user_wait'] - symbols['neu_user_payload']
+    wait_high = USER_CODE + symbols['neu_user_wait_end'] - symbols['neu_user_payload']
     while time.monotonic() < deadline:
         registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
         if "CPL=3" in registers:
-            def reg(name):
-                match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
-                if not match:
-                    raise Failure("Missing user CPU register: " + name)
-                return int(match[1], 16)
-            length = symbols["neu_user_payload_end"] - symbols["neu_user_payload"]
-            if (reg("CR3") != ready["root"] or reg("CS") != 0x3b or reg("SS") != 0x33
-                    or reg("RSP") != USER_RSP or not USER_CODE <= reg("RIP") < USER_CODE + length
-                    or reg("RFL") & ((1 << 8) | (1 << 9) | (1 << 10) | (3 << 12) | (1 << 14) | (1 << 18))
-                    or reg("CR0") & 10 != 10 or reg("EFER") & 1 or "HLT=0" not in registers
-                    or not re.search(r"FS =0000 0000000000000000", registers)
-                    or not re.search(r"GS =0000 0000000000000000", registers)):
-                raise Failure("Actual QMP user CPU state violates the entry contract.")
-            ready["qmp_user_observation"] = registers
-            return ready
+            qmp.call("stop")
+            try:
+                registers = qmp.call("human-monitor-command", {"command-line": "info registers"})
+                if "CPL=3" not in registers:
+                    continue
+                def reg(name):
+                    match = re.search(r"\b" + name + r"\s*=([0-9a-fA-F]+)", registers)
+                    if not match:
+                        raise Failure("Missing user CPU register: " + name)
+                    return int(match[1], 16)
+                # Only the documented bounded observation interval has the
+                # initial stack shape; earlier payload instructions push/pop.
+                if not wait_low <= reg("RIP") < wait_high:
+                    continue
+                length = symbols["neu_user_payload_end"] - symbols["neu_user_payload"]
+                if (reg("CR3") != ready["root"] or reg("CS") != 0x3b or reg("SS") != 0x33
+                        or reg("RSP") != USER_RSP or not USER_CODE <= reg("RIP") < USER_CODE + length
+                        or reg("RFL") & ((1 << 8) | (1 << 9) | (1 << 10) | (3 << 12) | (1 << 14) | (1 << 18))
+                        or reg("CR0") & 10 != 10 or reg("EFER") & 1 or "HLT=0" not in registers
+                        or not re.search(r"FS =0000 0000000000000000", registers)
+                        or not re.search(r"GS =0000 0000000000000000", registers)):
+                    raise Failure("Actual QMP user CPU state violates the entry contract.\n" + registers)
+                ready["qmp_user_observation"] = registers
+                return ready
+            finally:
+                qmp.call("cont")
         if "User boundary:" in transcript(text_path):
             raise Failure("Guest completed without a direct QMP CPL=3 observation.")
         time.sleep(0.01)
@@ -2726,6 +2751,10 @@ def run_case(case, esp, timeout):
             try:
                 required, forbidden = EXPECT[case]
                 symbols = elf_info(temporary / "esp/boot/neu-kernel")["symbols"]
+                memory_observation = None
+                memory_snapshots = []
+                if case in MEMORY_OBJECT_CASES:
+                    result["memory_object_checkpoints"] = memory_snapshots
                 user_observation = None
                 native_observation = None
                 node_observations = {}
@@ -2742,6 +2771,11 @@ def run_case(case, esp, timeout):
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
                     if time.monotonic() - started >= timeout:
                         raise Failure(f"{case}: timed out after {timeout:g}s waiting for the expected serial result.")
+                    if case in MEMORY_OBJECT_CASES and memory_observation is None and "Memory checkpoint:" in transcript(serial):
+                        if qmp is None: qmp = QMP(endpoint, started + timeout)
+                        memory_observation = memory_object_qmp.observe(qmp, serial, symbols, started + timeout,
+                            debug_words, native_register, Failure, memory_snapshots, MEMORY_OBJECT_CASES.index(case))
+                        result["memory_object"] = memory_observation
                     if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
@@ -2829,6 +2863,8 @@ def run_case(case, esp, timeout):
                     cursor = position + len(marker)
                 if any(marker in text for marker in forbidden):
                     raise Failure(f"Unexpected panic/failure/success marker in {case} transcript.")
+                if case in MEMORY_OBJECT_CASES and memory_observation is None:
+                    raise Failure("Missing independent MemoryObject checkpoints.")
                 fault = check_fault(case, text, symbols)
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
@@ -2862,6 +2898,8 @@ def run_case(case, esp, timeout):
                         if row!=[0,0]:raise Failure('Actual object reference/pin survived final move cleanup.')
                         final.append(row)
                     cap_state['final_move_accounting']=final
+                if case == 'memory-object-fail-stop':
+                    result['expected_fail_stop'] = memory_object_qmp.verify_fail_stop(qmp, memory_snapshots[-1], debug_words, Failure)
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")

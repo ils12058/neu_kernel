@@ -175,6 +175,19 @@ pub struct FrameAllocator<'a> {
 }
 
 impl<'a> FrameAllocator<'a> {
+    #[cfg(feature = "memory-object-test")]
+    pub fn diagnostic_layout(&self) -> [u64; 8] {
+        [
+            core::ptr::addr_of!(self.total) as u64,
+            core::ptr::addr_of!(self.free) as u64,
+            self.allocated.as_ptr() as u64,
+            self.allocated.len() as u64,
+            self.map.regions.as_ptr() as u64,
+            self.map.regions.len() as u64,
+            core::ptr::addr_of!(self.map.kernel.start) as u64,
+            core::ptr::addr_of!(self.map.kernel.end) as u64,
+        ]
+    }
     pub fn new(map: &'a MemoryMap<'a>, bitmap: &'a mut [u64]) -> Result<Self, FrameError> {
         let total = map.allocatable_frames();
         if bitmap

@@ -11,6 +11,7 @@ struct Model {
     invalidated: Vec<u64>,
     released: usize,
     fail_clear: bool,
+    reject_leaf_index: Option<usize>,
 }
 impl Model {
     fn new() -> Self {
@@ -24,6 +25,7 @@ impl Model {
             invalidated: Vec::new(),
             released: 0,
             fail_clear: false,
+            reject_leaf_index: None,
         }
     }
 }
@@ -79,6 +81,10 @@ impl TableMemory for Model {
             .ok_or(Error::NotOwned)
     }
     fn write(&mut self, table: u64, index: usize, value: u64) -> Result<()> {
+        if value & 1 != 0 && self.owned(table, 1) && self.reject_leaf_index == Some(index) {
+            self.reject_leaf_index = None;
+            return Err(Error::Exhausted);
+        }
         if value == 0 && self.fail_clear {
             return Err(Error::Corrupt);
         }
@@ -1655,7 +1661,7 @@ fn memory_object_capacity_rejection_is_atomic() {
             address: 0x1000000 + i as u64 * PAGE,
             frame,
             permissions: Permissions::R,
-            object: Some(obj),
+            object: MappingObject::Shared(obj),
             live: true,
         };
     }
@@ -1802,4 +1808,137 @@ fn memory_object_rollback_backend_failure_is_fail_stop() {
     // The exposed host model is deliberately poisoned, not reusable. No
     // mapping metadata was published before the fail-stop.
     assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
+}
+
+#[test]
+fn memory_object_table_requirement_deduplicates_intermediate_paths() {
+    let mut m = Model::new();
+    let tree = PageTree::new(&mut m, 48).unwrap();
+    assert_eq!(tree.required_user_tables(&m, 0x410000, 2), Ok(3));
+    assert_eq!(tree.required_user_tables(&m, 0x5ff000, 2), Ok(4));
+    tree.map_user(&mut m, 0x410000, 0x100000, Permissions::RW)
+        .unwrap();
+    let before = m.pages.len();
+    assert_eq!(tree.required_user_tables(&m, 0x420000, 2), Ok(0));
+    assert_eq!(tree.required_user_tables(&m, 0x600000, 2), Ok(1));
+    assert_eq!(tree.required_user_tables(&m, 0x5ff000, 2), Ok(1));
+    assert_eq!(m.pages.len(), before);
+    assert!(tree.required_user_tables(&m, 0x800000, 1).is_err());
+}
+
+#[test]
+fn memory_object_new_region_failure_and_final_unmap_conserve_tables() {
+    let (mut r, mut m, a, _, sa, _, frames, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    // Populate the original user leaf table with an unrelated private page.
+    let private = r.insert_for(sa, 0x102000).unwrap();
+    r.initialize(private).unwrap();
+    map_user_frames_for(
+        &a,
+        &mut m,
+        &mut r,
+        sa,
+        0x410000,
+        &[private],
+        Permissions::RW,
+    )
+    .unwrap();
+    let before = m.pages.len();
+    m.budget = Some(0);
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x600000, 2, Permissions::RW),
+        Err(Error::Exhausted)
+    );
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
+    m.budget = None;
+    map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x600000, 2, Permissions::RW).unwrap();
+    assert_eq!(m.pages.len(), before + 1);
+    assert_eq!(
+        a.translate(&m, 0x600000).unwrap().unwrap().physical,
+        r.physical(frames[0]).unwrap()
+    );
+    unmap_memory_object(&a, &mut m, &mut r, sa, 0x600000).unwrap();
+    assert_eq!(m.pages.len(), before + 1);
+    unmap_memory_object(&a, &mut m, &mut r, sa, 0x601000).unwrap();
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(r.mapping_for(sa, 0x410000).unwrap().frame, private);
+}
+
+#[test]
+fn memory_object_stale_grant_cannot_map_a_recycled_object() {
+    let (mut r, mut m, a, _, sa, _, frames, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    r.release_memory_object(obj).unwrap();
+    r.collect_memory_object(obj).unwrap();
+    let next = r.create_memory_object(&frames).unwrap();
+    assert_ne!(obj, next);
+    let before = m.pages.len();
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x600000, 2, Permissions::RW),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(r.memory_object_counts(next), Ok((1, 0, 2)));
+}
+
+#[test]
+fn memory_object_wrong_provenance_rejects_unmap_before_leaf_mutation() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x600000, 1, Permissions::RW).unwrap();
+    let record = r
+        .mappings
+        .iter_mut()
+        .find(|m| m.live && m.address == 0x600000)
+        .unwrap();
+    record.object = MappingObject::Shared(MemoryObjectId {
+        slot: obj.slot,
+        generation: obj.generation + 1,
+    });
+    assert_eq!(
+        unmap_memory_object(&a, &mut m, &mut r, sa, 0x600000),
+        Err(Error::Corrupt)
+    );
+    assert!(a.translate(&m, 0x600000).unwrap().is_some());
+}
+
+#[test]
+fn memory_object_second_leaf_write_failure_releases_new_table() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let private = r.insert_for(sa, 0x102000).unwrap();
+    r.initialize(private).unwrap();
+    map_user_frames_for(
+        &a,
+        &mut m,
+        &mut r,
+        sa,
+        0x410000,
+        &[private],
+        Permissions::RW,
+    )
+    .unwrap();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    let before = m.pages.len();
+    m.reject_leaf_index = Some(1);
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x600000, 2, Permissions::RW),
+        Err(Error::Exhausted)
+    );
+    assert!(m.reject_leaf_index.is_none());
+    assert_eq!(m.pages.len(), before);
+    assert_eq!(a.translate(&m, 0x600000), Ok(None));
+    assert_eq!(a.translate(&m, 0x601000), Ok(None));
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
+}
+
+#[test]
+fn memory_object_exhausted_generation_is_retired_permanently() {
+    let (mut r, _, _, _, _, _, frames, object) = object_fixture();
+    r.release_memory_object(object).unwrap();
+    r.collect_memory_object(object).unwrap();
+    r.objects[object.slot].generation = u64::MAX;
+    let next = r.create_memory_object(&frames).unwrap();
+    assert_ne!(next.slot, object.slot);
+    assert_eq!(r.memory_object_counts(object), Err(Error::NotOwned));
 }

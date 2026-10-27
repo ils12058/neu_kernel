@@ -1,6 +1,83 @@
 # Neu Kernel implementation status
 
-## K8 / Phase 8A-1 completion work — still partial
+## K8 / Phase 8A-1 — complete for bounded trusted bootstrap (2026-10-28)
+
+Baseline was clean `7b3ecf5b8ed59f99c0a6a516321332adffc20afd`. The two remaining
+foundation gaps are closed: trusted shared mapping now owns newly allocated
+user tables correctly, and dedicated QMP profiles inspect production memory and
+physical page tables independently. [ADR 0022](adr/0022-memoryobject-backing-and-lifetime.md)
+is accepted only for this bounded, single-CPU Phase 8A-1 scope. Architecture v0.2,
+ABI 0.5 and historical ADR reasoning are preserved.
+
+`Paging::map_memory_backing` verifies the exact root and grant, inactive/unpinned
+state, reserved fixture range, missing table paths and bounded capacity. The
+existing 16 data-frame, 64 table and 64 mapping pools are unchanged. Once the
+leaf/ledger transaction commits, each new table enters the correct UserSpace
+inventory with a supervisor RW/NX alias in that root. Normal unmap prunes empty
+owned tables and both their user-root and common-workspace aliases before
+release. Whole-root teardown preflights the prepared inventory and then detaches
+shared leaves, retires their references and releases private resources. Either
+space can be destroyed first while the survivor retains the two backing pages.
+Unexpected post-commit or rollback cleanup failures remain fail-stop.
+
+The new profiles are `memory-object-lifetime`, `memory-object-lifetime-reverse`,
+`memory-object-new-tables`, `memory-object-new-tables-reverse`,
+`memory-object-map-rollback`, and `memory-object-fail-stop`. The older expanded
+Node fixture has moved into these focused images. The last case is an expected
+terminal-corruption test, not successful rollback. The others complete both
+mapping lifetime and final physical collection.
+
+QMP stops the CPU before reading addresses/layouts in a bounded diagnostic
+header. It scans the actual object, frame, space and mapping arrays, allocator
+bitmap and table pool; walks actual physical PTEs; verifies effective permissions,
+all root inventories/workspace aliases and every user leaf against the ledger;
+then checks the exact surviving root and final collection. No guest-calculated
+permission or reference count is trusted. See [the protocol and commands](testing/memory-object-qmp.md).
+
+One recorded new-table run has roots `0xe000` and `0x1c000`, both mapping physical
+pages `0x8000` and `0x9000` at VA `0x600000`. First-page leaf PTEs are
+`0x8000000000008007` (A, user RW/NX) and `0x8000000000008005` (B, user R/NX), with
+effective permissions checked through all four levels. Shared records decrease
+4 → 2 → 0. Allocated frames decrease 39 → 24 → 9 → 7 as the roots and object
+are retired; 7 is the exact baseline table allocation. The final bitmap equals
+the initial bitmap. Reuse then produces object/frame generation 2, physically
+zeroed backing, and another exact return to baseline. These are observations
+from this profile, not universal platform constants.
+
+Validation passed: `make doctor`, `make check`, `make build`, and `make test`.
+The final full suite passed **228 host tests and 138 unique QEMU scenarios**:
+all 222 host/132 QEMU baseline tests plus six new host tests and six new QEMU
+cases (including one expected fail-stop). The focused MemoryObject host group
+passed again with **17 tests**. Focused QMP cases and selected repeats passed.
+Two independent clean source/target directories passed QMP boots of the new-table
+reverse and map-rollback profiles sequentially, sharing only the pinned bootloader
+cache. They are repeats, not additional unique scenarios. No hardware or hosted
+CI validation is claimed.
+
+Evidence: `build/k8-final-{doctor,check,build,test}.log`,
+`k8-final-check-confirm.log`, `k8-final-build-confirm.log`,
+`k8-final-host-repeat.log`, per-case JSON in `build/test-logs/`,
+`build/k8-final-evidence-summary.json`, and `k8-final-clean-{a,b}.{log,json}`.
+The first full attempt rejected an expired running RIP hint in the new observer;
+the checker now retries hints and still requires every stopped checkpoint.
+A later attempt failed legacy `user-unmapped` entry observation. The legacy
+observer now stops/rechecks the CPU inside its existing bounded wait instead of
+sampling running payload push/pop instructions. Its assertions, iteration bound
+and timeout are preserved. All eight legacy profiles, three additional
+`user-unmapped` repeats and the final full suite passed. The exact earlier
+failure trigger, including the historical `user-kernel` issue, remains
+unconfirmed; concurrency is not asserted as its cause. Rejected evidence is
+retained in `k8-final-test-{first,second}-attempt.log` and
+`k8-final-user-unmapped-rejected.json`.
+
+This completes backing and mapping lifetime foundation under trusted setup.
+Public MemoryObject syscalls, capability transfer, active-root mutation, SMP,
+Ring 3 shared-memory reads/writes and hardware read-only faults remain outside
+this scope. Phase 8A-2 should attach these mappings before Thread execution pins,
+then prove live Ring 3 access, hardware permission faults and Node fault/exit
+cleanup with the existing three-Thread scheduler.
+
+## K8 / Phase 8A-1 completion work — historical partial state
 
 `UserSpace` teardown now borrows its owning token, preserving it on preflight
 rejection and marking it unusable once destructive teardown starts. Node

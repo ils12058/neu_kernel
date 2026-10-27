@@ -153,6 +153,8 @@ neu_user_payload:
 neu_user_wait:
     dec ecx
     jne neu_user_wait
+.global neu_user_wait_end
+neu_user_wait_end:
     movabs rsi, 0x401000
     mov edx, [rsi + 8]
     cmp edx, 0

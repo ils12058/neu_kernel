@@ -1,7 +1,7 @@
 # ADR 0022: MemoryObject backing and lifetime foundation
 
 - Date: 2026-10-27
-- Status: Proposed (partial implementation)
+- Status: Accepted for the bounded Phase 8A-1 scope (2026-10-28)
 - Related decisions: NEU-018, NEU-005 and NEU-024
 - Architecture: [memory and object lifetimes](../Neu_Kernel_Architecture_v0.2.md#15-memory-architecture)
 
@@ -13,7 +13,7 @@ that space eventually frees its frames. Two address spaces need backing whose
 ownership and lifetime are independent of either address space. Removing the
 private owner check would allow foreign private frames to be mapped.
 
-## Decision
+## Initial decision (2026-10-27)
 
 The proposed foundation uses a bounded, generation-checked MemoryObject identity
 and distinguishes its frame ownership from private `SpaceId` ownership. Each
@@ -54,7 +54,7 @@ tracked asynchronous operation pin in this slice.
 - Implement a public capability and mapping ABI now: expands the security and
   execution boundary before allocation, teardown and rollback are complete.
 
-## Consequences
+## Initial consequences (2026-10-27)
 
 Host tests exercise real registry and page-tree transactions with a simulated
 table backend. The existing kernel paging self-test adopts frames allocated and
@@ -65,7 +65,7 @@ consumed input is not returned on failure, so this is not a retryable teardown. 
 corruption during physical frees, and actual user-space mapping teardown is not
 yet integrated. QMP has not independently inspected MemoryObject state,
 and no Ring 3 cross-Node shared-memory or hardware permission claim is made.
-These were the original gaps. The 2026-10-28 update below supersedes these implementation details; the decision remains proposed pending its independent QMP evidence and remaining integration. ABI 0.5 and architecture v0.2 remain unchanged.
+These were the original gaps. The 2026-10-28 update below supersedes these implementation details; the final acceptance below records the verified scope after independent evidence and integration. ABI 0.5 and architecture v0.2 remain unchanged.
 
 ## History
 
@@ -73,7 +73,7 @@ These were the original gaps. The 2026-10-28 update below supersedes these imple
   independent runtime evidence remain outstanding.
 
 
-## 2026-10-28: Teardown and batch-reclamation update
+## 2026-10-28: Teardown and batch-reclamation update (historical partial state)
 
 A borrowed, non-copyable `UserSpace` token now remains with its owner when
 preflight rejects a wrong root, active or pinned space, outstanding AddressSpace
@@ -109,3 +109,46 @@ allocator counts. The host independently tests page-tree transactions and
 failure injection. The existing Node QMP checks still do **not** independently
 inspect this fixture's object fields or cross-root PTEs. This remains a partial
 implementation, not proof of Ring 3 access or hardware-enforced sharing.
+
+## 2026-10-28: Dynamic inventory and independent evidence decision
+
+Trusted shared mapping now goes through `Paging::map_memory_backing`, which
+preflights distinct missing table paths, physical capacity, the 64-slot workspace,
+root identity and reserved fixture addresses. The generic MemoryObject mapping
+transaction remains responsible for leaves, metadata and rollback. On commit,
+every newly allocated table enters the correct token inventory and receives a
+supervisor RW/NX workspace alias only in that root. Unexpected failure after
+publication is fail-stop. Ordinary unmap removes empty owned table parents and
+aliases before releasing the table; whole-root teardown verifies the prepared
+inventory before destruction. The fixed table and frame pools are unchanged.
+
+A separate trusted test-image family replaces the earlier expansion of the
+`nodes` profile. QMP reads actual production registry layouts, physical tables,
+allocator counters and bitmap while the sole CPU is stopped in a bounded probe.
+It independently reconciles references and frame/table ownership, checks effective
+permissions and each workspace alias, observes both destruction orders, and
+verifies generation reuse and physical zeroing. A deliberate corruption profile
+also checks the real panic halt and the poisoned partial leaf; it is not reported
+as successful rollback. [The evidence protocol](../testing/memory-object-qmp.md)
+documents the schema, checkpoints, scope and commands.
+
+These decisions cover bounded trusted bootstrap mapping and lifetime management.
+Public MemoryObject construction, mapping ABI, transfer, derivation, revocation,
+SMP and actual Ring 3 shared-memory access remain deferred.
+
+
+## Scoped acceptance (2026-10-28)
+
+Accepted after 228 host tests, 138 unique QEMU scenarios and two independent
+clean-directory QMP builds/boots passed. Six added scenarios include one expected
+fail-stop, whose poisoned state is not treated as successful rollback. Raw
+production snapshots independently verify both roots and destruction orders,
+dynamic table/alias ownership, exact final allocator bitmap, and generation reuse.
+The [implementation status](../IMPLEMENTATION_STATUS.md) records exact results,
+rejected observer attempts and the still-unconfirmed historical intermittent
+entry-observation trigger. This accepts the bounded trusted bootstrap foundation;
+it does not accept a public MemoryObject ABI or claim live Ring 3 sharing.
+
+- 2026-10-28: Finalized dynamic table inventory, normal unmap, independent QMP
+  oracle and scoped acceptance after validation. Earlier rationale and partial
+  milestones are retained above as history.

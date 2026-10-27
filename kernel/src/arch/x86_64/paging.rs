@@ -180,6 +180,8 @@ struct Memory<'a, 'm> {
     root: u64,
     active: bool,
     budget: Option<usize>,
+    #[cfg(feature = "memory-object-test")]
+    reject_leaf_index: Option<usize>,
 }
 impl Memory<'_, '_> {
     fn slot(&self, physical: u64) -> Result<usize> {
@@ -418,6 +420,11 @@ impl TableMemory for Memory<'_, '_> {
         if index >= 512 {
             return Err(Error::Address);
         }
+        #[cfg(feature = "memory-object-test")]
+        if value & 1 != 0 && self.owned(table, 1) && self.reject_leaf_index == Some(index) {
+            self.reject_leaf_index = None;
+            return Err(Error::Exhausted);
+        }
         // SAFETY: Exclusive mutable BSP operation on an owned table alias.
         unsafe {
             ptr::write_volatile(self.pointer(table)?.add(index), value);
@@ -464,6 +471,8 @@ impl<'a, 'm> Paging<'a, 'm> {
         }
         let before = frames.stats();
         let mut memory = Memory {
+            #[cfg(feature = "memory-object-test")]
+            reject_leaf_index: None,
             frames,
             boot: BootAccess {
                 root: current_root(),
@@ -953,6 +962,7 @@ pub struct UserSpace {
     pub root: u64,
     id: SpaceId,
     teardown: UserTeardown,
+    prepared: bool,
     tables: [bool; TABLES],
     frames: [Option<FrameId>; 4],
     private: Option<FrameId>,
@@ -968,6 +978,7 @@ pub struct UserSpace {
 }
 #[cfg(feature = "user-test")]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum UserTeardown {
     Live,
     Started,
@@ -983,137 +994,164 @@ impl UserSpace {
 
 #[cfg(feature = "user-test")]
 impl Paging<'_, '_> {
-    /// Real allocator and page-tree exercise under the existing Node test
-    /// image. QMP currently checks only the surrounding Node test; this is not
-    /// independent inspection of this fixture's object state.
-    #[cfg(feature = "test-nodes")]
-    pub fn shared_backing_self_test(&mut self, bytes: &[u8]) -> Result<()> {
+    /// Trusted mapping integration: install new user tables in the owning
+    /// token and publish only that root's supervisor workspace aliases.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn map_memory_backing(
+        &mut self,
+        space: &mut UserSpace,
+        grant: &logic::MemoryMapAuthority,
+        offset: usize,
+        base: u64,
+        pages: usize,
+        permissions: Permissions,
+    ) -> Result<()> {
+        if space.teardown != UserTeardown::Live || !space.prepared {
+            return Err(Error::NotOwned);
+        }
+        self.registry.can_allocate(space.id)?;
+        self.verify_user(space)?;
+        // The low 64 KiB is reserved for the embedded image and Thread guards.
+        logic::user_range(base, pages)?;
+        if base < logic::USER_BASE + 0x10000 {
+            return Err(Error::Address);
+        }
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        let needed = tree.required_user_tables(&self.memory, base, pages)?;
+        if needed
+            > self
+                .memory
+                .tables
+                .iter()
+                .filter(|t| t.physical == 0)
+                .count()
+            || needed > self.stats().free
+        {
+            return Err(Error::Exhausted);
+        }
+        let old = self.memory.tables.map(|t| t.physical);
         let before = self.stats();
-        let before_tables = self.table_count();
-        for reverse in [false, true] {
-            let mut a = self.prepare_domain(bytes, 0, 35, None, None)?;
-            let mut b = self.prepare_domain(bytes, 0, 77, None, None)?;
-            if a.root == b.root || a.id == b.id {
-                return Err(Error::Corrupt);
-            }
-            let object = self.create_memory_object(2)?;
-            let first = self.registry.memory_object_frame(object, 0)?;
-            let second = self.registry.memory_object_frame(object, 1)?;
-            for id in [first, second] {
-                if !self.with_frame(id, |data| data.iter().all(|byte| *byte == 0))? {
-                    return Err(Error::Corrupt);
-                }
-            }
-            let ga = self.registry.authorize_memory_mapping(object, a.id, true)?;
-            let gb = self
-                .registry
-                .authorize_memory_mapping(object, b.id, false)?;
-            let ta = PageTree {
-                root: a.root,
-                bits: self.tree.bits,
-            };
-            let tb = PageTree {
-                root: b.root,
-                bits: self.tree.bits,
-            };
-            // Both VAs are in the already-owned user leaf table. This avoids
-            // changing either UserSpace's private workspace/table inventory.
-            let tables = self.table_count();
-            logic::map_memory_object(
-                &ta,
-                &mut self.memory,
-                &mut self.registry,
-                &ga,
-                0,
-                0x410000,
-                2,
-                Permissions::RW,
-            )?;
-            logic::map_memory_object(
-                &tb,
-                &mut self.memory,
-                &mut self.registry,
-                &gb,
-                0,
-                0x420000,
-                2,
-                Permissions::R,
-            )?;
-            if self.table_count() != tables {
-                return Err(Error::Corrupt);
-            }
-            for i in 0..2 {
-                let aa = ta
-                    .translate(&self.memory, 0x410000 + i * PAGE)?
-                    .ok_or(Error::NotMapped)?;
-                let bb = tb
-                    .translate(&self.memory, 0x420000 + i * PAGE)?
-                    .ok_or(Error::NotMapped)?;
-                if aa.physical != bb.physical
-                    || aa.permissions != Permissions::RW
-                    || bb.permissions != Permissions::R
-                    || !aa.user
-                    || !bb.user
-                {
-                    return Err(Error::Corrupt);
-                }
-            }
-            self.registry.release_memory_object(object)?;
-            if self.registry.memory_object_counts(object)? != (0, 4, 2)
-                || self.collect_memory_object(object) != Err(Error::InUse)
-            {
-                return Err(Error::Corrupt);
-            }
-            let (first_space, second_space, second_tree, second_va) = if reverse {
-                (&mut b, &mut a, &ta, 0x410000)
-            } else {
-                (&mut a, &mut b, &tb, 0x420000)
-            };
-            let original_root = first_space.root;
-            first_space.root = second_space.root;
-            if self.destroy_user(first_space) != Err(Error::InUse) {
-                return Err(Error::Corrupt);
-            }
-            first_space.root = original_root;
-            self.registry.activate_space(first_space.id)?;
-            if self.destroy_user(first_space) != Err(Error::InUse) {
-                return Err(Error::Corrupt);
-            }
-            self.registry.deactivate_space(first_space.id)?;
-            let root_ref = self.registry.retain_space(first_space.id)?;
-            if self.destroy_user(first_space) != Err(Error::InUse) {
-                return Err(Error::Corrupt);
-            }
-            self.registry
-                .release_space_ref(root_ref)
-                .map_err(|_| Error::Corrupt)?;
-            self.registry.pin_space(first_space.id)?;
-            if self.destroy_user(first_space) != Err(Error::InUse) {
-                return Err(Error::Corrupt);
-            }
-            self.registry.unpin_space(first_space.id)?;
-            self.destroy_user(first_space)?;
-            if self.destroy_user(first_space) != Err(Error::NotOwned) {
-                return Err(Error::Corrupt);
-            }
-            if self.registry.memory_object_counts(object)? != (0, 2, 2)
-                || second_tree.translate(&self.memory, second_va)?.is_none()
-                || self.collect_memory_object(object) != Err(Error::InUse)
-            {
-                return Err(Error::Corrupt);
-            }
-            self.destroy_user(second_space)?;
-            if self.registry.memory_object_counts(object)? != (0, 0, 2) {
-                return Err(Error::Corrupt);
-            }
-            self.collect_memory_object(object)?;
-            if self.collect_memory_object(object) != Err(Error::NotOwned)
-                || self.stats() != before
-                || self.table_count() != before_tables
-            {
-                return Err(Error::Corrupt);
+        let mut control = tree.root;
+        for index in &logic::indices(WINDOW)?[..3] {
+            control = self.memory.read(control, *index)? & ADDRESS_FIELD;
+        }
+        if let Err(error) = logic::map_memory_object(
+            &tree,
+            &mut self.memory,
+            &mut self.registry,
+            grant,
+            offset,
+            base,
+            pages,
+            permissions,
+        ) {
+            assert!(
+                self.memory.tables.map(|t| t.physical) == old && self.stats() == before,
+                "shared mapping rollback changed table ownership"
+            );
+            return Err(error);
+        }
+        // Generic mapping has committed. All following operations were
+        // preflighted, and unexpected failures are fail-stop.
+        for (slot, previous) in old.iter().copied().enumerate() {
+            if previous == 0 && self.memory.tables[slot].physical != 0 {
+                assert!(!space.tables[slot]);
+                let leaf = logic::leaf_entry(
+                    self.memory.tables[slot].physical,
+                    Permissions::RW,
+                    tree.bits,
+                )
+                .expect("owned table encoding");
+                self.memory
+                    .write(control, slot, leaf)
+                    .expect("user table alias publication");
+                space.tables[slot] = true;
             }
         }
+        self.verify_user(space)
+            .expect("shared mapping inventory verification");
+        for i in 0..pages {
+            logic::validate_memory_object_mapping(
+                &tree,
+                &self.memory,
+                &self.registry,
+                space.id,
+                base + i as u64 * PAGE,
+            )
+            .expect("committed shared leaf");
+        }
+        Ok(())
+    }
+
+    /// Normal shared unmap also prunes empty owned tables and their aliases.
+    #[allow(dead_code)]
+    pub fn unmap_memory_backing(&mut self, space: &mut UserSpace, address: u64) -> Result<()> {
+        if space.teardown != UserTeardown::Live {
+            return Err(Error::NotOwned);
+        }
+        self.registry.can_allocate(space.id)?;
+        self.verify_user(space)?;
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        logic::validate_memory_object_mapping(
+            &tree,
+            &self.memory,
+            &self.registry,
+            space.id,
+            address,
+        )?;
+        let path = logic::indices(address)?;
+        let mut tables = [tree.root; 4];
+        for depth in 0..3 {
+            tables[depth + 1] = self.memory.read(tables[depth], path[depth])? & ADDRESS_FIELD;
+        }
+        let mut control = tree.root;
+        for index in &logic::indices(WINDOW)?[..3] {
+            control = self.memory.read(control, *index)? & ADDRESS_FIELD;
+        }
+        for table in tables {
+            if !space.tables[self.memory.slot(table)?] {
+                return Err(Error::NotOwned);
+            }
+        }
+        logic::unmap_memory_object_preserving_tables(
+            &tree,
+            &mut self.memory,
+            &mut self.registry,
+            space.id,
+            address,
+        )?;
+        let cleanup: Result<()> = (|| {
+            for depth in (1..4).rev() {
+                let table = tables[depth];
+                if self.memory.pinned(table) {
+                    break;
+                }
+                let mut empty = true;
+                for i in 0..512 {
+                    if self.memory.read(table, i)? & 1 != 0 {
+                        empty = false;
+                        break;
+                    }
+                }
+                if !empty {
+                    break;
+                }
+                let slot = self.memory.slot(table)?;
+                self.memory.write(tables[depth - 1], path[depth - 1], 0)?;
+                self.memory.write(control, slot, 0)?;
+                self.memory.flush();
+                self.memory.release(table)?;
+                space.tables[slot] = false;
+            }
+            self.verify_user(space)
+        })();
+        cleanup.expect("shared unmap inventory cleanup");
         Ok(())
     }
     #[cfg(not(feature = "switch-test"))]
@@ -1145,6 +1183,7 @@ impl Paging<'_, '_> {
             root: 0,
             id,
             teardown: UserTeardown::Live,
+            prepared: false,
             tables: [false; TABLES],
             frames: [None; 4],
             private: None,
@@ -1266,6 +1305,7 @@ impl Paging<'_, '_> {
             }
             return Err(error);
         }
+        space.prepared = true;
         Ok(space)
     }
     pub fn verify_user(&self, space: &UserSpace) -> Result<()> {
@@ -1458,6 +1498,9 @@ impl Paging<'_, '_> {
             return Err(Error::InUse);
         }
         self.registry.can_destroy_space(space.id)?; // execution pins and object references
+        if space.prepared {
+            self.verify_user(space)?;
+        }
         #[cfg(feature = "switch-test")]
         if space.stacks.iter().any(Option::is_some) {
             return Err(Error::InUse);
@@ -2393,3 +2436,7 @@ impl Paging<'_, '_> {
         })
     }
 }
+
+#[cfg(feature = "memory-object-test")]
+#[path = "memory_object.rs"]
+mod memory_object;

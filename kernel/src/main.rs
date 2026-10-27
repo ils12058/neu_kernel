@@ -5,7 +5,13 @@
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 compile_error!("Neu kernel must be built for x86_64-unknown-none");
 const _: () = assert!(
-    (cfg!(feature = "test-panic") as u8
+    (cfg!(feature = "test-memory-object-fail-stop") as u8
+        + cfg!(feature = "test-memory-object-new-tables-reverse") as u8
+        + cfg!(feature = "test-memory-object-lifetime") as u8
+        + cfg!(feature = "test-memory-object-lifetime-reverse") as u8
+        + cfg!(feature = "test-memory-object-new-tables") as u8
+        + cfg!(feature = "test-memory-object-map-rollback") as u8
+        + cfg!(feature = "test-panic") as u8
         + cfg!(feature = "test-missing-memory-map") as u8
         + cfg!(feature = "test-memory") as u8
         + cfg!(feature = "test-invalid-opcode") as u8
@@ -304,11 +310,21 @@ extern "C" fn neu_main() -> ! {
         ));
         arch::halt();
     }
-    #[cfg(all(feature = "user-test", not(feature = "native-test")))]
+    #[cfg(all(
+        feature = "user-test",
+        not(feature = "native-test"),
+        not(feature = "memory-object-test")
+    ))]
     if let Err(error) = arch::userspace::run(&mut paging) {
         arch::serial::emergency(format_args!(
             "[NEU] BOOT FAILURE: user execution {error:?}\n"
         ));
+        arch::halt();
+    }
+
+    #[cfg(feature = "memory-object-test")]
+    if let Err(error) = paging.memory_object_test() {
+        arch::serial::emergency(format_args!("[NEU] BOOT FAILURE: MemoryObject {error:?}\n"));
         arch::halt();
     }
 

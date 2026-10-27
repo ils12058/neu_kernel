@@ -5,37 +5,36 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K7 / Phase 7B hardens atomic move-only Flag/Counter transfer across fault and
-wait/wake boundaries. The existing two-slot FIFO retains mixed scalar/capability
-order, and blocking scalar senders recheck at settlement after a wake. Sender
-failure before commit creates no queued authority; after commit, queued ownership
-survives sender cleanup. Receiver cleanup and fresh Node-local handle generations
-remain accounted. No ABI, architecture or fixed resource limits changed.
+K8 / Phase 8A-1 completes the bounded MemoryObject backing and mapping lifetime
+foundation. Trusted setup can map the same real RAM backing into two separate
+address spaces with R or RW non-executable permissions. Newly allocated page
+tables belong to the correct root, workspace aliases stay supervisor-only, and
+either root can be torn down while the other retains its backing. Final collection
+and generation reuse are independently checked through QMP.
 
-**Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
+**Nodes execute. Capabilities authorize. MemoryObjects own shared backing.**
 
-[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the executed
-validation, including the 190-host/115-QEMU K6B baseline and the later K7 runs.
-Current results are **222 host tests and 132 QEMU scenarios**, including the
-terminal-order case, which also passed two independent clean-directory builds
-and QMP boots.
-[Experimental ABI 0.5](docs/abi/experimental-v0.5.md) adds nonblocking capability
-send/receive while retaining ABI 0.1–0.4 configurations.
-[ADR 0020](docs/adr/0020-atomic-capability-moves.md) records the transfer
-contract; [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md)
-records lifecycle and fault-boundary hardening. A subsequent terminal-order
-scenario verifies a queued waiter across endpoint retirement and peer delivery;
-the Ready-before-admission ordering remains unverified in QEMU. Phase 8A shared
-MemoryObjects remain incomplete; [proposed ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md) records the ownership, teardown and collection foundation and its independent QMP verification gap. Architecture v0.2 and earlier accepted ADR
-rationale remain intact.
+Current validation is **228 host tests and 138 unique QEMU scenarios**, including
+132 earlier regressions and six new focused cases. One case deliberately verifies
+a fail-stop panic; normal lifetime cases return to the exact allocator baseline.
+Two independent clean source/target builds and QMP boots also passed.
+[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
+observer failures/retries. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
+is accepted for this bounded scope; [the QMP protocol](docs/testing/memory-object-qmp.md)
+explains the raw production-state checks.
+
+Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
+the baselines. K7 capability movement and Channel behavior retain their earlier
+contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
+[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md).
+Phase 8A-2 will prove actual Ring 3 shared-memory reads/writes and hardware
+permission faults. Public MemoryObject APIs, transfer, revocation and SMP remain
+future work.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private
-Thread stacks. Public creation, public timeouts/deadlines, AddressSpace/endpoint
-transfer, derivation, revocation, shared memory, SMP, TLS/SIMD and ELF runtime
-remain deferred.
-The platform remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF, Rust 1.95.0
-and Limine 12.9.4/base 6 on Apple Silicon.
+Thread stacks. The platform remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB,
+UEFI/OVMF, Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon.
 
 ## Build and run
 

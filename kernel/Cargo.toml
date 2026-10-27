@@ -171,3 +171,12 @@ test-native-move-receive-disabled = ["native-test"]
 test-address-space-move-disabled = ["abi-02"]
 test-channels-move-disabled = ["channel-test"]
 test-channels-wait-move-disabled = ["channel-wait-test"]
+
+# Trusted kernel-only MemoryObject lifetime probes; no public ABI.
+memory-object-test = ["user-test"]
+test-memory-object-lifetime = ["memory-object-test"]
+test-memory-object-lifetime-reverse = ["memory-object-test"]
+test-memory-object-new-tables = ["memory-object-test"]
+test-memory-object-map-rollback = ["memory-object-test"]
+test-memory-object-new-tables-reverse = ["memory-object-test"]
+test-memory-object-fail-stop = ["memory-object-test"]

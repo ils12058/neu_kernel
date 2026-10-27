@@ -28,6 +28,7 @@ pub enum Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Permissions {
     pub write: bool,
     pub execute: bool,
@@ -195,6 +196,49 @@ pub struct PageTree {
     pub bits: u8,
 }
 impl PageTree {
+    /// Count distinct absent intermediate tables without mutating the tree.
+    /// Bounded to a MemoryObject transaction (at most two pages).
+    pub fn required_user_tables(
+        &self,
+        memory: &impl TableMemory,
+        base: u64,
+        pages: usize,
+    ) -> Result<usize> {
+        user_range(base, pages)?;
+        if pages > MEMORY_OBJECT_PAGES {
+            return Err(Error::Capacity);
+        }
+        let mut missing = [(0u8, 0u64); 6];
+        let mut count = 0;
+        for i in 0..pages {
+            let address = base + i as u64 * PAGE;
+            let path = indices(address)?;
+            let mut table = Some(self.root);
+            for (depth, index) in path[..3].iter().copied().enumerate() {
+                if let Some(current) = table {
+                    if !memory.owned(current, 4 - depth as u8) {
+                        return Err(Error::NotOwned);
+                    }
+                    if let Some((next, size)) =
+                        decode(memory.read(current, index)?, 4 - depth as u8, self.bits)?
+                    {
+                        if size != 0 {
+                            return Err(Error::AlreadyMapped);
+                        }
+                        table = Some(next);
+                        continue;
+                    }
+                }
+                let key = (depth as u8, address >> (39 - depth * 9));
+                if !missing[..count].contains(&key) {
+                    missing[count] = key;
+                    count += 1;
+                }
+                table = None;
+            }
+        }
+        Ok(count)
+    }
     pub fn new(memory: &mut impl TableMemory, bits: u8) -> Result<Self> {
         physical(0, bits)?;
         Ok(Self {
@@ -424,6 +468,7 @@ pub const DATA_FRAMES: usize = 16;
 pub const MAPPINGS: usize = 64;
 pub const USER_SPACES: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct SpaceId {
     slot: usize,
     generation: u64,
@@ -457,6 +502,7 @@ impl SpaceRef {
     }
 }
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Space {
     generation: u64,
     live: bool,
@@ -465,12 +511,14 @@ struct Space {
     object_refs: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct FrameId {
     slot: usize,
     generation: u64,
 }
 /// Physical backing has exactly one owner; a mapping is never an owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, u64)]
 pub enum FrameOwner {
     Space(SpaceId),
     MemoryObject(MemoryObjectId),
@@ -479,16 +527,18 @@ pub enum FrameOwner {
 pub const MEMORY_OBJECTS: usize = 4;
 pub const MEMORY_OBJECT_PAGES: usize = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct MemoryObjectId {
     slot: usize,
     generation: u64,
 }
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct MemoryObject {
     generation: u64,
     live: bool,
     creator: bool,
-    frames: [Option<FrameId>; MEMORY_OBJECT_PAGES],
+    frames: [FrameId; MEMORY_OBJECT_PAGES],
     pages: usize,
 }
 /// Trusted internal setup authority. Its fields cannot be supplied by userspace;
@@ -500,6 +550,7 @@ pub struct MemoryMapAuthority {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Frame {
     physical: u64,
     generation: u64,
@@ -509,14 +560,29 @@ struct Frame {
     stack_owner: Option<(crate::node::ThreadId, StackKind)>,
 }
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Mapping {
     pub space: SpaceId,
     pub address: u64,
     pub frame: FrameId,
     pub permissions: Permissions,
-    pub object: Option<MemoryObjectId>,
+    pub object: MappingObject,
     live: bool,
 }
+/// Explicit provenance also gives the test-only debugger a defined raw layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, u64)]
+pub enum MappingObject {
+    Private,
+    Shared(MemoryObjectId),
+}
+impl FrameId {
+    const EMPTY: Self = Self {
+        slot: 0,
+        generation: 0,
+    };
+}
+
 /// Completion receipt is minted only after this generation has no tagged
 /// backing or scoped mappings. Architecture code cannot forge its fields.
 pub struct StackRelease {
@@ -540,6 +606,52 @@ impl Default for Registry {
     }
 }
 impl Registry {
+    /// Test-only schema: bases, strides and offsets point to production fields.
+    /// No data values are projected, and no address authorizes a kernel action.
+    #[cfg(feature = "memory-object-test")]
+    pub fn diagnostic_layout(&self) -> [u64; 38] {
+        use core::mem::{offset_of as off, size_of as size};
+        [
+            1,
+            self.frames.as_ptr() as u64,
+            size::<Frame>() as u64,
+            DATA_FRAMES as u64,
+            off!(Frame, physical) as u64,
+            off!(Frame, generation) as u64,
+            off!(Frame, live) as u64,
+            off!(Frame, initialized) as u64,
+            off!(Frame, owner) as u64,
+            self.mappings.as_ptr() as u64,
+            size::<Mapping>() as u64,
+            MAPPINGS as u64,
+            off!(Mapping, space) as u64,
+            off!(Mapping, address) as u64,
+            off!(Mapping, frame) as u64,
+            off!(Mapping, permissions) as u64,
+            off!(Mapping, object) as u64,
+            off!(Mapping, live) as u64,
+            self.objects.as_ptr() as u64,
+            size::<MemoryObject>() as u64,
+            MEMORY_OBJECTS as u64,
+            off!(MemoryObject, generation) as u64,
+            off!(MemoryObject, live) as u64,
+            off!(MemoryObject, creator) as u64,
+            off!(MemoryObject, frames) as u64,
+            off!(MemoryObject, pages) as u64,
+            self.spaces.as_ptr() as u64,
+            size::<Space>() as u64,
+            USER_SPACES as u64,
+            off!(Space, generation) as u64,
+            off!(Space, live) as u64,
+            off!(Space, root) as u64,
+            off!(Space, pins) as u64,
+            off!(Space, object_refs) as u64,
+            size::<FrameId>() as u64,
+            size::<SpaceId>() as u64,
+            size::<MappingObject>() as u64,
+            size::<FrameOwner>() as u64,
+        ]
+    }
     pub const fn new() -> Self {
         Self {
             frames: [Frame {
@@ -558,14 +670,14 @@ impl Registry {
                     generation: 0,
                 },
                 permissions: Permissions::R,
-                object: None,
+                object: MappingObject::Private,
                 live: false,
             }; MAPPINGS],
             objects: [MemoryObject {
                 generation: 0,
                 live: false,
                 creator: false,
-                frames: [None; MEMORY_OBJECT_PAGES],
+                frames: [FrameId::EMPTY; MEMORY_OBJECT_PAGES],
                 pages: 0,
             }; MEMORY_OBJECTS],
             spaces: [Space {
@@ -979,9 +1091,9 @@ impl Registry {
             slot,
             generation: self.objects[slot].generation + 1,
         };
-        let mut backing = [None; MEMORY_OBJECT_PAGES];
+        let mut backing = [FrameId::EMPTY; MEMORY_OBJECT_PAGES];
         for (i, frame) in frames.iter().copied().enumerate() {
-            backing[i] = Some(frame);
+            backing[i] = frame;
         }
         self.objects[slot] = MemoryObject {
             generation: id.generation,
@@ -1020,7 +1132,7 @@ impl Registry {
             usize::from(object.creator),
             self.mappings
                 .iter()
-                .filter(|m| m.live && m.object == Some(id))
+                .filter(|m| m.live && m.object == MappingObject::Shared(id))
                 .count(),
             object.pages,
         ))
@@ -1031,26 +1143,23 @@ impl Registry {
         Ok(self
             .mappings
             .iter()
-            .any(|m| m.live && m.space == space && m.object.is_some()))
+            .any(|m| m.live && m.space == space && matches!(m.object, MappingObject::Shared(_))))
     }
     pub fn memory_object_mappings(
         &self,
         space: SpaceId,
     ) -> Result<impl Iterator<Item = Mapping> + '_> {
         self.space(space)?;
-        Ok(self
-            .mappings
-            .iter()
-            .copied()
-            .filter(move |m| m.live && m.space == space && m.object.is_some()))
+        Ok(self.mappings.iter().copied().filter(move |m| {
+            m.live && m.space == space && matches!(m.object, MappingObject::Shared(_))
+        }))
     }
     pub fn memory_object_frame(&self, id: MemoryObjectId, index: usize) -> Result<FrameId> {
-        self.object(id)?
-            .frames
-            .get(index)
-            .copied()
-            .flatten()
-            .ok_or(Error::Address)
+        let object = self.object(id)?;
+        if index >= object.pages {
+            return Err(Error::Address);
+        }
+        Ok(object.frames[index])
     }
     pub fn frame_owner(&self, id: FrameId) -> Result<FrameOwner> {
         Ok(self.frame(id)?.owner)
@@ -1084,17 +1193,28 @@ impl Registry {
     ) -> Result<[Option<FrameId>; MEMORY_OBJECT_PAGES]> {
         self.can_allocate(SpaceId::KERNEL)?;
         let object = *self.object(id)?;
-        if object.creator || self.mappings.iter().any(|m| m.live && m.object == Some(id)) {
+        if object.creator
+            || self
+                .mappings
+                .iter()
+                .any(|m| m.live && m.object == MappingObject::Shared(id))
+        {
             return Err(Error::InUse);
         }
-        for frame in object.frames.iter().flatten() {
+        for frame in &object.frames[..object.pages] {
             if self.frame(*frame)?.owner != FrameOwner::MemoryObject(id)
                 || self.mappings.iter().any(|m| m.live && m.frame == *frame)
             {
                 return Err(Error::Corrupt);
             }
         }
-        Ok(object.frames)
+        Ok(core::array::from_fn(|i| {
+            if i < object.pages {
+                Some(object.frames[i])
+            } else {
+                None
+            }
+        }))
     }
     pub fn physical(&self, id: FrameId) -> Result<u64> {
         Ok(self.frame(id)?.physical)
@@ -1277,7 +1397,7 @@ impl Registry {
                 address: base + index as u64 * PAGE,
                 frame,
                 permissions,
-                object: None,
+                object: MappingObject::Private,
                 live: true,
             };
         }
@@ -1308,7 +1428,7 @@ impl Registry {
             .iter()
             .position(|m| m.live && m.space == space && m.address == address)
             .ok_or(Error::NotMapped)?;
-        if self.mappings[slot].object.is_some() {
+        if matches!(self.mappings[slot].object, MappingObject::Shared(_)) {
             return Err(Error::NotOwned);
         }
         self.mappings[slot].live = false;
@@ -1515,7 +1635,7 @@ pub fn map_memory_object(
         return Err(Error::Capacity);
     }
     for i in 0..pages {
-        let id = object.frames[offset + i].ok_or(Error::Corrupt)?;
+        let id = object.frames[offset + i];
         let frame = registry.frame(id)?;
         if frame.owner != FrameOwner::MemoryObject(authority.object) {
             return Err(Error::NotOwned);
@@ -1538,7 +1658,7 @@ pub fn map_memory_object(
         }
     }
     for i in 0..pages {
-        let frame = object.frames[offset + i].ok_or(Error::Corrupt)?;
+        let frame = object.frames[offset + i];
         if let Err(error) = tree.map_user(
             memory,
             base + i as u64 * PAGE,
@@ -1561,9 +1681,9 @@ pub fn map_memory_object(
         registry.mappings[slot] = Mapping {
             space: authority.space,
             address: base + i as u64 * PAGE,
-            frame: object.frames[offset + i].ok_or(Error::Corrupt)?,
+            frame: object.frames[offset + i],
             permissions,
-            object: Some(authority.object),
+            object: MappingObject::Shared(authority.object),
             live: true,
         };
     }
@@ -1595,7 +1715,9 @@ pub fn validate_memory_object_mapping(
         return Err(Error::NotOwned);
     }
     let record = registry.mapping_for(space, address)?;
-    let id = record.object.ok_or(Error::NotOwned)?;
+    let MappingObject::Shared(id) = record.object else {
+        return Err(Error::NotOwned);
+    };
     if registry.frame(record.frame)?.owner != FrameOwner::MemoryObject(id) {
         return Err(Error::Corrupt);
     }
@@ -1618,7 +1740,12 @@ fn retire_memory_object_mapping(
     let slot = registry
         .mappings
         .iter()
-        .position(|m| m.live && m.space == space && m.address == address && m.object.is_some())
+        .position(|m| {
+            m.live
+                && m.space == space
+                && m.address == address
+                && matches!(m.object, MappingObject::Shared(_))
+        })
         .ok_or(Error::Corrupt)?;
     registry.mappings[slot].live = false;
     Ok(())
