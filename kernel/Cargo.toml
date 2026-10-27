@@ -132,6 +132,7 @@ test-native-abi02-disabled = ["native-test"]
 # ABI 0.3 bridge to K6: bounded scalar IPC, no capability transport.
 channel-test = ["abi-02"]
 test-channels = ["channel-test"]
+test-channels-stress = ["channel-test"]
 test-channels-xapic = ["channel-test"]
 test-channels-a-fault = ["channel-test"]
 test-channels-b-fault = ["channel-test"]

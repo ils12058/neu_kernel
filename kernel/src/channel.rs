@@ -56,7 +56,19 @@ impl Fifo {
         len: 0,
         values: [0; MESSAGES],
     };
+    fn validate(&self) -> Result<()> {
+        let capacity = MESSAGES as u64;
+        if self.head >= capacity
+            || self.tail >= capacity
+            || self.len > capacity
+            || (self.head + self.len) % capacity != self.tail
+        {
+            return Err(Error::Terminal);
+        }
+        Ok(())
+    }
     fn push(&mut self, value: u64) -> Result<()> {
+        self.validate()?;
         if self.len == MESSAGES as u64 {
             return Err(Error::Full);
         }
@@ -65,15 +77,16 @@ impl Fifo {
         self.len += 1;
         Ok(())
     }
-    fn pop(&mut self) -> Option<u64> {
+    fn pop(&mut self) -> Result<Option<u64>> {
+        self.validate()?;
         if self.len == 0 {
-            return None;
+            return Ok(None);
         }
         let v = self.values[self.head as usize];
         self.values[self.head as usize] = 0;
         self.head = (self.head + 1) % MESSAGES as u64;
         self.len -= 1;
-        Some(v)
+        Ok(Some(v))
     }
     fn words(self) -> [u64; 5] {
         [
@@ -181,7 +194,8 @@ impl Channels {
             return Err(Error::Object);
         }
         let info = e.info.ok_or(Error::Object)?;
-        if !self.live
+        if info.side >= ENDPOINTS
+            || !self.live
             || info.channel.generation != self.generation
             || self.ends[info.side] != Some(id)
         {
@@ -225,6 +239,7 @@ impl Channels {
     pub(crate) fn receive(&mut self, id: EndpointId, owner: NodeId) -> Result<u64> {
         let i = self.owned(id, owner)?;
         let peer_live = self.peer_live(i)?;
+        self.queues[i.side].validate()?;
         if self.queues[i.side].len == 0 {
             return Err(if peer_live {
                 Error::Empty
@@ -235,13 +250,19 @@ impl Channels {
         let count = self.received[i.side]
             .checked_add(1)
             .ok_or(Error::Capacity)?;
-        let value = self.queues[i.side].pop().ok_or(Error::Empty)?; // linearization: removes exactly one scalar
+        let value = self.queues[i.side].pop()?.ok_or(Error::Empty)?; // linearization: removes exactly one scalar
         self.received[i.side] = count;
         Ok(value)
     }
     pub(crate) fn retire(&mut self, reference: EndpointRef) -> Result<()> {
         let i = self.info(reference.id)?;
-        self.discarded[i.side] += self.queues[i.side].len;
+        self.queues[i.side].validate()?;
+        // Retirement cannot publish a partially accounted discard. The sole
+        // caller treats failure as a kernel invariant violation (fail-stop).
+        let discarded = self.discarded[i.side]
+            .checked_add(self.queues[i.side].len)
+            .ok_or(Error::Terminal)?;
+        self.discarded[i.side] = discarded;
         self.queues[i.side] = Fifo::EMPTY;
         self.ends[i.side] = None;
         self.endpoints[reference.id.slot].info = None;

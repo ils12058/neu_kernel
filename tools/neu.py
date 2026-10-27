@@ -64,7 +64,7 @@ AS_CASES=('address-space','address-space-xapic','address-space-a-fault','address
 FEATURES.update({name:'test-'+name for name in AS_CASES})
 FEATURES['native-abi02-disabled']='test-native-abi02-disabled'
 NATIVE_CASES['native-abi02-disabled']=1
-IPC_CASES=('channels','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback')
+IPC_CASES=('channels','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback','channels-stress')
 FEATURES.update({name:'test-'+name for name in IPC_CASES})
 FEATURES['native-abi03-disabled']='test-native-abi03-disabled';NATIVE_CASES['native-abi03-disabled']=1
 AS_CASES+=('address-space-channel-disabled',)
@@ -1300,10 +1300,18 @@ def check_ipc(case,text,symbols,members,state):
             if status!=expected or (op!=0x14 or expected!=0) and scalar!=0:raise Failure('IPC status/scalar differs from independent nonblocking capability/FIFO model.')
             if expected:errors.add(expected)
         if w[28:50]!=snapshot() or w[61]!=int(bool(ends[0]))+2*int(bool(ends[1])):raise Failure('Actual queue/endpoint state lost or invented a committed message.')
+        if any(sent[1-side]!=received[side]+queues[side][2]+discard[side] for side in (0,1)):raise Failure('Directional message conservation failed.')
         if w[62]!=sum(len(t) for t in caps.values()):raise Failure('Capability reference accounting differs from live handles.')
         if w[23] and (seq not in native or native[seq]['words']!=w):raise Failure('Missing coherent native CPU/actual FIFO observation.')
     if closed!={a,b} or refs!=[0,0] or any(ends) or any(q[2] for q in queues):raise Failure('Channel/endpoint/handle/queue teardown incomplete.')
-    if sent!=[4,3] or received[1]!=4 or received[0]!=(2 if case=='channels-a-fault' else 3) or discard!=([1,0] if case=='channels-a-fault' else [0,0]):raise Failure('Message lifetime accounting differs from selected close/fault policy.')
+    extra=[6,3] if case=='channels-stress' else [0,0]
+    if sent!=[4+extra[0],3+extra[1]] or received[1]!=4+extra[0] or received[0]!=(2 if case=='channels-a-fault' else 3)+extra[1] or discard!=([1,0] if case=='channels-a-fault' else [0,0]):raise Failure('Message lifetime accounting differs from selected close/fault policy.')
+    if case=='channels-stress':
+        for i in range(3):
+            for side,kind,value in ((0,'send',0x6000+i),(0,'send',0x6100+i),(1,'receive',0x6000+i),(1,'receive',0x6100+i),(1,'send',0x6200+i),(0,'receive',0x6200+i)):
+                if not any(e[1:4]==(kind,side,value) for e in successful):raise Failure('Missing repeated real FIFO wraparound transaction.')
+            if not any(w[6]==0x13 and w[8]==0x7000+i and w[9]==(1<<64)-33 for w in records):raise Failure('Missing repeated Full rejection.')
+        if sum(1 for w in records if w[23] and (w[8] in (0x6000,0x6002,0x7000) or w[10] in (0x6000,0x6102,0x6202)))<6:raise Failure('Missing stopped-CPU wraparound FIFO observations.')
     if not {-16,-17,-18,-19,-32,-33,-34}<=errors or len(native)<12:raise Failure('Incomplete negative or physical FIFO evidence.')
     if {e[4] for e in successful if e[1]=='send' and e[2]==0}!={1,2}:raise Failure('A1/A2 did not send through shared Node authority.')
     if case!='channels-a-fault' and not after_exit:raise Failure('A2 did not use its endpoint after A1 exit.')

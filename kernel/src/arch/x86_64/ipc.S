@@ -23,6 +23,16 @@
     cmp rdx,rcx
     jne neu_multi_failed
 .endm
+.macro ipc_stress_send status
+    mov eax,0x13
+    mov rdi,[0x402110]
+    mov rsi,rbx
+    call neu_ipc_invoke
+    cmp rax,\status
+    jne neu_multi_failed
+    test rdx,rdx
+    jne neu_multi_failed
+.endm
 .macro neu_ipc_user_body
 neu_ipc_user_steps:
     push rax
@@ -72,6 +82,14 @@ neu_ipc_user_steps:
     cmp r12,8
     jne .Lipc_discover
     mov qword ptr [r15+56],1
+    .if {ipc_stress}
+    cmp r14,2
+    je .Lipc_done
+    mov qword ptr [r15+56],10
+    mov qword ptr [0x402168],0
+    jmp .Lipc_stress
+    .endif
+.Lipc_initial_a:
     cmp r14,1
     jne .Lipc_dispatch
     ipc_call 0x10,8,0,-16,0
@@ -95,6 +113,15 @@ neu_ipc_user_steps:
     mov qword ptr [0x402100],1
     jmp .Lipc_done
 .Lipc_dispatch:
+    .if {ipc_stress}
+    cmp r14,2
+    jne .Lipc_stress_check
+    cmp qword ptr [0x402160],1
+    jne .Lipc_done
+.Lipc_stress_check:
+    cmp qword ptr [r15+56],10
+    jae .Lipc_stress
+    .endif
     cmp r14,3
     je .Lipc_b
     cmp r14,2
@@ -210,6 +237,61 @@ neu_ipc_user_steps:
     pop rbx
     pop rax
     ret
+    .if {ipc_stress}
+.Lipc_stress:
+    cmp r14,3
+    je .Lipc_stress_b
+    cmp qword ptr [r15+56],10
+    jne .Lipc_stress_a_ack
+    mov rbx,[0x402168]
+    add rbx,0x6000
+    ipc_stress_send 0
+    add rbx,0x100
+    ipc_stress_send 0
+    add rbx,0xf00
+    ipc_stress_send -33
+    mov qword ptr [r15+56],11
+    jmp .Lipc_done
+.Lipc_stress_a_ack:
+    mov rbx,[0x402168]
+    add rbx,0x6200
+    ipc_receive "qword ptr [0x402118]",rbx
+    inc qword ptr [0x402168]
+    cmp qword ptr [0x402168],3
+    je .Lipc_stress_a_complete
+    mov qword ptr [r15+56],10
+    jmp .Lipc_done
+.Lipc_stress_a_complete:
+    mov qword ptr [0x402160],1
+    mov qword ptr [r15+56],1
+    jmp .Lipc_initial_a
+.Lipc_stress_b:
+    mov rcx,[0x402168]
+    add rcx,4
+    bt qword ptr [0x402150],rcx
+    jnc .Lipc_done
+    cmp qword ptr [r15+56],10
+    jne .Lipc_stress_b_second
+    mov rbx,[0x402168]
+    add rbx,0x6000
+    ipc_receive "qword ptr [0x402118]",rbx
+    mov qword ptr [r15+56],11
+.Lipc_stress_b_second:
+    mov rbx,[0x402168]
+    add rbx,0x6100
+    ipc_receive "qword ptr [0x402118]",rbx
+    mov rbx,[0x402168]
+    add rbx,0x6200
+    ipc_stress_send 0
+    inc qword ptr [0x402168]
+    cmp qword ptr [0x402168],3
+    je .Lipc_stress_b_complete
+    mov qword ptr [r15+56],10
+    jmp .Lipc_done
+.Lipc_stress_b_complete:
+    mov qword ptr [r15+56],1
+    jmp .Lipc_done
+    .endif
 neu_ipc_invoke:
 .global neu_ipc_syscall_site,neu_ipc_syscall_resume
 neu_ipc_syscall_site:

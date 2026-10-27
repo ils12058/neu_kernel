@@ -1246,3 +1246,88 @@ fn opposite_node_table_cannot_close_another_tables_entry() {
     send(&n, &mut o, a, h, 32).unwrap();
     assert_eq!(receive(&n, &mut o, b, h), Ok(32));
 }
+
+#[test]
+fn pair_preflight_refuses_each_owner_capacity_without_consuming_any_generation() {
+    for blocked in 0..2 {
+        let (mut n, a, b) = owners();
+        let mut o = Objects::with_channels();
+        let creator = o.flag(true).unwrap();
+        let node = [a, b][blocked];
+        for _ in 0..5 {
+            n.authority_mut(node)
+                .unwrap()
+                .grant(&mut o, &creator, Rights::READ)
+                .unwrap();
+        }
+        let before = o.stats();
+        let snapshot = o.channel_state().snapshot();
+        let objects = o.slots.each_ref().map(|slot| slot.generation);
+        let generations = [a, b].map(|id| {
+            n.authority(id)
+                .unwrap()
+                .slots
+                .each_ref()
+                .map(|slot| slot.generation)
+        });
+        assert_eq!(n.bootstrap_channel(&mut o, a, b), Err(Error::Capacity));
+        assert_eq!(o.stats(), before);
+        assert_eq!(o.channel_state().snapshot(), snapshot);
+        assert_eq!(o.slots.each_ref().map(|slot| slot.generation), objects);
+        assert_eq!(
+            [a, b].map(|id| n
+                .authority(id)
+                .unwrap()
+                .slots
+                .each_ref()
+                .map(|slot| slot.generation)),
+            generations
+        );
+        assert_eq!(o.info(creator.id()).unwrap().references, 6);
+        n.authority_mut(node).unwrap().drain(&mut o, node).unwrap();
+        o.release(creator).unwrap();
+        assert_eq!(o.stats(), Stats::default());
+    }
+}
+
+#[test]
+fn each_faulted_owner_discards_only_its_inbound_and_preserves_peer_fifo() {
+    for dead_side in 0..2 {
+        let (mut n, mut o, a, b) = channels();
+        let nodes = [a, b];
+        let handles = nodes.map(|id| endpoint(&n, &o, id, 4));
+        for side in 0..2 {
+            send(&n, &mut o, nodes[side], handles[side], 10 + side as u64).unwrap();
+            send(&n, &mut o, nodes[side], handles[side], 20 + side as u64).unwrap();
+        }
+        n.authority_mut(nodes[dead_side]).unwrap().terminate();
+        n.authority_mut(nodes[dead_side])
+            .unwrap()
+            .drain(&mut o, nodes[dead_side])
+            .unwrap();
+        let live = 1 - dead_side;
+        assert_eq!(o.channel_state().snapshot()[20 + dead_side], 2);
+        assert_eq!(
+            receive(&n, &mut o, nodes[live], handles[live]),
+            Ok(10 + dead_side as u64)
+        );
+        assert_eq!(
+            receive(&n, &mut o, nodes[live], handles[live]),
+            Ok(20 + dead_side as u64)
+        );
+        assert_eq!(
+            receive(&n, &mut o, nodes[live], handles[live]),
+            Err(Error::PeerClosed)
+        );
+        assert_eq!(
+            send(&n, &mut o, nodes[live], handles[live], 99),
+            Err(Error::PeerClosed)
+        );
+        n.authority_mut(nodes[live])
+            .unwrap()
+            .drain(&mut o, nodes[live])
+            .unwrap();
+        assert_eq!(o.stats(), Stats::default());
+        assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+    }
+}

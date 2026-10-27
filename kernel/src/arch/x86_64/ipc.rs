@@ -219,12 +219,22 @@ pub fn request(
             r.words[26..28].copy_from_slice(&guard.queue_addresses());
             r.words[61] = u64::from(after[2] != 0) | u64::from(after[3] != 0) << 1;
             if status == cap::Error::Full as i64 {
-                s.gates |= 1 << info.side;
+                if cfg!(feature = "test-channels-stress") && (0x7000..0x7003).contains(&payload) {
+                    s.gates |= 1 << (4 + payload - 0x7000);
+                } else {
+                    s.gates |= 1 << info.side;
+                }
             }
             if status == 0 && info.side == 1 && op == v03::CHANNEL_SEND && payload == 55 {
                 s.gates |= 8;
             }
             let bit = match (active.thread.index(), op, status, payload, scalar) {
+                (0, 0x13, 0, 0x6000, _) => Some(18),
+                (0, 0x13, -33, 0x7000, _) => Some(19),
+                (1, 0x14, 0, _, 0x6000) => Some(20),
+                (0, 0x13, 0, 0x6002, _) => Some(21),
+                (1, 0x14, 0, _, 0x6102) => Some(22),
+                (0, 0x14, 0, _, 0x6202) => Some(23),
                 (0, 0x13, 0, 0, _) => Some(0),
                 (0, 0x13, -33, _, _) => Some(1),
                 (1, 0x14, 0, _, 0) => Some(2),

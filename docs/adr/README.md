@@ -190,3 +190,12 @@ remain future decisions. See the [versioned ABI specification](../abi/experiment
 This implements a narrow K6 communication subset while continuing K5 authority
 enforcement. K6 is not declared complete; K7 moves and K10 revocation remain open.
 Earlier ADR rationale and ABI 0.1/0.2 configurations remain intact.
+
+## Phase 6A clarification
+
+| Record | Decision | Related register entries |
+| --- | --- | --- |
+| [0018: Channel conservation and retirement invariants](0018-channel-conservation-and-retirement.md) | Accepted within the nonblocking single-CPU Channel contract | NEU-005/006/007/008/009/010/011/021/023/024 scoped subsets |
+
+This clarifies ADR 0017; wait/wake, capability movement and revocation remain
+future work.

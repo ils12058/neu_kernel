@@ -1,5 +1,62 @@
 # Neu Kernel implementation status
 
+## K6 / Phase 6A — scoped hardening in progress (2026-10-27)
+
+Phase 6A remains **incomplete** pending the full required fault-timing and QMP
+stress matrix. [ADR 0018](adr/0018-channel-conservation-and-retirement.md)
+clarifies the existing nonblocking contract; architecture v0.2 and experimental
+ABI 0.3 are unchanged. The historical Phase 5C results below remain evidence for
+that earlier revision, not a claim that the new revision passed those tests.
+
+The production ring validates head, tail, length and their relationship before
+indexing. Retirement checks discard accumulation before mutation; its caller
+fail-stops if a corrupt retirement cannot complete. Counters are indexed by
+sender for sends and by receiver for queued, received and discarded messages;
+they reset only on trusted construction of a new Channel generation. As before,
+last reference and pin release retire only that endpoint, discarding its inbound
+messages and preserving the peer's queued messages. No capacity, ABI, kernel
+preemption or queue size changed.
+
+The host suite now includes 128 deterministic xorshift seeds, eight generations
+per seed, and 120 modeled operations per generation, using the real Channel code
+and an independent logical FIFO, with invariants checked after each operation.
+Additional tests cover repeated bidirectional Full/Empty cycles, malformed ring
+metadata, discard overflow, both owners' bootstrap capacity failures, and both
+peer cleanup directions. Reconstruction evidence here is host-side trusted
+mechanism testing, not userspace Channel creation. The new `channels-stress`
+fixture uses three Full/recovery cycles through Ring 3 before the existing
+three-Thread scenario; the host independently reconciles each ledger entry and
+QMP observes actual FIFO storage at selected first/last-cycle native entries.
+The fixture's test-only gates order observations and do not carry payloads.
+A four-cycle prototype first passed, but a later run with six extra QMP probes
+exhausted the 96-dispatch limit and failed; it is not counted as a pass. The
+fixture was reduced to three cycles while retaining the unchanged 112-record
+(57,344-byte) allocation, 96-dispatch limit and 30-second deadline.
+
+Validation: `make doctor`, `make check`, `make build`, and the final `make test`
+passed: **164 host tests and 105 QEMU scenarios**, including all 104 prior
+scenarios. The revised stress run accounted for 10 A-to-B and 6 B-to-A sends,
+all received, 65 records and 23 QMP native observations. Three additional
+revised stress QMP runs passed. The earlier four-cycle full-suite attempt failed
+after 102 passes by exhausting its dispatch bound; it is not a suite pass.
+The original fault and xAPIC images also passed repeated QMP runs; those repeats
+preceded the final fixture-constant revision, while the final full suite rebuilt
+and passed those profiles on the final code.
+
+A separate clean source/target directory built and QMP-booted the default and
+revised stress images successfully. Their ELF hashes differ from the main
+workspace builds; each pair has identical loadable segments and identical hashes
+after stripping debug sections. The clean debug data includes its source path.
+This is one independent directory and two builds, not two independent source
+directories or evidence of physical hardware support.
+
+Future blocking
+operations require atomic enqueue-and-sleep, explicit wait ownership and wake
+policy, close/fault/timeout cancellation, lifetime pins, scheduler integration,
+and priority-inversion analysis. There is no current wait queue, sleeping,
+wake-up, transfer, derivation or revocation implementation.
+
+
 **Verified:** 2026-10-26. **Milestone:** K5 / Phase 5C — capability-backed endpoints
 and bounded scalar IPC. **159 host tests and 104 QEMU scenarios pass**, preserving
 all 129/97 baseline regressions, plus twelve scheduling repeats and four

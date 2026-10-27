@@ -16,7 +16,7 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
