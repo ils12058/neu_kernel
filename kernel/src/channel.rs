@@ -386,6 +386,11 @@ impl Channels {
         self.sent = sent;
         self.received = received;
     }
+    #[cfg(test)]
+    pub(crate) fn test_discarded(&mut self, discarded: [u64; 2]) {
+        // Boundary injection exists only in host tests, never a guest ABI.
+        self.discarded = discarded;
+    }
     pub fn stats(&self) -> Stats {
         Stats {
             channels: usize::from(self.live),

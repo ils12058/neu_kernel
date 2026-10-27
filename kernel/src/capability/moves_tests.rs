@@ -664,3 +664,510 @@ fn two_queued_moves_preserve_order_and_release_two_distinct_references_to_one_ob
     assert_eq!(o.stats(), Stats::default());
     conserved(&o);
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelMessage {
+    Scalar(u64),
+    Capability(ObjectId, Rights),
+}
+
+#[derive(Clone, Copy)]
+struct ModelTable {
+    entries: [Option<(ObjectId, Rights, bool)>; HANDLES],
+    generations: [u32; HANDLES],
+    live: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ModelQueue {
+    head: usize,
+    tail: usize,
+    len: usize,
+    slots: [Option<ModelMessage>; crate::channel::MESSAGES],
+}
+
+impl ModelQueue {
+    const EMPTY: Self = Self {
+        head: 0,
+        tail: 0,
+        len: 0,
+        slots: [None; crate::channel::MESSAGES],
+    };
+
+    fn push(&mut self, message: ModelMessage) {
+        assert!(self.len < crate::channel::MESSAGES);
+        assert!(self.slots[self.tail].is_none());
+        self.slots[self.tail] = Some(message);
+        self.tail = (self.tail + 1) % crate::channel::MESSAGES;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> ModelMessage {
+        assert_ne!(self.len, 0);
+        let message = self.slots[self.head].take().unwrap();
+        self.head = (self.head + 1) % crate::channel::MESSAGES;
+        self.len -= 1;
+        message
+    }
+
+    fn words(self) -> [u64; 5] {
+        let scalar = |slot| match self.slots[slot] {
+            Some(ModelMessage::Scalar(value)) => value,
+            _ => 0,
+        };
+        [
+            self.head as u64,
+            self.tail as u64,
+            self.len as u64,
+            scalar(0),
+            scalar(1),
+        ]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MoveModel {
+    tables: [ModelTable; 2],
+    queues: [ModelQueue; 2],
+    sent: [u64; 2],
+    received: [u64; 2],
+    discarded: [u64; 2],
+    live_ends: [bool; 2],
+}
+
+impl MoveModel {
+    fn new(nodes: &Nodes, handles: [[Handle; 8]; 2], owners: [NodeId; 2]) -> (Self, [ObjectId; 4]) {
+        let mut tables = [ModelTable {
+            entries: [None; HANDLES],
+            generations: [1; HANDLES],
+            live: true,
+        }; 2];
+        for side in 0..2 {
+            for slot in 0..HANDLES {
+                let (object, rights) = nodes
+                    .authority(owners[side])
+                    .unwrap()
+                    .describe(owners[side], handles[side][slot])
+                    .unwrap();
+                tables[side].entries[slot] = Some((object, rights, slot == 3));
+            }
+        }
+        let objects = [
+            nodes
+                .authority(owners[0])
+                .unwrap()
+                .describe(owners[0], handles[0][0])
+                .unwrap()
+                .0,
+            nodes
+                .authority(owners[1])
+                .unwrap()
+                .describe(owners[1], handles[1][0])
+                .unwrap()
+                .0,
+            nodes
+                .authority(owners[0])
+                .unwrap()
+                .describe(owners[0], handles[0][4])
+                .unwrap()
+                .0,
+            nodes
+                .authority(owners[1])
+                .unwrap()
+                .describe(owners[1], handles[1][4])
+                .unwrap()
+                .0,
+        ];
+        (
+            Self {
+                tables,
+                queues: [ModelQueue::EMPTY; 2],
+                sent: [0; 2],
+                received: [0; 2],
+                discarded: [0; 2],
+                live_ends: [true; 2],
+            },
+            objects,
+        )
+    }
+
+    fn references(&self, object: ObjectId) -> u32 {
+        let local = self
+            .tables
+            .iter()
+            .flat_map(|table| table.entries.iter())
+            .filter(|entry| entry.is_some_and(|(id, _, _)| id == object))
+            .count();
+        let queued = self
+            .queues
+            .iter()
+            .flat_map(|queue| queue.slots.iter())
+            .filter(
+                |message| matches!(message, Some(ModelMessage::Capability(id, _)) if *id == object),
+            )
+            .count();
+        (local + queued) as u32
+    }
+
+    fn snapshot(&self, owners: [NodeId; 2]) -> [u64; 22] {
+        let mut words = [0; 22];
+        words[..6].copy_from_slice(&[
+            0x101,
+            u64::from(self.live_ends.iter().any(|live| *live)),
+            if self.live_ends[0] { 0x101 } else { 0 },
+            if self.live_ends[1] { 0x102 } else { 0 },
+            owners[0].raw(),
+            owners[1].raw(),
+        ]);
+        words[6..11].copy_from_slice(&self.queues[0].words());
+        words[11..16].copy_from_slice(&self.queues[1].words());
+        words[16..22].copy_from_slice(&[
+            self.sent[0],
+            self.sent[1],
+            self.received[0],
+            self.received[1],
+            self.discarded[0],
+            self.discarded[1],
+        ]);
+        words
+    }
+
+    fn transfer_tags(&self) -> [u64; 12] {
+        let mut words = [0; 12];
+        for (side, queue) in self.queues.iter().enumerate() {
+            for (slot, message) in queue.slots.iter().enumerate() {
+                if let Some(ModelMessage::Capability(object, rights)) = message {
+                    let offset = side * 6 + slot * 3;
+                    words[offset..offset + 3].copy_from_slice(&[
+                        1,
+                        object.raw(),
+                        rights.bits() as u64,
+                    ]);
+                }
+            }
+        }
+        words
+    }
+
+    fn verify(&self, nodes: &Nodes, objects: &Objects, owners: [NodeId; 2], known: [ObjectId; 4]) {
+        for side in 0..2 {
+            if !self.tables[side].live {
+                continue;
+            }
+            let table = nodes.authority(owners[side]).unwrap();
+            for slot in 0..HANDLES {
+                let handle = Handle::new(slot, self.tables[side].generations[slot]);
+                match self.tables[side].entries[slot] {
+                    Some((object, rights, _)) => {
+                        assert_eq!(table.describe(owners[side], handle), Ok((object, rights)))
+                    }
+                    None => assert_eq!(table.describe(owners[side], handle), Err(Error::Stale)),
+                }
+            }
+        }
+        assert_eq!(objects.channel_state().snapshot(), self.snapshot(owners));
+        assert_eq!(
+            objects.channel_state().transfer_snapshot(),
+            self.transfer_tags()
+        );
+        assert_eq!(
+            objects.queued_references(),
+            self.queues
+                .iter()
+                .flat_map(|q| q.slots.iter())
+                .filter(|m| matches!(m, Some(ModelMessage::Capability(_, _))))
+                .count() as u32
+        );
+        let references: u32 = known.iter().map(|object| self.references(*object)).sum();
+        let live = known
+            .iter()
+            .filter(|object| self.references(**object) != 0)
+            .count();
+        assert_eq!(
+            objects.stats(),
+            Stats {
+                live,
+                references,
+                pins: 0
+            }
+        );
+        for object in known {
+            let expected = self.references(object);
+            if expected == 0 {
+                assert_eq!(objects.info(object), Err(Error::Object));
+            } else {
+                assert_eq!(objects.info(object).unwrap().references, expected);
+                assert_eq!(objects.info(object).unwrap().pins, 0);
+            }
+        }
+        for side in 0..2 {
+            assert_eq!(
+                self.sent[side],
+                self.received[1 - side]
+                    + self.queues[1 - side].len as u64
+                    + self.discarded[1 - side]
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ModelOperation {
+    SendScalar(usize, u64),
+    SendCapability(usize),
+    ReceiveScalar(usize),
+    ReceiveCapability(usize),
+    Close(usize, usize),
+}
+
+fn model_step(
+    model: &mut MoveModel,
+    nodes: &mut Nodes,
+    objects: &mut Objects,
+    owners: [NodeId; 2],
+    known: [ObjectId; 4],
+    operation: ModelOperation,
+) {
+    match operation {
+        ModelOperation::SendScalar(side, value) => {
+            let destination = 1 - side;
+            let expected = if model.queues[destination].len == crate::channel::MESSAGES {
+                Err(Error::Full)
+            } else {
+                Ok(())
+            };
+            let actual = nodes
+                .authority(owners[side])
+                .unwrap()
+                .lookup(
+                    objects,
+                    owners[side],
+                    Handle::new(4, 1),
+                    ObjectType::ChannelEndpoint,
+                    Rights::SEND,
+                )
+                .unwrap()
+                .channel_send(value);
+            assert_eq!(actual, expected);
+            if actual.is_ok() {
+                model.queues[destination].push(ModelMessage::Scalar(value));
+                model.sent[side] += 1;
+            }
+        }
+        ModelOperation::SendCapability(side) => {
+            let slot = model.tables[side]
+                .entries
+                .iter()
+                .position(|entry| entry.is_some_and(|(_, _, movable)| movable));
+            let source = slot.map_or(Handle::new(0, model.tables[side].generations[0]), |slot| {
+                Handle::new(slot, model.tables[side].generations[slot])
+            });
+            let destination = 1 - side;
+            let expected = if slot.is_none() {
+                if model.tables[side].entries[0].is_none() {
+                    Err(Error::Stale)
+                } else {
+                    Err(Error::Transfer)
+                }
+            } else if model.queues[destination].len == crate::channel::MESSAGES {
+                Err(Error::Full)
+            } else {
+                Ok(())
+            };
+            let actual = nodes.authority_mut(owners[side]).unwrap().send_cap(
+                objects,
+                owners[side],
+                Handle::new(4, 1),
+                source,
+            );
+            assert_eq!(actual, expected);
+            if actual.is_ok() {
+                let (object, rights, _) = model.tables[side].entries[slot.unwrap()].take().unwrap();
+                model.queues[destination].push(ModelMessage::Capability(object, rights));
+                model.sent[side] += 1;
+            }
+        }
+        ModelOperation::ReceiveScalar(side) => {
+            let head = if model.queues[side].len == 0 {
+                None
+            } else {
+                model.queues[side].slots[model.queues[side].head]
+            };
+            let expected = match head {
+                None => Err(Error::Empty),
+                Some(ModelMessage::Capability(_, _)) => Err(Error::MessageKind),
+                Some(ModelMessage::Scalar(value)) => Ok(value),
+            };
+            let actual = nodes
+                .authority(owners[side])
+                .unwrap()
+                .lookup(
+                    objects,
+                    owners[side],
+                    Handle::new(4, 1),
+                    ObjectType::ChannelEndpoint,
+                    Rights::RECEIVE,
+                )
+                .unwrap()
+                .channel_receive();
+            assert_eq!(actual, expected);
+            if actual.is_ok() {
+                assert_eq!(model.queues[side].pop(), head.unwrap());
+                model.received[side] += 1;
+            }
+        }
+        ModelOperation::ReceiveCapability(side) => {
+            let head = if model.queues[side].len == 0 {
+                None
+            } else {
+                model.queues[side].slots[model.queues[side].head]
+            };
+            let free = model.tables[side]
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(slot, entry)| {
+                    entry.is_none() && model.tables[side].generations[*slot] != u32::MAX
+                })
+                .map(|(slot, _)| slot);
+            let expected = match head {
+                None => Err(Error::Empty),
+                Some(ModelMessage::Scalar(_)) => Err(Error::MessageKind),
+                Some(ModelMessage::Capability(_, _)) if free.is_none() => Err(Error::Capacity),
+                Some(ModelMessage::Capability(_, _)) => Ok(()),
+            };
+            let actual = nodes.authority_mut(owners[side]).unwrap().receive_cap(
+                objects,
+                owners[side],
+                Handle::new(4, 1),
+            );
+            assert_eq!(actual.map(|_| ()), expected);
+            if expected.is_ok() {
+                let ModelMessage::Capability(object, rights) = model.queues[side].pop() else {
+                    unreachable!()
+                };
+                let slot = free.unwrap();
+                model.tables[side].generations[slot] += 1;
+                model.tables[side].entries[slot] = Some((object, rights, true));
+                model.received[side] += 1;
+                assert_eq!(
+                    actual.unwrap(),
+                    Handle::new(slot, model.tables[side].generations[slot])
+                );
+            }
+        }
+        ModelOperation::Close(side, slot) => {
+            let handle = Handle::new(slot, model.tables[side].generations[slot]);
+            let expected = if model.tables[side].entries[slot].is_some() {
+                Ok(())
+            } else {
+                Err(Error::Stale)
+            };
+            let actual =
+                nodes
+                    .authority_mut(owners[side])
+                    .unwrap()
+                    .close(objects, owners[side], handle);
+            assert_eq!(actual, expected);
+            if actual.is_ok() {
+                model.tables[side].entries[slot] = None;
+            }
+        }
+    }
+    model.verify(nodes, objects, owners, known);
+}
+
+#[test]
+fn seeded_mixed_fifo_sequences_match_an_independent_ownership_model_after_each_operation() {
+    for seed in [1_u64, 7, 0x5eed, 0xc0ffee] {
+        let (mut nodes, mut objects, owners, handles) = pair();
+        let (mut model, known) = MoveModel::new(&nodes, handles, owners);
+
+        // Edge-focused prefix: scalar-before-capability, wrong-kind rollback,
+        // both directions, ring wraparound, and full rejection/retry.
+        model_step(
+            &mut model,
+            &mut nodes,
+            &mut objects,
+            owners,
+            known,
+            ModelOperation::Close(1, 2),
+        );
+        for operation in [
+            ModelOperation::SendScalar(0, 0x10),
+            ModelOperation::SendCapability(0),
+            ModelOperation::ReceiveCapability(1),
+            ModelOperation::ReceiveScalar(1),
+            ModelOperation::ReceiveCapability(1),
+            ModelOperation::SendScalar(1, 0x20),
+            ModelOperation::SendCapability(1),
+            ModelOperation::ReceiveCapability(0),
+            ModelOperation::ReceiveScalar(0),
+            ModelOperation::ReceiveCapability(0),
+            ModelOperation::SendScalar(0, 0x30),
+            ModelOperation::SendCapability(0),
+            ModelOperation::SendScalar(0, 0x31),
+            ModelOperation::ReceiveCapability(1),
+            ModelOperation::ReceiveScalar(1),
+            ModelOperation::SendScalar(1, 0x40),
+            ModelOperation::SendScalar(1, 0x41),
+            ModelOperation::ReceiveScalar(0),
+            ModelOperation::ReceiveScalar(0),
+        ] {
+            model_step(
+                &mut model,
+                &mut nodes,
+                &mut objects,
+                owners,
+                known,
+                operation,
+            );
+        }
+
+        let mut random = seed;
+        for index in 0..96 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let side = ((random >> 8) & 1) as usize;
+            let operation = match random % 5 {
+                0 => {
+                    ModelOperation::SendScalar(side, random.rotate_left(index % 63) ^ index as u64)
+                }
+                1 => ModelOperation::ReceiveScalar(side),
+                2 => ModelOperation::SendCapability(side),
+                3 => ModelOperation::ReceiveCapability(side),
+                _ => ModelOperation::Close(side, ((random >> 16) as usize) % 4),
+            };
+            model_step(
+                &mut model,
+                &mut nodes,
+                &mut objects,
+                owners,
+                known,
+                operation,
+            );
+        }
+
+        // Node teardown is modeled as endpoint retirement plus table drainage.
+        for side in 0..2 {
+            nodes.authority_mut(owners[side]).unwrap().terminate();
+            nodes
+                .authority_mut(owners[side])
+                .unwrap()
+                .drain(&mut objects, owners[side])
+                .unwrap();
+            model.discarded[side] += model.queues[side].len as u64;
+            model.queues[side] = ModelQueue::EMPTY;
+            model.live_ends[side] = false;
+            model.tables[side].entries = [None; HANDLES];
+            model.tables[side].live = false;
+            model.verify(&nodes, &objects, owners, known);
+        }
+        assert_eq!(objects.stats(), Stats::default());
+        assert_eq!(
+            objects.channel_state().stats(),
+            crate::channel::Stats::default()
+        );
+    }
+}

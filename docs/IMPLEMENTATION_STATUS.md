@@ -1,5 +1,65 @@
 # Neu Kernel implementation status
 
+## K7 / Phase 7B — capability-transfer lifecycle hardening (2026-10-27)
+
+Phase 7B hardens the Phase 7A ABI 0.5 move-only transfer across sender/receiver
+faults, mixed scalar/capability FIFO traffic and the existing blocking scalar
+wait path. Architecture v0.2, ABI 0.5, the supported Flag/Counter transfer
+subset and all fixed limits remain unchanged. [ADR 0021](adr/0021-capability-transfer-lifecycle-hardening.md)
+records the decisions; [ADR 0020](adr/0020-atomic-capability-moves.md) and
+[experimental ABI 0.5](abi/experimental-v0.5.md) remain the transfer contract.
+
+Wait terminalization preserves `Ready` and `Queued` scheduler states; only a
+`Waiting` Thread becomes `Ready`. This prevents a waiter already admitted to the
+runnable FIFO from being admitted again during terminal cleanup. Settlement
+retains the registration token through its final result and releases the wait
+pin once. The existing scalar wake remains advisory and rechecks peer/FIFO state
+before commit.
+
+The integration fixture fills the same two-entry FIFO, blocks a scalar sender,
+and verifies wake, queue admission, settle-time commit and subsequent capability
+traffic in FIFO order. Controlled Thread faults exercise sender failure before
+commit, sender failure after commit and receiver failure after delivery. A
+double-transfer profile checks repeated ownership relocation within the existing
+table/object bounds. Sender-reclamation gates are published only after
+controller cleanup. Host tests include a seeded mixed-FIFO ownership model,
+generation/exhaustion and reference/pin accounting; QMP reconciles actual move
+records, queue snapshots, wait-witness order, scheduler captures and final
+registry references/pins.
+
+### Phase 7B evidence and limits
+
+| Gate | Result |
+| --- | --- |
+| `make doctor` | Pass; Rust 1.95.0, Python 3.14.7, QEMU 11.0.0 and required target present |
+| `make check` | Pass; formatting and clippy `-D warnings` across configured x86-64 profiles and host library |
+| `make build` | Pass; ordinary ELF64/x86-64 UEFI image, four LOAD segments |
+| Host suite | **210 pass**, 0 failed |
+| `make test` | **131 QEMU scenarios pass**, including new mixed-wait/move and move-fault profiles |
+| xAPIC | Move, sender-fault, receiver-fault and mixed backpressure/wait xAPIC profiles pass |
+| Selected repeats | **6/6 pass**: `cap-moves`, `cap-moves-sender-fault-before`, `cap-moves-receiver-fault-after`, `cap-moves-double`, `cap-moves-backpressure-wait`, and `cap-moves-backpressure-wait-xapic` |
+| Independent clean builds | **2/2 pass**: separate fresh source/target directories each built and QMP-booted the default image |
+
+The `test-cap-moves-terminal-order` Cargo alias selects a mode and controlled
+Thread action, but `tools/neu.py` routes no matching case or independent
+checker. It was not built or executed in this validation and is **unverified**;
+no terminal-order result is claimed. The existing `channels-wait` scenarios
+continue to cover their own terminal/queued-wait behavior. This limitation does
+not make terminal-order part of the supported or validated transfer contract.
+
+Files: `kernel/src/wait.rs`, `kernel/src/capability/tests.rs` and
+`kernel/src/capability/moves_tests.rs` cover waiter terminalization and the
+ownership model; `kernel/src/arch/x86_64/address_space.rs`, `ipc.rs`, `moves.S`
+and `multithread.rs` provide controller settlement, controlled guest scenarios
+and evidence publication.
+`kernel/Cargo.toml` and `tools/neu.py` define/rout the tested profiles and
+independent QMP checks. The full suite result is from the final run after
+correcting user-payload observation routing; no evidence threshold was relaxed.
+
+Hardware, SMP, hosted CI, blocking capability operations, deadlines, variable
+buffers, shared memory, derivation, revocation and terminal-order validation
+remain outside the completed scope.
+
 ## K7 / Phase 7A — atomic move-only capability messages (2026-10-27)
 
 The implementation adds nonblocking movement of explicitly eligible Flag and

@@ -111,14 +111,22 @@ pub fn bootstrap(
             })?;
             let flag = s.objects.flag(true)?;
             let t = model(nodes.authority_mut(owner))?;
-            for (index, rights) in [
-                (0, Rights::INSPECT),
-                (1, Rights::INSPECT),
-                (2, Rights::NONE),
-            ] {
+            for (index, rights) in [(0, Rights::INSPECT), (1, Rights::INSPECT)] {
                 t.install_bootstrap(&mut s.objects, &object, rights, index)?;
             }
-            t.install_bootstrap(&mut s.objects, &flag, Rights::READ, 3)?;
+            #[cfg(feature = "test-cap-moves-double")]
+            {
+                // Same object/reference totals: the third AddressSpace
+                // reference becomes a second movable reference to this Node's
+                // Flag, so two distinct grants can cross one Channel.
+                t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 2)?;
+                t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 3)?;
+            }
+            #[cfg(not(feature = "test-cap-moves-double"))]
+            {
+                t.install_bootstrap(&mut s.objects, &object, Rights::NONE, 2)?;
+                t.install_bootstrap(&mut s.objects, &flag, Rights::READ, 3)?;
+            }
             creators[n * 2] = Some(object);
             creators[n * 2 + 1] = Some(flag);
         }
@@ -255,7 +263,12 @@ pub fn settle(active: ActiveContext) -> cap::Result<Settle> {
         let result = if lease.active() != active || lease.table().id().owner() != active.node {
             Err(cap::Error::Owner)
         } else {
-            Ok(s.objects.settle_wait(active.thread))
+            let settled = s.objects.settle_wait(active.thread);
+            #[cfg(feature = "cap-move-test")]
+            if matches!(settled, Settle::Committed(_)) {
+                super::ipc::mark_wait_settled()?;
+            }
+            Ok(settled)
         };
         s.lease = Some(lease);
         result

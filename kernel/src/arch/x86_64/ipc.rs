@@ -465,8 +465,29 @@ fn move_request(
     if status == cap::Error::Full as i64 {
         s.gates |= 1;
     }
+    if status == BLOCKED {
+        // Deterministic "a scalar wait is now registered" gate for the
+        // backpressure fixture. Scalar waits remain the only blocking ABI.
+        s.gates |= 1 << 25;
+    }
     if op == v05::CHANNEL_SEND_CAP && status == 0 {
         s.gates |= 1 << 26;
+        // Distinguish the two movable Flag grants used by the double-transfer
+        // profile without exposing handles to the ABI.
+        match (frame.registers.rsi as u32).wrapping_sub(1) {
+            2 => s.gates |= 1 << 27,
+            3 => s.gates |= 1 << 28,
+            _ => {}
+        }
+    }
+    if op == v05::TEST_READ && status == 0 {
+        // Controller-only completion gate for profiles that fault a Node after
+        // observing use of a freshly delivered Flag.
+        s.gates |= if active.node == s.a.unwrap() {
+            1 << 29
+        } else {
+            1 << 30
+        };
     }
     let bit = match (op, status) {
         (1, 0) => Some(37),
@@ -480,6 +501,9 @@ fn move_request(
         (v05::TEST_READ, -17) => Some(34),
         (0x14, -36) => Some(35),
         (0x16, -36) => Some(36),
+        (0x17, -37) => Some(38),
+        (0x17, -19) => Some(39),
+        (0x18, -32) => Some(40),
         _ => None,
     };
     publish(s, *r, bit).unwrap_or_else(|_| super::halt());
@@ -487,6 +511,29 @@ fn move_request(
 }
 pub fn gates(_objects: &Objects) -> cap::Result<u64> {
     tx(|s| Ok(s.gates))
+}
+/// Terminal-order gate: published only after the controller has reclaimed the
+/// named Node. Move fixtures use it instead of probing a dead peer with
+/// repeated syscalls, keeping the bounded transaction ledger deterministic.
+#[cfg(feature = "cap-move-test")]
+pub fn mark_reclaimed(node: NodeId) -> cap::Result<()> {
+    tx(|s| {
+        if s.a == Some(node) {
+            s.gates |= 1 << 31;
+        } else if s.b == Some(node) {
+            s.gates |= 1 << 32;
+        } else {
+            return Err(cap::Error::Owner);
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "cap-move-test")]
+pub fn mark_wait_settled() -> cap::Result<()> {
+    tx(|s| {
+        s.gates |= 1 << 34;
+        Ok(())
+    })
 }
 pub fn cleanup(node: NodeId, before: [u64; 22], objects: &Objects) -> cap::Result<()> {
     tx(|s| {

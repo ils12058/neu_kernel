@@ -18,7 +18,7 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("moves.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_move=const cfg!(feature="cap-move-test") as u8,move_discard=const cfg!(feature="test-cap-moves-discard") as u8,ipc_wait=const cfg!(feature="channel-wait-test") as u8,ipc_legacy=const cfg!(feature="test-channels-legacy") as u8,wait_mode=const if cfg!(feature="test-channels-wait-send") {1} else if cfg!(feature="test-channels-wait-fifo") {2} else if cfg!(feature="test-channels-wait-close-receive") {3} else if cfg!(feature="test-channels-wait-close-send") {4} else if cfg!(feature="test-channels-wait-fault") {5} else if cfg!(feature="test-channels-wait-deadlock") {6} else {0},ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,move_disabled=const (cfg!(feature="test-address-space-move-disabled") || cfg!(feature="test-channels-move-disabled") || cfg!(feature="test-channels-wait-move-disabled")) as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="cap-move-test") {abi::v05::INFO}else if cfg!(feature="channel-wait-test") {abi::v04::INFO}else if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("moves.S"),include_str!("multithread.S"),capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_move=const cfg!(feature="cap-move-test") as u8,move_discard=const cfg!(feature="test-cap-moves-discard") as u8,move_mode=const if cfg!(feature="test-cap-moves-sender-fault-before") {7u8} else if cfg!(feature="test-cap-moves-sender-fault") {2u8} else if cfg!(feature="test-cap-moves-receiver-fault-after") {3} else if cfg!(feature="test-cap-moves-double") {4} else if cfg!(feature="test-cap-moves-backpressure-wait") {5} else if cfg!(feature="test-cap-moves-terminal-order") {6} else {0},ipc_wait=const cfg!(feature="channel-wait-test") as u8,ipc_legacy=const cfg!(feature="test-channels-legacy") as u8,wait_mode=const if cfg!(feature="test-channels-wait-send") {1} else if cfg!(feature="test-channels-wait-fifo") {2} else if cfg!(feature="test-channels-wait-close-receive") {3} else if cfg!(feature="test-channels-wait-close-send") {4} else if cfg!(feature="test-channels-wait-fault") {5} else if cfg!(feature="test-channels-wait-deadlock") {6} else {0},ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,move_disabled=const (cfg!(feature="test-address-space-move-disabled") || cfg!(feature="test-channels-move-disabled") || cfg!(feature="test-channels-wait-move-disabled")) as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="cap-move-test") {abi::v05::INFO}else if cfg!(feature="channel-wait-test") {abi::v04::INFO}else if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
@@ -543,6 +543,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
             || cfg!(feature = "test-capabilities-a-fault")
             || cfg!(feature = "test-address-space-a-fault")
             || cfg!(feature = "test-channels-a-fault")
+            || cfg!(feature = "test-cap-moves-sender-fault")
+            || cfg!(feature = "test-cap-moves-sender-fault-before")
         {
             1
         } else if cfg!(feature = "test-threads-a-cross") {
@@ -568,6 +570,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
             || cfg!(feature = "test-address-space-b-fault")
             || cfg!(feature = "test-channels-b-fault")
             || cfg!(feature = "test-cap-moves-discard")
+            || cfg!(feature = "test-cap-moves-receiver-fault-after")
+            || cfg!(feature = "test-cap-moves-terminal-order")
         {
             1
         } else if cfg!(feature = "test-threads-cross") {
@@ -757,6 +761,56 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     return Err(Error::Corrupt);
                 }
                 let count = committed(words[offset], Some(frame))?;
+                #[cfg(feature = "cap-move-test")]
+                if cfg!(feature = "test-cap-moves-sender-fault") && index == 0 {
+                    let gates =
+                        super::address_space::channel_gates().map_err(|_| Error::Corrupt)?;
+                    if gates & (1 << 26) != 0 {
+                        // The capability move has linearized. Let this selected
+                        // A1 reach its configured fault action on the next
+                        // loop boundary, before B is permitted to consume it.
+                        paging.member_limit(
+                            space(&a)?,
+                            members[index].label,
+                            count.checked_add(1).ok_or(Error::Corrupt)?,
+                        )?;
+                        limited[index] = true;
+                    }
+                }
+                #[cfg(feature = "cap-move-test")]
+                if cfg!(feature = "test-cap-moves-sender-fault-before")
+                    && index == 0
+                    && !limited[index]
+                {
+                    let gates =
+                        super::address_space::channel_gates().map_err(|_| Error::Corrupt)?;
+                    if gates & 1 != 0 {
+                        // The preflight Full result proves the sender reached
+                        // the boundary; its test image is now terminally armed
+                        // and cannot issue the later move transaction.
+                        paging.member_limit(
+                            space(&a)?,
+                            members[index].label,
+                            count.checked_add(100_000).ok_or(Error::Corrupt)?,
+                        )?;
+                        limited[index] = true;
+                    }
+                }
+                #[cfg(feature = "cap-move-test")]
+                if cfg!(feature = "test-cap-moves-receiver-fault-after") && index == 2 {
+                    let gates =
+                        super::address_space::channel_gates().map_err(|_| Error::Corrupt)?;
+                    if gates & (1 << 30) != 0 {
+                        // Keep the delivered handle live until B's configured
+                        // user-fault action runs through ordinary Node cleanup.
+                        paging.member_limit(
+                            space(&b)?,
+                            members[index].label,
+                            count.checked_add(1).ok_or(Error::Corrupt)?,
+                        )?;
+                        limited[index] = true;
+                    }
+                }
                 #[cfg(feature = "abi-02")]
                 if paging.member_cap_words(space(&a)?)?[0] == 3
                     && (!cfg!(feature = "test-channels-a-fault")
@@ -904,6 +958,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     paging.destroy_user(s)?;
                     check(nodes.release_space(domain.id, id))?;
                     check(nodes.reclaim(domain.id))?;
+                    #[cfg(feature = "cap-move-test")]
+                    super::ipc::mark_reclaimed(domain.id).map_err(|_| Error::Corrupt)?;
                     serial::write(format_args!(
                         "[NEU] Multi Node reclaimed: node={} final_outcome=retained\n",
                         domain.id.raw()
@@ -916,7 +972,11 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                 for other in 0..3 {
                     if members[other].outcome.is_none() {
                         let domain = if other == 2 { &b } else { &a };
-                        if !limited[other] || queue.len() == 1 {
+                        if !limited[other]
+                            || (queue.len() == 1
+                                && !(cfg!(feature = "test-cap-moves-sender-fault")
+                                    || cfg!(feature = "test-cap-moves-receiver-fault-after")))
+                        {
                             let words = paging.member_words(space(domain)?)?;
                             let count = committed(words[8 + other * 4], members[other].last)?;
                             paging.member_limit(

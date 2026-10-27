@@ -874,6 +874,23 @@ impl Table {
         self.bootstrap[index] = Some(handle);
         Ok(handle)
     }
+    /// Test-profile bootstrap grant of the supported move-only subset. The
+    /// manifest index and capacity checks are identical to `install_bootstrap`.
+    #[cfg(feature = "cap-move-test")]
+    pub fn install_bootstrap_movable(
+        &mut self,
+        objects: &mut Objects,
+        reference: &ObjectRef,
+        rights: Rights,
+        index: usize,
+    ) -> Result<Handle> {
+        if self.sealed || index >= self.bootstrap_limit || self.bootstrap[index].is_some() {
+            return Err(Error::InUse);
+        }
+        let handle = self.grant_movable(objects, reference, rights)?;
+        self.bootstrap[index] = Some(handle);
+        Ok(handle)
+    }
     /// Trusted bootstrap grant for the supported move-only object subset.
     pub fn grant_movable(
         &mut self,

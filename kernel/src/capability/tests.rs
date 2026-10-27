@@ -1926,6 +1926,43 @@ fn a_woken_receiver_drains_a_committed_message_before_observing_peer_close() {
     assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
 }
 
+#[test]
+fn terminalizing_a_queued_waiter_does_not_admit_the_thread_twice() {
+    let (mut n, mut o, a1, _, b1) = waiters();
+    let ah = endpoint(&n, &o, a1.node, 7);
+    let bh = endpoint(&n, &o, b1.node, 6);
+
+    assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
+    let token = o.wait_waiter(a1.thread).unwrap().token;
+    send(&n, &mut o, b1.node, bh, 0x71).unwrap();
+
+    // This is the controller's take-ready boundary: the waiter is now already
+    // admitted to its run queue, but remains in the registry until settlement.
+    let (ready, count) = queued(&mut o);
+    assert_eq!(count, 1);
+    assert_eq!(ready[0].unwrap().thread(), a1.thread);
+    assert_eq!(
+        o.wait_waiter(a1.thread).unwrap().state,
+        crate::wait::State::Queued
+    );
+
+    // Retiring the waited endpoint terminalizes the outstanding registration.
+    // It must not downgrade Queued to Ready, or the next drain would enqueue
+    // the same Thread a second time.
+    close_all(&mut n, &mut o, a1.node);
+    let terminal = o.wait_waiter(a1.thread).unwrap();
+    assert_eq!(terminal.token, token);
+    assert_eq!(terminal.state, crate::wait::State::Queued);
+    assert_eq!(terminal.terminal, Some(Error::PeerClosed));
+    assert_eq!(o.wait_stats().queued, 1);
+    assert_eq!(o.wait_stats().ready, 0);
+    assert_eq!(queued(&mut o).1, 0);
+
+    assert_eq!(o.settle_wait(a1.thread), Settle::Failed(Error::PeerClosed));
+    assert!(o.wait_waiter(a1.thread).is_none());
+    assert_eq!(o.stats().pins, 0);
+}
+
 fn movable_wait_fixture() -> (
     Nodes,
     Objects,

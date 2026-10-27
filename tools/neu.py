@@ -65,9 +65,13 @@ FEATURES.update({name:'test-'+name for name in AS_CASES})
 FEATURES['native-abi02-disabled']='test-native-abi02-disabled'
 NATIVE_CASES['native-abi02-disabled']=1
 IPC_CASES=('channels','channels-legacy','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback','channels-stress')
-WAIT_CASES=('channels-wait','channels-wait-send','channels-wait-fifo','channels-wait-close-receive','channels-wait-close-send','channels-wait-fault','channels-wait-deadlock','channels-wait-xapic','channels-wait-move-disabled')
+WAIT_CASES=('channels-wait','channels-wait-send','channels-wait-fifo','channels-wait-close-receive','channels-wait-close-send','channels-wait-fault','channels-wait-deadlock','channels-wait-xapic','channels-wait-move-disabled','cap-moves-backpressure-wait','cap-moves-backpressure-wait-xapic')
 IPC_CASES+=WAIT_CASES
-MOVE_CASES=('cap-moves','cap-moves-xapic','cap-moves-discard')
+MOVE_CASES=('cap-moves','cap-moves-xapic','cap-moves-discard',
+            'cap-moves-sender-fault','cap-moves-sender-fault-xapic',
+            'cap-moves-sender-fault-before',
+            'cap-moves-receiver-fault-after','cap-moves-receiver-fault-after-xapic',
+            'cap-moves-double','cap-moves-backpressure-wait','cap-moves-backpressure-wait-xapic')
 IPC_CASES+=MOVE_CASES
 IPC_CASES+=('channels-move-disabled',)
 FEATURES.update({name:'test-'+name for name in IPC_CASES})
@@ -1298,8 +1302,8 @@ def check_wait_multi(case,text,symbols,observations,kernel_root,qmp):
     selected=list(re.finditer(r'Multi selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false) peer=(true|false)\n',text))
     if not selected or ready[-1].end()>selected[0].start() or 'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000' not in text:raise Failure('The scheduler did not admit all three before dispatch.')
     peak=re.search(r'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000 allocated=(\d+) free=(\d+) tables=(\d+)',text)
-    if not peak or int(peak[1])!=int(peak[3])+16 or int(peak[3])!=(42 if case=='channels-wait-xapic' else 33):raise Failure('Three-member capacity differs from its bounded accounting design.')
-    exits={'channels-wait':{1:33,2:34,3:49},'channels-wait-xapic':{1:33,2:34,3:49},'channels-wait-send':{1:35,2:34,3:52},'channels-wait-fifo':{1:65,2:66,3:69},'channels-wait-close-receive':{1:37,2:34,3:53},'channels-wait-close-send':{1:38,2:34,3:55},'channels-wait-fault':{2:0,3:56},'channels-wait-deadlock':{}}[case]
+    if not peak or int(peak[1])!=int(peak[3])+16 or int(peak[3])!=(42 if case.endswith('-xapic') else 33):raise Failure('Three-member capacity differs from its bounded accounting design.')
+    exits={'channels-wait':{1:33,2:34,3:49},'channels-wait-xapic':{1:33,2:34,3:49},'channels-wait-send':{1:35,2:34,3:52},'channels-wait-fifo':{1:65,2:66,3:69},'channels-wait-close-receive':{1:37,2:34,3:53},'channels-wait-close-send':{1:38,2:34,3:55},'channels-wait-fault':{2:0,3:56},'channels-wait-deadlock':{},'cap-moves-backpressure-wait':{1:33,2:34,3:49},'cap-moves-backpressure-wait-xapic':{1:33,2:34,3:49}}[case]
     fault_label=2 if case=='channels-wait-fault' else None;deadlock=case=='channels-wait-deadlock'
     by_thread={r['thread']:label for label,r in records.items()}
     woken_events=[(m.start(),int(m[1]),int(m[2]),int(m[3]),int(m[4],0)) for m in re.finditer(r'Multi woken: thread=(\d+) wait=(\d+) kind=(\d+) RIP=(0x[0-9a-f]+)',text)]
@@ -1723,14 +1727,20 @@ def check_ipc_wait(case,text,symbols,members,state):
 
 
 def check_moves(case,text,symbols,members,state):
+    combined_wait=case in ('cap-moves-backpressure-wait','cap-moves-backpressure-wait-xapic')
     owners=[members['threads'][1]['node'],members['threads'][3]['node']]
+    wait_events=members.get('wait_witness',[]) if combined_wait else []
+    wait_cursor=0;wait_trace=[];pending_waits={};wait_pins={};registered_waits=[]
     object_ids=[(kind<<40)|0x100|slot for slot,kind in enumerate((3,2,3,2,4,4),1)]
     tables=[];generations=[[1]*8 for _ in owners]
     for side in range(2):
-        ids=[object_ids[side*2]]*3+[object_ids[side*2+1]]+[object_ids[4+side]]*4
-        tables.append({(1<<32)|(i+1):[obj,[16,16,0,1,224,96,32,64][i],int(i==3)] for i,obj in enumerate(ids)})
+        ids=([object_ids[side*2]]*2+[object_ids[side*2+1]]*2 if case=='cap-moves-double'
+             else [object_ids[side*2]]*3+[object_ids[side*2+1]])+[object_ids[4+side]]*4
+        movable=lambda i: i in ((2,3) if case=='cap-moves-double' else (3,))
+        rights=[16,16,1,1,224,96,32,64] if case=='cap-moves-double' else [16,16,0,1,224,96,32,64]
+        tables.append({(1<<32)|(i+1):[obj,rights[i],int(movable(i))] for i,obj in enumerate(ids)})
     queues=[[],[]];slots=[[None,None],[None,None]];heads=[0,0];tails=[0,0];ends=[0x101,0x102]
-    sent=[0,0];received=[0,0];discarded=[0,0];closed=set();errors=set();moves=[];deliveries=[];reads=[]
+    sent=[0,0];received=[0,0];discarded=[0,0];closed=set();errors=set();moves=[];move_sources=[];deliveries=[];reads=[];cleanups={}
     rows=[list(map(lambda v:int(v,0),line.split(','))) for line in re.findall(r'IPC record: words=([^\n]+)',text)]
     evidence={w[0]:w for w in [list(map(lambda v:int(v,0),line.split(','))) for line in re.findall(r'Move record: words=([^\n]+)',text)]}
     def table_words(side):
@@ -1746,22 +1756,58 @@ def check_moves(case,text,symbols,members,state):
                 if message[0]=='cap':result[message[1]]+=1
         return result
     def objects_words():
-        c=counts();return [v for obj in object_ids for v in ([obj,c[obj],0] if c[obj] else [0,0,0])]
+        c=counts();return [v for obj in object_ids for v in ([obj,c[obj],wait_pins.get(obj,0)] if c[obj] or wait_pins.get(obj,0) else [0,0,0])]
     def qwords(side):return [heads[side],tails[side],len(queues[side]),*[m[1] if m and m[0]=='scalar' else 0 for m in slots[side]]]
     def tags():return [v for side in range(2) for m in slots[side] for v in ([1,m[1],m[2]] if m and m[0]=='cap' else [0,0,0])]
     def snapshot():return [0x101,int(any(ends)),*ends,*owners,*qwords(0),*qwords(1),*sent,*received,*discarded]
     def append(side,message):queues[side].append(message);slots[side][tails[side]]=message;tails[side]=(tails[side]+1)%2
     def pop(side):
         m=queues[side].pop(0);slots[side][heads[side]]=None;heads[side]=(heads[side]+1)%2;received[side]+=1;return m
+    def advance_waits(cursor):
+        nonlocal wait_cursor
+        if cursor<wait_cursor or cursor>len(wait_events):raise Failure('Move ledger regressed or skipped a wait-witness publication.')
+        fresh=wait_events[wait_cursor:cursor];wait_cursor=cursor;wait_trace.extend(fresh)
+        new_registrations=[]
+        for event in fresh:
+            kind=event[0];token=event[4];thread=event[2];node=event[3];ep=event[6];wait_kind=event[7];state_code=event[8];payload=event[11];side=event[12];obj=event[20]
+            if kind==1:
+                if not combined_wait or token in pending_waits or wait_kind!=1 or side!=0 or payload!=33 or ep!=0x101 or event[5]!=0x101 or obj!=object_ids[4] or state_code!=1 or event[9]!=1 or event[10]!=0:
+                    raise Failure('Unexpected or malformed capability-transfer blocking-send registration.')
+                if thread!=members['threads'][1]['thread'] or node!=owners[0]:raise Failure('Blocking transfer wait changed sender identity/ownership.')
+                waiter={'token':token,'thread':thread,'node':node,'endpoint':ep,'kind':wait_kind,'payload':payload,'side':side,'object':obj}
+                pending_waits[token]=waiter;registered_waits.append(waiter);new_registrations.append(waiter)
+            elif kind==6:
+                waiter=pending_waits.pop(token,None)
+                if not waiter or (thread,node,ep,wait_kind,side,obj)!=(waiter['thread'],waiter['node'],waiter['endpoint'],waiter['kind'],waiter['side'],waiter['object']) or state_code!=3 or event[14]!=0:
+                    raise Failure('Wait settlement committed a foreign or non-queued transfer send.')
+                if wait_pins.get(obj,0)!=1:raise Failure('Settled send did not release exactly its endpoint pin.')
+                wait_pins.pop(obj)
+                q=1-side
+                if not ends[q] or len(queues[q])>=2:raise Failure('Settled send did not recheck peer liveness and FIFO capacity.')
+                append(q,('scalar',payload));sent[side]+=1
+        return new_registrations
     def handle_error(side,handle):
         slot=handle&0xffffffff;gen=handle>>32
         return -16 if not 1<=slot<=8 or not gen else -17 if handle not in tables[side] else 0
     for seq,w in enumerate(rows,1):
         if len(w)!=64 or w[0]!=seq:raise Failure('Malformed capability-move transaction ledger.')
         side=owners.index(w[1]);peer=1-side;op,h,value,status,scalar=w[6:11];status=status-(1<<64) if status>>63 else status
+        cursor=w[23]>>1
+        new_waits=advance_waits(cursor) if combined_wait else []
         if w[50:60]!=qwords(0)+qwords(1):raise Failure('Move request before-state lost an earlier committed message.')
         if op==(1<<64)-2:
             if side in closed:raise Failure('Duplicate move Node cleanup.')
+            cleanups[side]=seq
+            if case in ('cap-moves-sender-fault','cap-moves-sender-fault-xapic') and side==0:
+                if queues[1]!=[('scalar',22),('cap',object_ids[1],1)]:raise Failure('Sender fault did not preserve the exact queued scalar/capability FIFO for B.')
+            if case=='cap-moves-sender-fault-before' and side==0:
+                if queues[1]!=[('scalar',22)]:raise Failure('Pre-commit sender fault changed the pending scalar or committed a capability.')
+            if case in ('cap-moves-receiver-fault-after','cap-moves-receiver-fault-after-xapic') and side==1:
+                if not deliveries or deliveries[-1][1]!=1 or deliveries[-1][3]!=object_ids[1] or deliveries[-1][0]>=seq:
+                    raise Failure('Receiver fault did not retain the delivered sender capability through Node cleanup.')
+                delivered_handle=deliveries[-1][2]
+                if delivered_handle not in tables[1] or tables[1][delivered_handle][0]!=object_ids[1]:
+                    raise Failure('Receiver cleanup did not own the delivered capability reference.')
             tables[side].clear();discarded[side]+=len(queues[side]);queues[side].clear();slots[side]=[None,None];heads[side]=tails[side]=0;ends[side]=0;closed.add(side)
         else:
             ev=evidence.get(seq)
@@ -1791,10 +1837,15 @@ def check_moves(case,text,symbols,members,state):
                 if not error:
                     if op in (0x13,0x15,0x17):
                         if not ends[peer]:error=-34
-                        elif len(queues[peer])==2:error=-33
+                        elif len(queues[peer])==2:
+                            error=0x100 if combined_wait and op==0x15 else -33
+                            if error==0x100:
+                                matches=[x for x in new_waits if x['thread']==w[2] and x['kind']==1 and x['payload']==value and x['side']==side]
+                                if len(matches)!=1:raise Failure('Full blocking send did not publish exactly one matching wait registration.')
+                                obj=matches[0]['object'];wait_pins[obj]=wait_pins.get(obj,0)+1
                         else:
                             if op==0x17:
-                                source=tables[side].pop(value);message=('cap',source[0],source[1]);moves.append((seq,side,source[0],source[1]))
+                                source=tables[side].pop(value);message=('cap',source[0],source[1]);moves.append((seq,side,source[0],source[1]));move_sources.append((seq,side,value,source[0],source[1]))
                             else:message=('scalar',value)
                             append(peer,message);sent[side]+=1
                     else:
@@ -1808,18 +1859,50 @@ def check_moves(case,text,symbols,members,state):
                                 tables[side][expected_scalar]=[message[1],message[2],1];deliveries.append((seq,side,expected_scalar,message[1]))
                         else:expected_scalar=pop(side)[1]
             if status!=error or scalar!=expected_scalar:raise Failure(f'Move status/result differs from authorization/FIFO model at {seq}: {status},{scalar} expected {error},{expected_scalar}.')
-            if error:errors.add(error)
+            if error and error!=0x100:errors.add(error)
             if ev[40:72]!=table_words(side) or ev[84:96]!=tags() or ev[114:132]!=objects_words():raise Failure('Move duplicated/lost/amplified a table or queued reference.')
             if w[23]&1 and (seq not in state['native'] or state['native'][seq]['words']!=w or state['native'][seq].get('move')!=ev):raise Failure('Missing paused-CPU move/table/object observation.')
         if w[28:50]!=snapshot() or w[62]!=sum(counts().values()):raise Failure('Move FIFO or reference accounting differs from committed ownership.')
         if any(sent[1-i]!=received[i]+len(queues[i])+discarded[i] for i in (0,1)):raise Failure('Mixed-message conservation failed.')
     if closed!={0,1} or any(queues) or sum(counts().values()):raise Failure('Queued move or handle reference survived final teardown.')
-    if len(moves)!=1 or len(deliveries)!=(0 if case=='cap-moves-discard' else 1):raise Failure('Wrong move/delivery commit count.')
-    if not {-16,-17,-18,-19,-22,-33,-36}<=errors or len(state['native'])<9:raise Failure('Incomplete move authorization/rollback/QMP evidence.')
-    if case!='cap-moves-discard' and not any(side==1 and obj==object_ids[1] for side,obj,_ in reads):raise Failure('No actual receiver use of sender Flag.')
+    if combined_wait:
+        if wait_cursor!=len(wait_events) or pending_waits or wait_pins:raise Failure('Blocking transfer waiter or endpoint pin survived final cleanup.')
+        if [w[0] for w in wait_trace]!=[1,10,2,4,11,13,6] or len(registered_waits)!=1:
+            raise Failure('Mixed-transfer wait did not follow register/block/wake/FIFO-take/resume/commit exactly once.')
+        token=registered_waits[0]['token']
+        if any(w[4]!=token for w in wait_trace) or wait_trace[1][8]!=1 or wait_trace[2][8]!=2 or wait_trace[3][8]!=3 or wait_trace[4][8]!=3 or wait_trace[5][8]!=3 or wait_trace[6][8]!=3:
+            raise Failure('Mixed-transfer wait lifecycle changed token or Waiting/Ready/Queued states.')
+        blocked=members.get('blocked',[]);woken=members.get('woken',[]);settled=members.get('settled',{})
+        if len(blocked)!=1 or blocked[0]['label']!=1 or len(woken)!=1 or woken[0]['label']!=1 or woken[0]['kind']!=1 or len(settled)!=1 or next(iter(settled.values()))!={'label':1,'status':0,'scalar':0}:
+            raise Failure('Scheduler did not capture and settle exactly one backpressured transfer sender.')
+        if sent!=[4,0] or received!=[0,4] or discarded!=[0,0]:raise Failure('Mixed scalar/capability FIFO conservation differs from the expected four-message sequence.')
+        blocked_send=next((r[0] for r in rows if r[6]==0x15 and r[9]==0x100),None)
+        if blocked_send is None or not (blocked_send<moves[0][0]<deliveries[0][0]):
+            raise Failure('Blocking-send commit, capability move, and recipient delivery crossed the required FIFO order.')
+    expected_moves=0 if case=='cap-moves-sender-fault-before' else 2 if case=='cap-moves-double' else 1
+    expected_deliveries=0 if case=='cap-moves-discard' else expected_moves
+    if len(moves)!=expected_moves or len(deliveries)!=expected_deliveries:raise Failure('Wrong move/delivery commit count.')
+    required_errors={-16,-18,-19,-33,-34,-36} if case=='cap-moves-sender-fault-before' else {-16,-17,-18,-19,-33,-36} if combined_wait else {-16,-17,-18,-19,-22,-33,-36}
+    minimum_probes=4 if case=='cap-moves-sender-fault-before' else 9
+    if not required_errors<=errors or len(state['native'])<minimum_probes:raise Failure('Incomplete move authorization/rollback/QMP evidence.')
+    if case not in ('cap-moves-discard','cap-moves-sender-fault-before') and not any(side==1 and obj==object_ids[1] for side,obj,_ in reads):raise Failure('No actual receiver use of sender Flag.')
     if case=='cap-moves-discard' and discarded[1]!=2:raise Failure('Fault did not discard exactly the queued capability and pending scalar.')
+    if case in ('cap-moves-sender-fault','cap-moves-sender-fault-xapic'):
+        if not (moves[0][0]<cleanups.get(0,0)<deliveries[0][0]) or discarded!=[0,0]:raise Failure('Sender reclamation did not precede delivery, or altered the preserved transfer queue.')
+        if 'Multi outcome: label=1' not in text or 'reason=fault' not in text or 'Multi outcome: label=3' not in text or 'reason=normal' not in text:raise Failure('Sender-fault profile did not produce the expected controlled fault and receiver completion.')
+    if case=='cap-moves-sender-fault-before':
+        closed_receive=[w for w in rows if w[6]==0x14 and (w[9]-(1<<64) if w[9]>>63 else w[9])==-34]
+        if moves or deliveries or discarded!=[1,0] or not closed_receive or cleanups.get(0,0)>=closed_receive[0][0]:raise Failure('Pre-commit sender fault crossed the transfer boundary or lost exact peer-close/discard accounting.')
+        if 'Multi outcome: label=1' not in text or 'reason=fault' not in text:raise Failure('Pre-commit sender fault was not captured by the controlled Thread fault action.')
+    if case in ('cap-moves-receiver-fault-after','cap-moves-receiver-fault-after-xapic'):
+        receiver_reads=[seq for side,obj,seq in reads if side==1 and obj==object_ids[1]]
+        if not (moves[0][0]<deliveries[0][0]<min(receiver_reads)<cleanups.get(1,0)) or discarded!=[0,1]:raise Failure('Receiver fault did not follow delivery/use and discard exactly its pending scalar.')
+        if 'Multi outcome: label=3' not in text or 'reason=fault' not in text:raise Failure('Receiver-fault profile did not capture the controlled post-delivery fault.')
+    if case=='cap-moves-double':
+        if move_sources[0][2]==move_sources[1][2] or move_sources[0][3:]!=move_sources[1][3:]:raise Failure('Double transfer did not move two distinct grants to the same object with identical rights.')
+        if not (moves[0][0]<deliveries[0][0]<moves[1][0]<deliveries[1][0]) or deliveries[0][2]==deliveries[1][2]:raise Failure('Double-transfer FIFO/delivery ordering or recipient generations were not distinct.')
     if not any(p['words'][6]==1 and p['words'][10]==0x5000000ff for p in state['native'].values()):raise Failure('Missing QMP ABI 0.5 query result.')
-    return {'moves':moves,'deliveries':deliveries,'reads':reads,'errors':sorted(errors),'sent':sent,'received':received,'discarded':discarded,'qmp_probes':len(state['native']),'records':len(rows),'final_references':0,'final_observed_objects':state['final_move_accounting']}
+    return {'moves':moves,'move_sources':move_sources,'deliveries':deliveries,'reads':reads,'cleanups':cleanups,'errors':sorted(errors),'sent':sent,'received':received,'discarded':discarded,'qmp_probes':len(state['native']),'records':len(rows),'final_references':0,'final_observed_objects':state['final_move_accounting']}
 
 
 def check_ipc(case,text,symbols,members,state):
@@ -1916,6 +1999,14 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
     probe_prefix='neu_ipc' if ipc else 'neu_as' if abi02 else 'neu_cap'
     root,bottom,top,initial=tuple(record[k] for k in ('root','bottom','top','initial_rsp'))
     local_rsp=initial-64;user_base=initial&~4095;seed=record['seed'];label=record['label']
+    body_name='neu_ipc_user_steps' if ipc else 'neu_as_user_steps' if abi02 else 'neu_cap_user_steps'
+    body_start=multi_site(symbols,body_name) if body_name in symbols else None
+    loop_start=multi_site(symbols,'neu_multi_loop');loop_end=multi_site(symbols,'neu_multi_loop_end')
+    payload_end=multi_site(symbols,'neu_multi_payload_end')
+    def user_payload(rip,rsp):
+        in_loop=loop_start<=rip<loop_end and rsp==local_rsp
+        in_operation=body_start is not None and body_start<=rip<payload_end and user_base<=rsp<=local_rsp
+        return in_loop or (cap_state is not None and in_operation)
     result={'sequence':sequence,'label':label,'root':root,'bottom':bottom,'top':top,'initial_rsp':initial}
     markers=[v^seed for v in (0x11225566778899aa,0xaabbccddeeff1234,0x1234567887654321)]
     reg_order=('R15','R14','R13','R12','R11','R10','R9','R8','RDI','RSI','RBP','RDX','RCX','RBX','RAX')
@@ -1928,7 +2019,7 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
             hint=qmp.call('human-monitor-command',{'command-line':'info registers'})
             hint_rip=native_register(hint,'RIP');wanted=False
             if native_register(hint,'CR3')==root:
-                wanted=('restore' not in result and symbols['neu_preempt_restore_wait']<=hint_rip<symbols['neu_preempt_restore_wait_end']) or ('user' not in result and 'CPL=3' in hint and multi_site(symbols,'neu_multi_loop')<=hint_rip<multi_site(symbols,'neu_multi_loop_end') and native_register(hint,'RSP')==local_rsp) or ('irq' not in result and symbols['neu_preempt_irq_wait']<=hint_rip<symbols['neu_preempt_irq_wait_end'])
+                wanted=('restore' not in result and symbols['neu_preempt_restore_wait']<=hint_rip<symbols['neu_preempt_restore_wait_end']) or ('user' not in result and 'CPL=3' in hint and user_payload(hint_rip,native_register(hint,'RSP'))) or ('irq' not in result and symbols['neu_preempt_irq_wait']<=hint_rip<symbols['neu_preempt_irq_wait_end'])
                 if symbols[probe_prefix+'_request_wait']<=hint_rip<symbols[probe_prefix+'_request_wait_end']:
                     wanted=debug_words(qmp,symbols[probe_prefix+'_witness'],1)[0] not in cap_state['native']
             if not wanted:
@@ -1944,7 +2035,7 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
                 if seq not in cap_state['native']:cap_state['native'][seq]=(observe_ipc_request if ipc else observe_as_request if abi02 else observe_cap_request)(qmp,cpu,symbols,record)
                 continue
             if symbols['neu_preempt_restore_wait']<=rip<symbols['neu_preempt_restore_wait_end'] and reg('RSP')==top-160:stage='restore'
-            elif 'CPL=3' in cpu and multi_site(symbols,'neu_multi_loop')<=rip<multi_site(symbols,'neu_multi_loop_end') and reg('RSP')==local_rsp:stage='user'
+            elif 'CPL=3' in cpu and user_payload(rip,reg('RSP')):stage='user'
             elif symbols['neu_preempt_irq_wait']<=rip<symbols['neu_preempt_irq_wait_end'] and reg('RSP')==top-176:stage='irq'
             if stage is None or stage in result:continue
             if reg('CR0')&10!=10 or reg('CR4')&0x50600 or reg('EFER')&1!=1 or not re.search(r'FS =0000 0000000000000000',cpu) or not re.search(r'GS =0000 0000000000000000',cpu):raise Failure('Unsupported CPU/TLS/extended state in member execution.')
@@ -2015,7 +2106,7 @@ def observe_multi(qmp,serial,symbols,start,sequence,record,deadline,cap_state=No
     return result
 
 
-def check_multi(case,text,symbols,observations,kernel_root,qmp,capabilities=False):
+def check_multi(case,text,symbols,observations,kernel_root,qmp,capabilities=False,xapic=False):
     calibrated=re.search(r'Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=10000',text)
     if not calibrated:raise Failure('Missing three-Thread 10 ms calibration.')
     hz,ref,a,b,c,divided,initial=map(int,calibrated.groups())
@@ -2034,7 +2125,7 @@ def check_multi(case,text,symbols,observations,kernel_root,qmp,capabilities=Fals
     selected=list(re.finditer(r'Multi selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false) peer=(true|false)\n',text))
     if not selected or ready[-1].end()>selected[0].start() or 'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000' not in text:raise Failure('The scheduler did not admit all three before dispatch.')
     peak=re.search(r'Multi three runnable: order=1,3,2 pins=2,1 data_owners=16 quantum_us=10000 allocated=(\d+) free=(\d+) tables=(\d+)',text)
-    if not peak or int(peak[1])!=int(peak[3])+16 or int(peak[3])!=(42 if case=='threads-xapic' else 33):raise Failure('Three-member capacity differs from its bounded accounting design.')
+    if not peak or int(peak[1])!=int(peak[3])+16 or int(peak[3])!=(42 if xapic or case=='threads-xapic' else 33):raise Failure('Three-member capacity differs from its bounded accounting design.')
     calibration={'samples':[a,b,c],'divided_hz':divided,'initial':initial}
     fifo=[1,3,2];saved={};suspended_counts={};code_frames={};outcomes={};captures={1:0,2:0,3:0};last_work={1:0,2:0,3:0};events=[];order=[];shared_audits=[];user_samples=[];node_results={}
     fault_label={'threads-a1-fault':1,'threads-a2-fault':2,'threads-b-fault':3,'threads-cross':3,'threads-a-cross':1,'threads-stack':1,'threads-user-guard':2,'threads-return-stack':2}.get(case)
@@ -2133,7 +2224,10 @@ def check_multi(case,text,symbols,observations,kernel_root,qmp,capabilities=Fals
         shared_audits.append(list(map(int,audits[0])))
     if fifo or set(outcomes)!={1,2,3} or len(node_results)!=2 or order[:6]!=[1,3,2,1,3,2]:raise Failure('Missing repeated three-Thread preemption or terminal/empty completion.')
     minimum=1 if case=='threads-return-stack' else 4
-    if min(captures.values())<minimum or any(sum(row['label']==label for row in user_samples)<(1 if case=='threads-return-stack' and label==2 else 2) for label in (1,2,3)):raise Failure('Insufficient actual interrupted/resumed CPU observations for all three members.')
+    user_counts={label:sum(row['label']==label for row in user_samples) for label in (1,2,3)}
+    if min(captures.values())<minimum or any(user_counts[label]<(1 if case=='threads-return-stack' and label==2 else 2) for label in (1,2,3)):
+        stages={seq:sorted(obs) for seq,obs in observations.items()}
+        raise Failure(f'Insufficient actual interrupted/resumed CPU observations for all three members: captures={captures}, user_samples={user_counts}, observed_stages={stages}.')
     if not capabilities and not any(not e['switched'] for e in events):raise Failure('Missing direct hardware return for the final runnable member.')
     if case=='threads-rollback':
         budgets=re.findall(r'Multi rollback: budget=(\d+) accounting=restored sibling_contexts=unchanged pins=1,1',text)
@@ -2574,7 +2668,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -2652,7 +2746,7 @@ def run_case(case, esp, timeout):
                             if sequence not in multi_observations and re.search(r"Switch native ready:.*fresh=(true|false)\n",episode):
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,{**records[label],'peer':selected[8]=='true'},started+timeout,cap_state)
-                    time.sleep(0.01 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else 0.05)
+                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -2702,11 +2796,11 @@ def run_case(case, esp, timeout):
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
-                member_case={'cap-moves-xapic':'threads-xapic','cap-moves-discard':'threads-b-fault','capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault','channels-xapic':'threads-xapic','channels-a-fault':'threads-a1-fault','channels-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES or case in IPC_CASES else case)
+                member_case={'cap-moves-xapic':'threads-xapic','cap-moves-discard':'threads-b-fault','cap-moves-sender-fault':'threads-a1-fault','cap-moves-sender-fault-xapic':'threads-a1-fault','cap-moves-sender-fault-before':'threads-a1-fault','cap-moves-receiver-fault-after':'threads-b-fault','cap-moves-receiver-fault-after-xapic':'threads-b-fault','capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault','channels-xapic':'threads-xapic','channels-a-fault':'threads-a1-fault','channels-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES or case in IPC_CASES else case)
                 if case in WAIT_CASES:
                     members=check_wait_multi('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,multi_observations,paging["root"],qmp)
                 else:
-                    members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES or case in IPC_CASES) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else None
+                    members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES or case in IPC_CASES,case.endswith('-xapic')) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else None
                 if case in MOVE_CASES:
                     addresses=debug_words(qmp,symbols['neu_move_witness']+136*8,18)
                     final=[]
@@ -2725,7 +2819,7 @@ def run_case(case, esp, timeout):
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
                 capabilities=check_capabilities(case,text,symbols,members,cap_state) if case in CAP_CASES else None
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
-                ipc=check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
+                ipc=check_ipc(case,text,symbols,members,cap_state) if case in MOVE_CASES else check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)

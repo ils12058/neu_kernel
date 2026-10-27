@@ -413,7 +413,13 @@ impl Waits {
             return false;
         }
         waiter.terminal = Some(error);
-        waiter.state = State::Ready;
+        // A waiter already admitted to the run queue (Ready/Queued) keeps its
+        // state. Downgrading Queued to Ready would let drain_ready admit the
+        // same Thread twice and fail the scheduler's InUse check. Only a
+        // Waiting registration needs a fresh admission here.
+        if waiter.state == State::Waiting {
+            waiter.state = State::Ready;
+        }
         let copy = *waiter;
         #[cfg(feature = "channel-wait-test")]
         self.witness(witness::TERMINAL, Some(copy), error as i64);

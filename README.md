@@ -5,24 +5,26 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K7 / Phase 7A adds atomic move-only transfer of Flag/Counter authority through
-the existing bounded Channel. A successful send invalidates one source handle
-and queues its owned reference; a later receive installs a fresh Node-local
-handle with unchanged rights. Full, wrong-kind and recipient-capacity failures
-preserve the corresponding ownership. K6B scalar blocking IPC, scheduler
-wait/wake and cancellation remain supported.
+K7 / Phase 7B hardens atomic move-only Flag/Counter transfer across fault and
+wait/wake boundaries. The existing two-slot FIFO retains mixed scalar/capability
+order, and blocking scalar senders recheck at settlement after a wake. Sender
+failure before commit creates no queued authority; after commit, queued ownership
+survives sender cleanup. Receiver cleanup and fresh Node-local handle generations
+remain accounted. No ABI, architecture or fixed resource limits changed.
 
 **Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
 
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) records the executed
-validation, including the 190-host/115-QEMU K6B baseline and new movement tests.
-Current results are **208 host tests, 123 QEMU scenarios**, six repeat runs and
-two independent clean-directory builds/QMP boots.
+validation, including the 190-host/115-QEMU K6B baseline and the later K7 runs.
+Current results are **210 host tests and 131 QEMU scenarios**, six selected
+repeat runs and two independent clean-directory builds/QMP boots.
 [Experimental ABI 0.5](docs/abi/experimental-v0.5.md) adds nonblocking capability
 send/receive while retaining ABI 0.1–0.4 configurations.
-[ADR 0020](docs/adr/0020-atomic-capability-moves.md) records the transfer,
-queued-reference, capacity, mixed-message and cleanup decisions. Architecture
-v0.2 and earlier accepted ADR rationale remain intact.
+[ADR 0020](docs/adr/0020-atomic-capability-moves.md) records the transfer
+contract; [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md)
+records lifecycle and fault-boundary hardening. The terminal-order test alias
+remains explicitly unverified. Architecture v0.2 and earlier accepted ADR
+rationale remain intact.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private
@@ -66,8 +68,14 @@ closure, `--case channels-wait-fault` for Node-fault cancellation, or
 `--case channels-legacy` rechecks immediate ABI 0.3 behavior, and
 `--case native-abi04-disabled` checks legacy rejection of the blocking operations.
 Run `--case cap-moves` for Ring 3 move, Full rollback, recipient-capacity retry
-and mixed FIFO evidence; `--case cap-moves-discard` for receiver-fault reference
-cleanup; or `--case cap-moves-xapic` for xAPIC. The `native-move-send-disabled`,
+and mixed FIFO evidence; `--case cap-moves-sender-fault-before` and
+`--case cap-moves-sender-fault` for pre/post-commit sender faults;
+`--case cap-moves-receiver-fault-after` for post-delivery cleanup;
+`--case cap-moves-double` for repeated ownership transfer; and
+`--case cap-moves-backpressure-wait` (or `-xapic`) for mixed FIFO plus blocking
+scalar wait/wake/settlement. `--case cap-moves-discard` and `--case cap-moves-xapic`
+retain their receiver-cleanup and controller-fallback profiles. The
+`native-move-send-disabled`,
 `native-move-receive-disabled`, `address-space-move-disabled`,
 `channels-move-disabled` and `channels-wait-move-disabled` images test rejection
 of movement by earlier ABI versions.
@@ -94,6 +102,7 @@ Run `python3 tools/neu.py test --case switch` for cooperative switching,
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
 - [Experimental blocking Channel ABI 0.4](docs/abi/experimental-v0.4.md)
+- [Experimental capability-move ABI 0.5](docs/abi/experimental-v0.5.md)
 - [Experimental scalar Channel ABI 0.3](docs/abi/experimental-v0.3.md)
 - [Experimental native ABI 0.2](docs/abi/experimental-v0.2.md)
 - [Architecture Decision Records](docs/adr/README.md)

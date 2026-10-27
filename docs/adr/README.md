@@ -220,3 +220,14 @@ quiescence. Capability movement and revocation remain future work.
 ADR 0020 extends the existing FIFO with owned capability messages and separate
 sender/receiver commits. It preserves prior ADR rationale and does not accept
 AddressSpace/endpoint transfer, derivation or revocation proposals.
+
+## Phase 7B record — transfer lifecycle hardening
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0021: Capability-transfer lifecycle hardening](0021-capability-transfer-lifecycle-hardening.md) | Accepted, bounded single-CPU lifecycle scope; terminal-order scenario explicitly unverified | NEU-005/006/007/008/009/010/011/013/014/021/023/024 scoped subsets |
+
+ADR 0021 hardens fault/commit boundaries, mixed scalar and capability FIFO
+ordering, blocking scalar wait settlement and exactly-once scheduler admission.
+It does not change the ABI or fixed limits. The separate terminal-order alias is
+not routed or QMP-validated and is not claimed by this record.
