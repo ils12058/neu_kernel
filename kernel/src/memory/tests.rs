@@ -191,3 +191,25 @@ fn fully_reserved_usable_span_is_an_empty_pool_not_an_allocatable_frame() {
     assert_eq!(allocator.allocate(), Err(FrameError::Exhausted));
     assert_eq!(allocator.free(0x1000), Err(FrameError::NotAllocatable));
 }
+
+#[test]
+fn batch_free_preflight_is_atomic_and_rejects_double_free() {
+    let regions = [r(0x1000, 8, 0)];
+    let map = MemoryMap::new(&regions, outside()).unwrap();
+    let mut bitmap = [0; 1];
+    let mut allocator = FrameAllocator::new(&map, &mut bitmap).unwrap();
+    let a = allocator.allocate().unwrap();
+    let b = allocator.allocate().unwrap();
+    let before = allocator.stats();
+    assert_eq!(allocator.free_batch(&[a, a]), Err(FrameError::NotAllocated));
+    assert_eq!(allocator.stats(), before);
+    assert_eq!(
+        allocator.free_batch(&[a, 0x123]),
+        Err(FrameError::Misaligned)
+    );
+    assert_eq!(allocator.stats(), before);
+    allocator.free_batch(&[a, b]).unwrap();
+    assert_eq!(allocator.stats().allocated, 0);
+    assert_eq!(allocator.free_batch(&[a]), Err(FrameError::NotAllocated));
+    assert_eq!(allocator.allocate(), Ok(a));
+}

@@ -233,8 +233,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         for budget in 0..64 {
             match paging.prepare_user(bytes, kind, Some(budget)) {
                 Err(Error::Exhausted) => failures += 1,
-                Ok(space) => {
-                    paging.destroy_user(space)?;
+                Ok(mut space) => {
+                    paging.destroy_user(&mut space)?;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -249,7 +249,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         ))
         .map_err(|_| Error::Corrupt)?;
     }
-    let space = paging.prepare_user(bytes, kind, None)?;
+    let mut space = paging.prepare_user(bytes, kind, None)?;
     exceptions::configure_user_test(true)?;
     // SAFETY: No user execution or boundary can run until the subsequent IRETQ.
     unsafe {
@@ -275,7 +275,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     exceptions::configure_user_test(false)?;
     paging.deactivate_user(&space)?;
     let valid = VALID.load(Ordering::Relaxed) && paging.user_result(&space)? == 42;
-    paging.destroy_user(space)?;
+    paging.destroy_user(&mut space)?;
     serial::write(format_args!(
         "[NEU] User teardown verified: kernel root restored, frames and tables restored\n"
     ))

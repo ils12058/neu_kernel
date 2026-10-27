@@ -1,6 +1,49 @@
 # Neu Kernel implementation status
 
-## K8 / Phase 8A-1 — partial MemoryObject foundation
+## K8 / Phase 8A-1 completion work — still partial
+
+`UserSpace` teardown now borrows its owning token, preserving it on preflight
+rejection and marking it unusable once destructive teardown starts. Node
+controllers do not drop their option until successful destruction. Shared
+records for that space are preflighted against their objects, frames, leaves and
+owned table inventory, then their leaves are removed and invalidated before
+records and private resources are reclaimed. No foreign space mappings are
+removed. Intermediate tables remain in the owning teardown inventory. A backend
+failure after mutation is fail-stop; no arbitrary corruption recovery is claimed.
+
+MemoryObject collection validates all frame identities and the allocator bitmap
+before committing a batch release. The exclusive, single-CPU borrow covers the
+commit; unexpected inconsistency after commit is fail-stop. Allocator batch errors
+leave the bitmap unchanged. Multi-page mapping rollback and table cleanup also
+fail-stop on unexpected backend errors.
+
+The existing `nodes` test image now runs a trusted kernel-side fixture with two
+actual roots, two zeroed physical pages, RW and R mappings, creator release,
+active/pinned/root-reference and invalid-root preflight rejection, retry, both
+teardown orders, surviving backing and final accounting. The `paging` image
+checks recycled object backing is zeroed. This is guest-side evidence; QMP does
+not independently observe the fixture's PTEs or registry fields. General
+mapping with newly allocated user table inventory, independent cross-root QMP
+verification, and Ring 3 sharing remain unimplemented. Thus Phase 8A-1 is
+**still incomplete**, and ADR 0022 remains proposed.
+
+Validation: `make doctor`, `make check`, `make build`, and `make test` passed.
+The full suite passed **222 host tests and 132 QEMU scenarios**, including the
+existing K7 terminal-order, Node-fault and user-isolation cases. Four new host
+tests cover atomic allocator batch rejection and release, shared-leaf teardown
+and pinned/wrong-root preflight, and fail-stop behavior on an injected rollback
+failure. Focused MemoryObject tests were repeated. Two separate clean source
+and Cargo target directories built and ran the existing Node case sequentially,
+using the pinned bootloader cache; they are repeats, not new scenarios. The
+QMP Node checker observes the existing execution and halt boundaries; it does
+not independently inspect the new fixture's shared PTEs, object metadata or
+allocator bitmap. Evidence is under `build/k8a1-completion-*.log` and
+`build/test-logs/`. The earlier intermittent `user-kernel` failure remains
+unexplained; its case passed this run. No hosted CI or physical hardware is
+claimed.
+
+## K8 / Phase 8A-1 — prior partial MemoryObject foundation (historical)
+
 
 The paging registry now distinguishes private Space-owned frames from frames
 owned by a generation-checked, one- or two-page MemoryObject. Trusted setup can
@@ -42,9 +85,9 @@ repeats, not additional scenarios. Evidence: `build/k8a1-doctor.log`,
 run is claimed. The previously intermittent `user-kernel` case passed here;
 its earlier failure's cause remains unconfirmed.
 
-The destructor currently consumes its `UserSpace` argument even when it rejects
+At that baseline the destructor consumed its `UserSpace` argument even when it rejected
 shared mappings, so this guard is fail-closed but is not a retryable teardown
-protocol. A future implementation must retain the teardown token on failure.
+protocol. The subsequent completion work above changes this contract.
 
 ## K8 / Phase 8A — K7 terminal-order gate (historical baseline)
 

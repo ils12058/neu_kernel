@@ -10,6 +10,7 @@ struct Model {
     detached: BTreeMap<u64, usize>,
     invalidated: Vec<u64>,
     released: usize,
+    fail_clear: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -22,6 +23,7 @@ impl Model {
             detached: BTreeMap::new(),
             invalidated: Vec::new(),
             released: 0,
+            fail_clear: false,
         }
     }
 }
@@ -77,6 +79,9 @@ impl TableMemory for Model {
             .ok_or(Error::NotOwned)
     }
     fn write(&mut self, table: u64, index: usize, value: u64) -> Result<()> {
+        if value == 0 && self.fail_clear {
+            return Err(Error::Corrupt);
+        }
         let page = self.pages.get_mut(&table).ok_or(Error::NotOwned)?;
         let old = *page.1.get(index).ok_or(Error::Address)?;
         self.clock += 1;
@@ -1716,4 +1721,85 @@ fn memory_object_mapping_prevents_space_retirement_until_detached() {
         map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::R),
         Err(Error::NotOwned)
     );
+}
+
+#[test]
+fn memory_object_teardown_leaf_removal_retains_table_inventory() {
+    let (mut r, mut m, a, b, sa, sb, frames, obj) = object_fixture();
+    let aa = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    let ab = r.authorize_memory_mapping(obj, sb, false).unwrap();
+    map_memory_object(&a, &mut m, &mut r, &aa, 0, 0x410000, 2, Permissions::RW).unwrap();
+    map_memory_object(&b, &mut m, &mut r, &ab, 0, 0x420000, 2, Permissions::R).unwrap();
+    let tables = m.pages.len();
+    r.release_memory_object(obj).unwrap();
+    for i in 0..2 {
+        validate_memory_object_mapping(&a, &m, &r, sa, 0x410000 + i * PAGE).unwrap();
+    }
+    for i in 0..2 {
+        unmap_memory_object_preserving_tables(&a, &mut m, &mut r, sa, 0x410000 + i * PAGE).unwrap();
+    }
+    assert_eq!(m.pages.len(), tables);
+    assert_eq!(r.memory_object_counts(obj), Ok((0, 2, 2)));
+    assert_eq!(
+        b.translate(&m, 0x420000).unwrap().unwrap().physical,
+        r.physical(frames[0]).unwrap()
+    );
+    assert_eq!(
+        unmap_memory_object_preserving_tables(&a, &mut m, &mut r, sa, 0x410000),
+        Err(Error::NotMapped)
+    );
+    assert_eq!(r.collectible_memory_object(obj), Err(Error::InUse));
+    for i in 0..2 {
+        unmap_memory_object_preserving_tables(&b, &mut m, &mut r, sb, 0x420000 + i * PAGE).unwrap();
+    }
+    assert_eq!(
+        r.collectible_memory_object(obj),
+        Ok([Some(frames[0]), Some(frames[1])])
+    );
+    r.collect_memory_object(obj).unwrap();
+    assert_eq!(r.collectible_memory_object(obj), Err(Error::NotOwned));
+}
+
+#[test]
+fn memory_object_teardown_preflight_rejects_pins_and_wrong_root_without_mutation() {
+    let (mut r, mut m, a, b, sa, _, _, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::RW).unwrap();
+    assert_eq!(
+        validate_memory_object_mapping(&b, &m, &r, sa, 0x410000),
+        Err(Error::NotOwned)
+    );
+    r.pin_space(sa).unwrap();
+    assert_eq!(
+        unmap_memory_object_preserving_tables(&a, &mut m, &mut r, sa, 0x410000),
+        Err(Error::InUse)
+    );
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 1, 2)));
+    assert!(a.translate(&m, 0x410000).unwrap().is_some());
+    r.unpin_space(sa).unwrap();
+    unmap_memory_object_preserving_tables(&a, &mut m, &mut r, sa, 0x410000).unwrap();
+}
+
+#[test]
+fn memory_object_rollback_backend_failure_is_fail_stop() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let authority = r.authorize_memory_mapping(obj, sa, true).unwrap();
+    m.budget = Some(3);
+    m.fail_clear = true;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &authority,
+            0,
+            0x5ff000,
+            2,
+            Permissions::RW,
+        );
+    }));
+    assert!(failure.is_err());
+    // The exposed host model is deliberately poisoned, not reusable. No
+    // mapping metadata was published before the fail-stop.
+    assert_eq!(r.memory_object_counts(obj), Ok((1, 0, 2)));
 }

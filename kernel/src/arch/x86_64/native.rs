@@ -632,16 +632,16 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     }
     // SAFETY: Linker-bounded immutable kernel R/NX fixture bytes, never user data.
     let bytes = unsafe { core::slice::from_raw_parts(ptr::addr_of!(neu_native_payload), length) };
-    let space = paging.prepare_user(bytes, kind, None)?;
+    let mut space = paging.prepare_user(bytes, kind, None)?;
     if let Err(error) = exceptions::configure_native(true) {
-        paging.destroy_user(space)?;
+        paging.destroy_user(&mut space)?;
         return Err(error);
     }
     let old = match configure() {
         Ok(old) => old,
         Err(error) => {
             exceptions::configure_native(false)?;
-            paging.destroy_user(space)?;
+            paging.destroy_user(&mut space)?;
             return Err(error);
         }
     };
@@ -669,7 +669,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         ACTIVE.store(false, Ordering::Relaxed);
         restore(old)?;
         exceptions::configure_native(false)?;
-        paging.destroy_user(space)?;
+        paging.destroy_user(&mut space)?;
         return Err(Error::Corrupt);
     }
     paging.activate_user(&space)?;
@@ -679,7 +679,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
     paging.deactivate_user(&space)?;
     let s = session();
     let data = paging.user_result(&space)?;
-    paging.destroy_user(space)?;
+    paging.destroy_user(&mut space)?;
     serial::write(format_args!(
         "[NEU] Native teardown verified: kernel root restored, MSRs and accounting restored\n"
     ))

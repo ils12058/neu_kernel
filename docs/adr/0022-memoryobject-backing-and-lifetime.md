@@ -59,16 +59,53 @@ tracked asynchronous operation pin in this slice.
 Host tests exercise real registry and page-tree transactions with a simulated
 table backend. The existing kernel paging self-test adopts frames allocated and
 zeroed by the real backend, checks object ownership and returns them to its
-normal free path. The kernel `UserSpace` destructor refuses to run while any
-MemoryObject mapping is present; it does not yet detach those leaves, and its
+normal free path. At the initial partial implementation, the kernel `UserSpace` destructor refused to run while any
+MemoryObject mapping was present; it does not yet detach those leaves, and its
 consumed input is not returned on failure, so this is not a retryable teardown. The backend collection path is not recoverable after unexpected allocator
 corruption during physical frees, and actual user-space mapping teardown is not
 yet integrated. QMP has not independently inspected MemoryObject state,
 and no Ring 3 cross-Node shared-memory or hardware permission claim is made.
-These gaps keep this record proposed and Phase 8A-1 incomplete. ABI 0.5 and
-architecture v0.2 remain unchanged.
+These were the original gaps. The 2026-10-28 update below supersedes these implementation details; the decision remains proposed pending its independent QMP evidence and remaining integration. ABI 0.5 and architecture v0.2 remain unchanged.
 
 ## History
 
 - 2026-10-27: Proposed initial ownership and mapping ledger; integration and
   independent runtime evidence remain outstanding.
+
+
+## 2026-10-28: Teardown and batch-reclamation update
+
+A borrowed, non-copyable `UserSpace` token now remains with its owner when
+preflight rejects a wrong root, active or pinned space, outstanding AddressSpace
+reference, or live Thread stack. Node controller call sites retain their owning
+option until teardown succeeds. Once destructive teardown starts the token is
+marked started; unexpected errors cause a kernel panic/halt, not a retryable
+result. Successful completion marks it finished, and reuse is rejected.
+
+Preflight enumerates only this space's object mapping records, checks each
+object/frame generation, permissions and actual leaf, and verifies that every
+walk table is in the space's existing table inventory. It then detaches leaves,
+invalidates each VA, retires each mapping record and finally performs the
+existing private-frame/table and SpaceId reclamation. Shared-leaf removal keeps
+intermediate tables in the original inventory until whole-root teardown, so it
+cannot silently invalidate the workspace aliases or free a table twice. This
+slice does not provide a general backend mapping API that extends the inventory;
+the controlled kernel fixture maps only into already owned user leaf tables.
+
+Object collection first validates the object, absence of references, each live
+frame and the allocator bitmap for the entire batch. The registry then transfers
+the object frames to kernel ownership and retires the object, after which the
+validated allocator batch is freed and frame identities retired. The exclusive
+single-CPU borrow prevents changes between preflight and commit. Unexpected
+post-commit inconsistency panics; it is not a recoverable partial release.
+FrameAllocator batch validation rejects duplicates and invalid entries without
+changing its bitmap. Map rollback and post-leaf unmap cleanup likewise fail-stop
+if backend cleanup fails rather than returning a misleading ordinary error.
+
+A trusted `test-nodes` guest fixture tests real zeroed two-page backing mapped
+RW in one root and R in a second, both teardown orders, the surviving mapping,
+creator release, pinned and other retryable teardown rejections, and final
+allocator counts. The host independently tests page-tree transactions and
+failure injection. The existing Node QMP checks still do **not** independently
+inspect this fixture's object fields or cross-root PTEs. This remains a partial
+implementation, not proof of Ring 3 access or hardware-enforced sharing.

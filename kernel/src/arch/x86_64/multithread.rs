@@ -507,9 +507,10 @@ fn quiesce(
             return Err(Error::InUse);
         }
         super::address_space::cleanup(nodes, domain.id, paging).map_err(|_| Error::Corrupt)?;
-        let s = domain.space.take().ok_or(Error::NotOwned)?;
+        let s = domain.space.as_mut().ok_or(Error::NotOwned)?;
         let id = s.id();
         paging.destroy_user(s)?;
+        domain.space = None;
         check(nodes.release_space(domain.id, id))?;
         check(nodes.reclaim(domain.id))?;
         serial::write(format_args!(
@@ -955,9 +956,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     #[cfg(feature = "abi-02")]
                     super::address_space::cleanup(&mut nodes, domain.id, paging)
                         .map_err(|_| Error::Corrupt)?;
-                    let s = domain.space.take().ok_or(Error::NotOwned)?;
+                    let s = domain.space.as_mut().ok_or(Error::NotOwned)?;
                     let id = s.id();
                     paging.destroy_user(s)?;
+                    domain.space = None;
                     check(nodes.release_space(domain.id, id))?;
                     check(nodes.reclaim(domain.id))?;
                     #[cfg(feature = "cap-move-test")]

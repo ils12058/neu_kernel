@@ -184,10 +184,11 @@ fn execute(paging: &mut Paging<'_, '_>, model: &mut Nodes, node: &Bootstrap) -> 
     Ok(())
 }
 fn reclaim(paging: &mut Paging<'_, '_>, model: &mut Nodes, node: &mut Bootstrap) -> Result<()> {
-    let s = node.space.take().ok_or(Error::NotOwned)?;
+    let s = node.space.as_mut().ok_or(Error::NotOwned)?;
     let id = s.id();
     let outcome = lifecycle(model.node(node.node))?.outcome;
     paging.destroy_user(s)?;
+    node.space = None;
     lifecycle(model.release_space(node.node, id))?;
     lifecycle(model.reclaim(node.node))?;
     let retained = lifecycle(model.node(node.node))?;
@@ -223,6 +224,8 @@ fn survivor(paging: &mut Paging<'_, '_>, model: &Nodes, node: &Bootstrap) -> Res
     Ok(())
 }
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
+    #[cfg(feature = "test-nodes")]
+    paging.shared_backing_self_test(native::payload())?;
     let case = if cfg!(feature = "test-nodes-a-fault") {
         1
     } else if cfg!(feature = "test-nodes-b-fault") {

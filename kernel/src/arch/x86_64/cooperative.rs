@@ -264,9 +264,10 @@ pub(super) fn reclaim(
     paging.unpin_context(space(domain)?)?;
     paging.destroy_thread_stack(domain.space.as_mut().ok_or(Error::NotOwned)?, domain.thread)?;
     policy(model.release_stack(domain.thread, stack))?;
-    let s = domain.space.take().ok_or(Error::NotOwned)?;
+    let s = domain.space.as_mut().ok_or(Error::NotOwned)?;
     let id = s.id();
     paging.destroy_user(s)?;
+    domain.space = None;
     policy(model.release_space(domain.node, id))?;
     policy(model.reclaim(domain.node))?;
     if policy(model.node(domain.node))?.outcome != domain.outcome {
@@ -283,7 +284,7 @@ pub(super) fn stale_audit(
 ) -> Result<()> {
     let node = policy(model.create())?;
     policy(model.configure(node))?;
-    let s = paging.prepare_domain(execution_payload(), 0, 35, None, None)?;
+    let mut s = paging.prepare_domain(execution_payload(), 0, 35, None, None)?;
     policy(model.bind_space(node, s.id()))?;
     let thread = policy(model.initial_thread(
         node,
@@ -299,7 +300,7 @@ pub(super) fn stale_audit(
     }
     policy(model.construction_failed(node))?;
     let id = s.id();
-    paging.destroy_user(s)?;
+    paging.destroy_user(&mut s)?;
     policy(model.release_space(node, id))?;
     policy(model.reclaim(node))?;
     serial::write(format_args!(

@@ -255,6 +255,39 @@ impl<'a> FrameAllocator<'a> {
         self.hint = self.hint.min(index);
         Ok(())
     }
+
+    /// Validate an entire bounded release before changing allocator state.
+    /// Callers must retain exclusive ownership until `free_batch` completes.
+    pub fn validate_free_batch(&self, addresses: &[u64]) -> Result<(), FrameError> {
+        for (i, &address) in addresses.iter().enumerate() {
+            if !address.is_multiple_of(PAGE_SIZE) {
+                return Err(FrameError::Misaligned);
+            }
+            let index = self.ordinal(address).ok_or(FrameError::NotAllocatable)?;
+            if addresses[..i].contains(&address)
+                || self.allocated[index / 64] & (1u64 << (index % 64)) == 0
+            {
+                return Err(FrameError::NotAllocated);
+            }
+        }
+        if addresses.len() > self.total.saturating_sub(self.free) {
+            return Err(FrameError::Accounting);
+        }
+        Ok(())
+    }
+
+    /// All checks precede all writes; an error leaves the entire bitmap intact.
+    pub fn free_batch(&mut self, addresses: &[u64]) -> Result<(), FrameError> {
+        self.validate_free_batch(addresses)?;
+        for &address in addresses {
+            // The exclusive borrow prevents the validated bitmap from changing.
+            let index = self.ordinal(address).expect("validated allocator ordinal");
+            self.allocated[index / 64] &= !(1u64 << (index % 64));
+            self.free += 1;
+            self.hint = self.hint.min(index);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "test-memory")]

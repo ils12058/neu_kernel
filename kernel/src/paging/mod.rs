@@ -177,7 +177,8 @@ pub fn decode(raw: u64, level: u8, bits: u8) -> Result<Option<(u64, u64)>> {
 }
 
 /// Backends allocate zeroed, exclusively owned table frames. Writes/reads never
-/// borrow an unowned table. flush() completes before any detached table release.
+/// borrow an unowned table. A failed write must not mutate its entry.
+/// flush() completes before any detached table release.
 pub trait TableMemory {
     fn allocate(&mut self, level: u8) -> Result<u64>;
     fn release(&mut self, address: u64) -> Result<()>;
@@ -316,12 +317,16 @@ impl PageTree {
                     let encoded = match table_entry(child, self.bits) {
                         Ok(value) => value | user_bit,
                         Err(error) => {
-                            memory.release(child)?;
+                            memory
+                                .release(child)
+                                .expect("failed to release unlinked table");
                             return Err(error);
                         }
                     };
                     if let Err(error) = memory.write(table, index, encoded) {
-                        memory.release(child)?;
+                        memory
+                            .release(child)
+                            .expect("failed to release unlinked table");
                         return Err(error);
                     }
                     created[count] = (table, index, child);
@@ -338,9 +343,13 @@ impl PageTree {
         })();
         if outcome.is_err() {
             for (parent, index, child) in created[..count].iter().copied().rev() {
-                memory.write(parent, index, 0)?;
+                memory
+                    .write(parent, index, 0)
+                    .expect("page-table map rollback detach failed");
                 memory.flush();
-                memory.release(child)?;
+                memory
+                    .release(child)
+                    .expect("page-table map rollback release failed");
             }
         }
         outcome
@@ -359,25 +368,54 @@ impl PageTree {
         }
         memory.write(tables[3], path[3], 0)?;
         memory.invalidate(va);
-        for depth in (1..4).rev() {
-            let table = tables[depth];
-            if memory.pinned(table) {
-                break;
-            }
-            let mut empty = true;
-            for index in 0..512 {
-                if memory.read(table, index)? & 1 != 0 {
-                    empty = false;
+        // After the leaf is removed, a backend failure cannot be reported as a
+        // retryable unmap. Fail-stop rather than leave untracked table state.
+        let cleanup: Result<()> = (|| {
+            for depth in (1..4).rev() {
+                let table = tables[depth];
+                if memory.pinned(table) {
                     break;
                 }
+                let mut empty = true;
+                for index in 0..512 {
+                    if memory.read(table, index)? & 1 != 0 {
+                        empty = false;
+                        break;
+                    }
+                }
+                if !empty {
+                    break;
+                }
+                memory.write(tables[depth - 1], path[depth - 1], 0)?;
+                memory.flush(); // Parent detached and walk caches invalidated before reuse.
+                memory.release(table)?;
             }
-            if !empty {
-                break;
-            }
-            memory.write(tables[depth - 1], path[depth - 1], 0)?;
-            memory.flush(); // Parent detached and walk caches invalidated before reuse.
-            memory.release(table)?;
+            Ok(())
+        })();
+        cleanup.expect("page-table unmap cleanup failed after leaf removal");
+        Ok(mapping)
+    }
+
+    /// Remove only the leaf; the caller remains responsible for every table.
+    /// This is used during whole-root teardown, whose table inventory and
+    /// workspace aliases must stay intact until that teardown owns them.
+    pub fn unmap_leaf_preserving_tables(
+        &self,
+        memory: &mut impl TableMemory,
+        va: u64,
+    ) -> Result<Translation> {
+        page_address(va)?;
+        let mapping = self.translate(memory, va)?.ok_or(Error::NotMapped)?;
+        if mapping.page_size != PAGE {
+            return Err(Error::Flags);
         }
+        let path = indices(va)?;
+        let mut table = self.root;
+        for &index in &path[..3] {
+            table = memory.read(table, index)? & ADDRESS_FIELD;
+        }
+        memory.write(table, path[3], 0)?;
+        memory.invalidate(va);
         Ok(mapping)
     }
 }
@@ -995,6 +1033,17 @@ impl Registry {
             .iter()
             .any(|m| m.live && m.space == space && m.object.is_some()))
     }
+    pub fn memory_object_mappings(
+        &self,
+        space: SpaceId,
+    ) -> Result<impl Iterator<Item = Mapping> + '_> {
+        self.space(space)?;
+        Ok(self
+            .mappings
+            .iter()
+            .copied()
+            .filter(move |m| m.live && m.space == space && m.object.is_some()))
+    }
     pub fn memory_object_frame(&self, id: MemoryObjectId, index: usize) -> Result<FrameId> {
         self.object(id)?
             .frames
@@ -1020,6 +1069,19 @@ impl Registry {
         &mut self,
         id: MemoryObjectId,
     ) -> Result<[Option<FrameId>; MEMORY_OBJECT_PAGES]> {
+        let frames = self.collectible_memory_object(id)?;
+        for frame in frames.iter().flatten() {
+            self.frames[frame.slot].owner = FrameOwner::Space(SpaceId::KERNEL);
+        }
+        self.objects[id.slot].live = false;
+        Ok(frames)
+    }
+
+    /// Non-mutating first stage for a physical allocator batch preflight.
+    pub fn collectible_memory_object(
+        &self,
+        id: MemoryObjectId,
+    ) -> Result<[Option<FrameId>; MEMORY_OBJECT_PAGES]> {
         self.can_allocate(SpaceId::KERNEL)?;
         let object = *self.object(id)?;
         if object.creator || self.mappings.iter().any(|m| m.live && m.object == Some(id)) {
@@ -1032,10 +1094,6 @@ impl Registry {
                 return Err(Error::Corrupt);
             }
         }
-        for frame in object.frames.iter().flatten() {
-            self.frames[frame.slot].owner = FrameOwner::Space(SpaceId::KERNEL);
-        }
-        self.objects[id.slot].live = false;
         Ok(object.frames)
     }
     pub fn physical(&self, id: FrameId) -> Result<u64> {
@@ -1412,7 +1470,8 @@ fn map_frames_kind(
         };
         if let Err(error) = result {
             for previous in (0..index).rev() {
-                tree.unmap(memory, base + previous as u64 * PAGE)?;
+                tree.unmap(memory, base + previous as u64 * PAGE)
+                    .expect("multi-page mapping rollback failed");
             }
             return Err(error);
         }
@@ -1487,7 +1546,8 @@ pub fn map_memory_object(
             permissions,
         ) {
             for previous in (0..i).rev() {
-                tree.unmap(memory, base + previous as u64 * PAGE)?;
+                tree.unmap(memory, base + previous as u64 * PAGE)
+                    .expect("memory-object mapping rollback failed");
             }
             return Err(error);
         }
@@ -1518,6 +1578,18 @@ pub fn unmap_memory_object(
     space: SpaceId,
     address: u64,
 ) -> Result<()> {
+    validate_memory_object_mapping(tree, memory, registry, space, address)?;
+    tree.unmap(memory, address)?;
+    retire_memory_object_mapping(registry, space, address)
+}
+
+pub fn validate_memory_object_mapping(
+    tree: &PageTree,
+    memory: &impl TableMemory,
+    registry: &Registry,
+    space: SpaceId,
+    address: u64,
+) -> Result<()> {
     registry.can_allocate(space)?;
     if registry.root(space)? != tree.root {
         return Err(Error::NotOwned);
@@ -1535,14 +1607,35 @@ pub fn unmap_memory_object(
     {
         return Err(Error::Corrupt);
     }
-    tree.unmap(memory, address)?;
+    Ok(())
+}
+
+fn retire_memory_object_mapping(
+    registry: &mut Registry,
+    space: SpaceId,
+    address: u64,
+) -> Result<()> {
     let slot = registry
         .mappings
         .iter()
-        .position(|m| m.live && m.space == space && m.address == address && m.object == Some(id))
+        .position(|m| m.live && m.space == space && m.address == address && m.object.is_some())
         .ok_or(Error::Corrupt)?;
     registry.mappings[slot].live = false;
     Ok(())
+}
+
+/// Teardown variant: preflight is repeated, then the mapping reference is
+/// retired only after its leaf was removed and locally invalidated.
+pub fn unmap_memory_object_preserving_tables(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    space: SpaceId,
+    address: u64,
+) -> Result<()> {
+    validate_memory_object_mapping(tree, memory, registry, space, address)?;
+    tree.unmap_leaf_preserving_tables(memory, address)?;
+    retire_memory_object_mapping(registry, space, address)
 }
 
 #[cfg(test)]

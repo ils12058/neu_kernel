@@ -238,4 +238,4 @@ for the exact evidence and the still-unverified Ready ordering.
 
 | ADR | Status | Related register entries |
 | --- | --- | --- |
-| [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Proposed; partial implementation | NEU-018; NEU-005; NEU-024 |
+| [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Proposed; teardown and batch reclamation implemented, independent QMP evidence pending | NEU-018; NEU-005; NEU-024 |
