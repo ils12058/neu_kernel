@@ -1,5 +1,117 @@
 # Neu Kernel implementation status
 
+## K7 / Phase 7A — atomic move-only capability messages (2026-10-27)
+
+The implementation adds nonblocking movement of explicitly eligible Flag and
+Counter entries through the existing two-slot directional FIFOs. The native
+fixture uses Flag.READ. [ADR 0020](adr/0020-atomic-capability-moves.md) and
+[experimental ABI 0.5](abi/experimental-v0.5.md) define the accepted subset.
+Architecture v0.2 is unchanged; the K6B record below retains its historical
+milestone scope and validation evidence.
+
+An endpoint needs SEND_CAPS (128) and the source entry needs separate trusted
+bootstrap eligibility. The 0.5 fixture grants that property to index 3's own
+Flag.READ and extends index 4's endpoint rights to 224, retaining meanings 0–7,
+eight handles per Node and six object slots. A1/A2 share Node A's table; B1 owns
+its separate table. AddressSpace, ChannelEndpoint and control/device/memory
+capability movement are deliberately unsupported. Received eligibility and
+object rights are preserved; no copy, derive or revoke API exists.
+
+Each existing FIFO slot has scalar storage and an optional non-copyable owned
+transfer token. Tags share the original head/tail/length and capacity; there is
+no second queue. Source detachment and enqueue are one preflighted IF=0
+transaction. Receive preflights its own table slot before consuming the head
+and installing its next generation. Both commits relocate one existing object
+reference, without retain/release churn. Full or authorization failure leaves
+the source valid; recipient Capacity leaves queued authority at the head.
+Wrong-kind receive (-36) never skips or removes it. Ineligible source is -37.
+
+Scalar blocking receives return MessageKind on a capability head, including at
+pre-entry settlement after a wake. Capability dequeue wakes blocked scalar
+senders and eligible local receivers when it exposes another message. Host
+tests cover these mixed wait/pin/cancel cases; guest move tests check immediate
+blocking-scalar mismatch, while all K6B images retain real suspend/resume tests.
+No blocking capability syscall was introduced.
+
+Final endpoint retirement detaches inbound tokens and releases each owned
+reference exactly once, preserving the surviving peer's inbound messages.
+Node cleanup separately counts closed handles and discarded queued references
+before releasing roots. The receiver-fault guest test exposed the former
+handle-only accounting assumption; it was corrected and the scenario rerun.
+The per-direction sent = peer received + peer queued + peer discarded equation
+includes both message kinds. Lifetime pins remain separate from queued refs.
+
+The new operations are 0x17 send-cap and 0x18 receive-cap; query reports
+0x00000005000000ff. Older images retain their exact versions, masks and rejection
+semantics. The gated private 0xfffffffffffffc00 Flag-read fixture exercises
+received authority through the production typed READ guard; it is not a public
+generic object ABI.
+
+### Phase 7A evidence and limits
+
+The new native image uses the real active lease and registry. Its bounded
+170-word (1360-byte) witness records before/after table ownership, physical FIFO
+slot tags and object generation/reference/pin counts. QMP independently reads
+the actual supervisor FIFO storage, live repr(C) table entries, slot generations,
+registry accounting fields and Flag storage at selected stopped native probes.
+The host reconciles every transaction with an independent mixed-message model.
+The final stopped CPU also observes zero references and pins in every real
+object slot. Existing CPL/CR3/TSS/guarded-stack, IRQ/EOI, scheduler, page-table
+and controlled-halt checks remain enabled.
+
+The fixture retains the 112-record IPC limit, 128-dispatch Channel guard and
+30-second deadline, and adds three computation slices per member for independent
+Ring 3 observations before transfer. It does not claim fairness from this
+ordered fixture. A new native fixture initially had an unbalanced saved-register
+restore and failed; it was corrected before validation. Early host/harness
+failures and receiver cleanup failures are not counted as passing suites.
+
+`make doctor`, `make check`, `make build` and `make test` passed. The full run
+passed 207 host tests and **123 QEMU scenarios**, preserving all 190 baseline
+host tests and all 115 baseline QEMU cases. One additional host-only test was
+then added for two ordered queued grants to the same Counter with different
+rights and final-reference collection; the final host suite passed **208 tests**.
+Guest runtime code was unchanged by that host-only addition. The focused
+`capability::moves_tests` filter passes 14 tests (an overlapping subset).
+
+The normal and xAPIC movement cases each commit exactly one capability move and
+one receive, account for sent=[4,2], received=[2,4], discarded=[0,0], and capture
+12 native QMP probes. The receiver-fault case commits one move and no delivery,
+accounts for sent=[4,1], received=[1,2], discarded=[0,2], and captures 10 probes.
+It releases eight Node handles plus one queued reference; the healthy Node's
+seven remaining handles are released separately. Every final QMP observation
+reads references=0 and pins=0 in all six actual object slots.
+
+Six additional runs (two each normal, xAPIC and receiver fault) pass with 33–43
+records, 44–62 dispatches, and elapsed times 8.689–11.141 seconds. These retain
+the 112-record, 128-dispatch and 30-second limits. Two separate fresh source and
+target directories build and QMP-boot normal transfer and receiver-fault images.
+Their full ELF hashes differ with debug information, but loadable segments and
+hashes after stripping debug sections match the corresponding workspace builds.
+
+Evidence: `build/k7-validation.json`, `k7-full-results.json`,
+`k7-host-final.log`, `k7-moves-focused.log`, `k7-repeat-results.json`,
+`k7-clean-move.json`, `k7-clean-discard.json`, `k7-clean-comparison.json`, plus
+doctor/check/build logs and per-case CPU/page-table/queue observations in
+`build/test-logs/`. The consolidated report preserves full-run versus later
+host-only validation provenance rather than treating the failed development
+attempts as passes.
+
+Files: core changes are in `kernel/src/capability.rs`, `channel.rs`,
+`syscall.rs`, `capability/tests.rs`, and new `capability/moves_tests.rs`.
+Native/bootstrap/fixture changes are in `arch/x86_64/address_space.rs`,
+`address_space.S`, `ipc.rs`, `ipc.S`, `multithread.rs`, `multithread.S`,
+`native.rs`, `native.S`, and new `moves.S`. `kernel/Cargo.toml` and
+`tools/neu.py` add isolated positive/legacy profiles and verification.
+Documentation adds ADR 0020 and ABI 0.5 and updates this status, the ADR index
+and root README; architecture v0.2 and earlier ADR text remain unchanged.
+
+Hardware, SMP, hosted CI, public factories,
+blocking capability moves, deadlines, variable buffers, shared memory,
+derivation and revocation remain outside this slice. The next K7 work should
+expand topology, fault/transfer interleavings and resource governance before
+adding more transferable object types.
+
 ## K6 / Phases 6A–6B — blocking Channel waits implemented (2026-10-27)
 
 Phase 6A hardening and Phase 6B blocking Channel waits are **complete for the

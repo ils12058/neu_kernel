@@ -193,7 +193,9 @@ neu_native_after_wait_end:
     je 3f
     jmp 5f
 2:
-    .if {abi03_disabled}
+    .if {move_unsupported}
+    mov eax,{move_unsupported}
+    .elseif {abi03_disabled}
     mov eax,0x13
     .elseif {abi04_disabled}
     mov eax,0x15

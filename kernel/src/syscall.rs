@@ -67,6 +67,19 @@ pub mod v04 {
     }
 }
 
+/// Experimental nonblocking capability moves; old namespaces are unchanged.
+pub mod v05 {
+    pub const CHANNEL_SEND_CAP: u64 = 0x17;
+    pub const CHANNEL_RECEIVE_CAP: u64 = 0x18;
+    pub const FEATURE_CAP_MOVE: u32 = 128;
+    pub const INFO: u64 = super::version(0, 5, 127 | FEATURE_CAP_MOVE);
+    // Private fixture read, never advertised as a public Flag/object ABI.
+    pub const TEST_READ: u64 = 0xffff_ffff_ffff_fc00;
+    pub fn owns(number: u64) -> bool {
+        (CHANNEL_SEND_CAP..=CHANNEL_RECEIVE_CAP).contains(&number)
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
@@ -235,6 +248,26 @@ pub fn valid_msrs(actual: Msrs, previous_efer: u64, entry: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn move_extension_is_disjoint_and_legacy_dispatch_rejects_both_numbers() {
+        assert_eq!(v05::INFO, 0x5000000ff);
+        for op in [v05::CHANNEL_SEND_CAP, v05::CHANNEL_RECEIVE_CAP] {
+            assert!(v05::owns(op));
+            assert!(!v02::owns(op));
+            assert!(!v03::owns(op));
+            assert!(!v04::owns(op));
+            assert_eq!(
+                dispatch(op, [0; 6]),
+                Outcome::Return {
+                    status: NOT_SUPPORTED,
+                    scalar: 0
+                }
+            );
+        }
+        assert_eq!(v04::INFO, 0x40000007f);
+        assert_eq!(v03::INFO, 0x30000003f);
+        assert_eq!(v02::INFO, 0x20000001f);
+    }
     fn contract() -> ReturnContract {
         ReturnContract {
             root: 0x1000,

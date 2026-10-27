@@ -50,6 +50,15 @@ struct Witness(UnsafeCell<Record>);
 unsafe impl Sync for Witness {}
 #[unsafe(no_mangle)]
 static neu_ipc_witness: Witness = Witness(UnsafeCell::new(Record::EMPTY));
+#[cfg(feature = "cap-move-test")]
+struct MoveWitness(UnsafeCell<[u64; 170]>);
+// SAFETY: Owned by this module's exclusive IF=0 transaction, just like Record.
+// QMP reads only while stopped. No borrowed table/registry reference is stored.
+#[cfg(feature = "cap-move-test")]
+unsafe impl Sync for MoveWitness {}
+#[cfg(feature = "cap-move-test")]
+#[unsafe(no_mangle)]
+static neu_move_witness: MoveWitness = MoveWitness(UnsafeCell::new([0; 170]));
 static BUSY: AtomicBool = AtomicBool::new(false);
 struct Borrow;
 impl Drop for Borrow {
@@ -83,7 +92,7 @@ pub fn bootstrap(a: NodeId, b: NodeId, objects: &Objects) -> cap::Result<()> {
         }
         s.a = Some(a);
         s.b = Some(b);
-        serial::write(format_args!("[NEU] IPC bootstrap: A={} B={} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI={}\n",a.raw(),b.raw(),if cfg!(feature = "channel-wait-test") {"0.4"} else {"0.3"})).map_err(|_|cap::Error::Object)
+        serial::write(format_args!("[NEU] IPC bootstrap: A={} B={} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI={}\n",a.raw(),b.raw(),if cfg!(feature = "cap-move-test") {"0.5"} else if cfg!(feature = "channel-wait-test") {"0.4"} else {"0.3"})).map_err(|_|cap::Error::Object)
     })
 }
 unsafe extern "C" {
@@ -185,51 +194,55 @@ pub fn request(
             r.words[12] = id.kind() as u64;
             r.words[13] = rights.bits();
         }
-        let result = (|| -> Result<Outcome, cap::Error> {
-            if op == neu_kernel::syscall::v02::CAP_CLOSE {
-                lease.table_mut().close(objects, active.node, h)?;
-                return Ok(Outcome::Return {
-                    status: 0,
-                    scalar: 0,
-                });
-            }
-            let blocking = op == v04::CHANNEL_SEND_WAIT || op == v04::CHANNEL_RECEIVE_WAIT;
-            let send = op == v03::CHANNEL_SEND || op == v04::CHANNEL_SEND_WAIT;
-            let rights = if send { Rights::SEND } else { Rights::RECEIVE };
-            let mut guard = lease.table().lookup(
-                objects,
-                active.node,
-                h,
-                ObjectType::ChannelEndpoint,
-                rights,
-            )?;
-            let info = guard.endpoint_info()?;
-            r.words[14] = guard.info().references as u64;
-            r.words[15] = guard.info().pins as u64;
-            r.words[16] = info.id.raw();
-            r.words[17] = info.channel.raw();
-            r.words[24] = info.side as u64;
-            r.words[25] = info.owner.raw();
-            let outcome = if send {
-                if blocking {
-                    guard.channel_send_wait(active, payload)
-                } else {
-                    guard.channel_send(payload).map(|_| WaitStart::Committed(0))
+        #[cfg(feature = "cap-move-test")]
+        return move_request(s, objects, lease, active, &mut r, frame);
+        #[cfg(not(feature = "cap-move-test"))]
+        {
+            let result = (|| -> Result<Outcome, cap::Error> {
+                if op == neu_kernel::syscall::v02::CAP_CLOSE {
+                    lease.table_mut().close(objects, active.node, h)?;
+                    return Ok(Outcome::Return {
+                        status: 0,
+                        scalar: 0,
+                    });
                 }
-            } else if blocking {
-                guard.channel_receive_wait(active)
-            } else {
-                guard.channel_receive().map(WaitStart::Committed)
-            };
-            let (status, scalar, blocked) = match outcome {
-                Ok(WaitStart::Committed(v)) => (0, v, false),
-                Ok(WaitStart::Blocked) => (BLOCKED, 0, true),
-                Err(e) => (e as i64, 0, false),
-            };
-            #[cfg(feature = "channel-wait-test")]
-            if blocking {
-                let ws = guard.wait_stats();
-                serial::write(format_args!(
+                let blocking = op == v04::CHANNEL_SEND_WAIT || op == v04::CHANNEL_RECEIVE_WAIT;
+                let send = op == v03::CHANNEL_SEND || op == v04::CHANNEL_SEND_WAIT;
+                let rights = if send { Rights::SEND } else { Rights::RECEIVE };
+                let mut guard = lease.table().lookup(
+                    objects,
+                    active.node,
+                    h,
+                    ObjectType::ChannelEndpoint,
+                    rights,
+                )?;
+                let info = guard.endpoint_info()?;
+                r.words[14] = guard.info().references as u64;
+                r.words[15] = guard.info().pins as u64;
+                r.words[16] = info.id.raw();
+                r.words[17] = info.channel.raw();
+                r.words[24] = info.side as u64;
+                r.words[25] = info.owner.raw();
+                let outcome = if send {
+                    if blocking {
+                        guard.channel_send_wait(active, payload)
+                    } else {
+                        guard.channel_send(payload).map(|_| WaitStart::Committed(0))
+                    }
+                } else if blocking {
+                    guard.channel_receive_wait(active)
+                } else {
+                    guard.channel_receive().map(WaitStart::Committed)
+                };
+                let (status, scalar, blocked) = match outcome {
+                    Ok(WaitStart::Committed(v)) => (0, v, false),
+                    Ok(WaitStart::Blocked) => (BLOCKED, 0, true),
+                    Err(e) => (e as i64, 0, false),
+                };
+                #[cfg(feature = "channel-wait-test")]
+                if blocking {
+                    let ws = guard.wait_stats();
+                    serial::write(format_args!(
                     "[NEU] IPC wait: op={:#x} thread={} status={} blocked={} waiting={} ready={} queued={} terminal={}\n",
                     op,
                     active.thread.raw(),
@@ -241,89 +254,236 @@ pub fn request(
                     ws.terminal
                 ))
                 .map_err(|_| cap::Error::Object)?;
-            }
-            r.words[9] = status as u64;
-            r.words[10] = scalar;
-            let stats = guard.registry_stats();
-            r.words[62] = stats.references as u64;
-            r.words[63] = stats.live as u64;
-            let after = guard.channel_snapshot();
-            r.words[28..50].copy_from_slice(&after);
-            r.words[26..28].copy_from_slice(&guard.queue_addresses());
-            r.words[61] = u64::from(after[2] != 0) | u64::from(after[3] != 0) << 1;
-            if status == cap::Error::Full as i64 {
-                if cfg!(feature = "test-channels-stress") && (0x7000..0x7003).contains(&payload) {
-                    s.gates |= 1 << (4 + payload - 0x7000);
+                }
+                r.words[9] = status as u64;
+                r.words[10] = scalar;
+                let stats = guard.registry_stats();
+                r.words[62] = stats.references as u64;
+                r.words[63] = stats.live as u64;
+                let after = guard.channel_snapshot();
+                r.words[28..50].copy_from_slice(&after);
+                r.words[26..28].copy_from_slice(&guard.queue_addresses());
+                r.words[61] = u64::from(after[2] != 0) | u64::from(after[3] != 0) << 1;
+                if status == cap::Error::Full as i64 {
+                    if cfg!(feature = "test-channels-stress") && (0x7000..0x7003).contains(&payload)
+                    {
+                        s.gates |= 1 << (4 + payload - 0x7000);
+                    } else {
+                        s.gates |= 1 << info.side;
+                    }
+                }
+                if blocked {
+                    s.gates |= 1 << 25;
+                }
+                if status == 0 && info.side == 1 && op == v03::CHANNEL_SEND && payload == 55 {
+                    s.gates |= 8;
+                }
+                let bit = match (active.thread.index(), op, status, payload, scalar) {
+                    (0, 0x13, 0, 0x6000, _) => Some(18),
+                    (0, 0x13, -33, 0x7000, _) => Some(19),
+                    (1, 0x14, 0, _, 0x6000) => Some(20),
+                    (0, 0x13, 0, 0x6002, _) => Some(21),
+                    (1, 0x14, 0, _, 0x6102) => Some(22),
+                    (0, 0x14, 0, _, 0x6202) => Some(23),
+                    (0, 0x13, 0, 0, _) => Some(0),
+                    (0, 0x13, -33, _, _) => Some(1),
+                    (1, 0x14, 0, _, 0) => Some(2),
+                    (1, 0x13, 0, 0x1020304050607080, _) => Some(3),
+                    (1, 0x13, -33, _, _) => Some(4),
+                    (2, 0x14, 0, _, 0x1020304050607080) => Some(5),
+                    (2, 0x13, 0, 33, _) => Some(6),
+                    (0, 0x13, 0, 44, _) => Some(7),
+                    (2, 0x14, 0, _, 55) => Some(8),
+                    (1, 0x13, 0, 55, _) => Some(9),
+                    (1, _, -34, _, _) => Some(10),
+                    (2, _, -34, _, _) => Some(11),
+                    (1, 0x14, 0, _, 0xfedcba9876543210) => Some(17),
+                    _ => None,
+                };
+                // The queue result is already committed. A diagnostic failure must
+                // never change it into a returned operational error after mutation.
+                // Stop instead; no caller can retry an allegedly uncommitted send.
+                publish(s, r, bit).unwrap_or_else(|_| super::halt());
+                // The guard pin remains live during the QMP observation above.
+                Ok(if blocked {
+                    Outcome::Blocked
                 } else {
-                    s.gates |= 1 << info.side;
+                    Outcome::Return { status, scalar }
+                })
+            })();
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(e) => Outcome::Return {
+                    status: e as i64,
+                    scalar: 0,
+                },
+            };
+            let (status, scalar) = match outcome {
+                Outcome::Return { status, scalar } => (status, scalar),
+                _ => (0, 0),
+            };
+            // Guarded operations already published; lookup failures and close did not.
+            if (op == 0x11 || r.words[15] == 0) && !matches!(outcome, Outcome::Blocked) {
+                r.words[9] = status as u64;
+                r.words[10] = scalar;
+                snapshot(&mut r, objects);
+                let bit = match (op, status) {
+                    (0x11, 0) => Some(if active.node == s.a.unwrap() { 15 } else { 16 }),
+                    (_, -16) => Some(12),
+                    (_, -18) => Some(13),
+                    (_, -19) => Some(14),
+                    _ => None,
+                };
+                publish(s, r, bit)?;
+            }
+            Ok(outcome)
+        }
+    })
+}
+
+#[cfg(feature = "cap-move-test")]
+fn move_request(
+    s: &mut State,
+    objects: &mut Objects,
+    lease: &mut Lease,
+    active: ActiveContext,
+    r: &mut Record,
+    frame: Frame,
+) -> cap::Result<Outcome> {
+    use neu_kernel::syscall::{v02, v05};
+    let op = frame.registers.rax;
+    let h = Handle::from_raw(frame.registers.rdi);
+    let mut evidence = [0u64; 170];
+    evidence[..6].copy_from_slice(&[
+        r.words[0],
+        op,
+        active.node.raw(),
+        active.thread.raw(),
+        h.raw(),
+        frame.registers.rsi,
+    ]);
+    evidence[8..40].copy_from_slice(&lease.table().move_slots());
+    evidence[72..84].copy_from_slice(&objects.channel_state().transfer_snapshot());
+    evidence[96..114].copy_from_slice(&objects.move_objects());
+    let result = (|| -> cap::Result<Outcome> {
+        let value = match op {
+            neu_kernel::syscall::ABI_QUERY => v05::INFO,
+            v02::CAP_CLOSE => {
+                lease.table_mut().close(objects, active.node, h)?;
+                0
+            }
+            v05::CHANNEL_SEND_CAP => {
+                lease.table_mut().send_cap(
+                    objects,
+                    active.node,
+                    h,
+                    Handle::from_raw(frame.registers.rsi),
+                )?;
+                0
+            }
+            v05::CHANNEL_RECEIVE_CAP => lease
+                .table_mut()
+                .receive_cap(objects, active.node, h)?
+                .raw(),
+            v05::TEST_READ => {
+                let guard = lease.table().lookup(
+                    objects,
+                    active.node,
+                    h,
+                    ObjectType::Flag,
+                    Rights::READ,
+                )?;
+                evidence[132] = guard.value_address();
+                evidence[134] = guard.info().id.raw();
+                guard.read()?
+            }
+            _ => {
+                let send = op == v03::CHANNEL_SEND || op == v04::CHANNEL_SEND_WAIT;
+                let mut guard = lease.table().lookup(
+                    objects,
+                    active.node,
+                    h,
+                    ObjectType::ChannelEndpoint,
+                    if send { Rights::SEND } else { Rights::RECEIVE },
+                )?;
+                let info = guard.endpoint_info()?;
+                r.words[14] = guard.info().references as u64;
+                r.words[16] = info.id.raw();
+                r.words[17] = info.channel.raw();
+                r.words[24] = info.side as u64;
+                r.words[25] = active.node.raw();
+                let result = match op {
+                    v03::CHANNEL_SEND => guard
+                        .channel_send(frame.registers.rsi)
+                        .map(|_| WaitStart::Committed(0)),
+                    v03::CHANNEL_RECEIVE => guard.channel_receive().map(WaitStart::Committed),
+                    v04::CHANNEL_SEND_WAIT => guard.channel_send_wait(active, frame.registers.rsi),
+                    v04::CHANNEL_RECEIVE_WAIT => guard.channel_receive_wait(active),
+                    _ => return Err(cap::Error::Type),
+                }?;
+                match result {
+                    WaitStart::Committed(v) => v,
+                    WaitStart::Blocked => return Ok(Outcome::Blocked),
                 }
             }
-            if blocked {
-                s.gates |= 1 << 25;
-            }
-            if status == 0 && info.side == 1 && op == v03::CHANNEL_SEND && payload == 55 {
-                s.gates |= 8;
-            }
-            let bit = match (active.thread.index(), op, status, payload, scalar) {
-                (0, 0x13, 0, 0x6000, _) => Some(18),
-                (0, 0x13, -33, 0x7000, _) => Some(19),
-                (1, 0x14, 0, _, 0x6000) => Some(20),
-                (0, 0x13, 0, 0x6002, _) => Some(21),
-                (1, 0x14, 0, _, 0x6102) => Some(22),
-                (0, 0x14, 0, _, 0x6202) => Some(23),
-                (0, 0x13, 0, 0, _) => Some(0),
-                (0, 0x13, -33, _, _) => Some(1),
-                (1, 0x14, 0, _, 0) => Some(2),
-                (1, 0x13, 0, 0x1020304050607080, _) => Some(3),
-                (1, 0x13, -33, _, _) => Some(4),
-                (2, 0x14, 0, _, 0x1020304050607080) => Some(5),
-                (2, 0x13, 0, 33, _) => Some(6),
-                (0, 0x13, 0, 44, _) => Some(7),
-                (2, 0x14, 0, _, 55) => Some(8),
-                (1, 0x13, 0, 55, _) => Some(9),
-                (1, _, -34, _, _) => Some(10),
-                (2, _, -34, _, _) => Some(11),
-                (1, 0x14, 0, _, 0xfedcba9876543210) => Some(17),
-                _ => None,
-            };
-            // The queue result is already committed. A diagnostic failure must
-            // never change it into a returned operational error after mutation.
-            // Stop instead; no caller can retry an allegedly uncommitted send.
-            publish(s, r, bit).unwrap_or_else(|_| super::halt());
-            // The guard pin remains live during the QMP observation above.
-            Ok(if blocked {
-                Outcome::Blocked
-            } else {
-                Outcome::Return { status, scalar }
-            })
-        })();
-        let outcome = match result {
-            Ok(outcome) => outcome,
-            Err(e) => Outcome::Return {
-                status: e as i64,
-                scalar: 0,
-            },
         };
-        let (status, scalar) = match outcome {
-            Outcome::Return { status, scalar } => (status, scalar),
-            _ => (0, 0),
-        };
-        // Guarded operations already published; lookup failures and close did not.
-        if (op == 0x11 || r.words[15] == 0) && !matches!(outcome, Outcome::Blocked) {
-            r.words[9] = status as u64;
-            r.words[10] = scalar;
-            snapshot(&mut r, objects);
-            let bit = match (op, status) {
-                (0x11, 0) => Some(if active.node == s.a.unwrap() { 15 } else { 16 }),
-                (_, -16) => Some(12),
-                (_, -18) => Some(13),
-                (_, -19) => Some(14),
-                _ => None,
-            };
-            publish(s, r, bit)?;
-        }
-        Ok(outcome)
-    })
+        Ok(Outcome::Return {
+            status: 0,
+            scalar: value,
+        })
+    })();
+    let outcome = result.unwrap_or_else(|e| Outcome::Return {
+        status: e as i64,
+        scalar: 0,
+    });
+    let (status, scalar) = match outcome {
+        Outcome::Return { status, scalar } => (status, scalar),
+        _ => (BLOCKED, 0),
+    };
+    r.words[9] = status as u64;
+    r.words[10] = scalar;
+    snapshot(r, objects);
+    evidence[6] = status as u64;
+    evidence[7] = scalar;
+    evidence[40..72].copy_from_slice(&lease.table().move_slots());
+    evidence[84..96].copy_from_slice(&objects.channel_state().transfer_snapshot());
+    evidence[114..132].copy_from_slice(&objects.move_objects());
+    evidence[133] = if evidence[132] != 0 { scalar } else { 0 };
+    evidence[136..154].copy_from_slice(&objects.move_object_addresses());
+    evidence[154..170].copy_from_slice(&lease.table().move_slot_addresses());
+    // Reused, bounded 1360-byte witness. All entries are recorded in serial;
+    // selected transactions are independently sampled at a stopped native CPU.
+    unsafe {
+        ptr::write_volatile(neu_move_witness.0.get(), evidence);
+    }
+    serial::write(format_args!("[NEU] Move record: words=")).unwrap_or_else(|_| super::halt());
+    for (i, word) in evidence.iter().enumerate() {
+        serial::write(format_args!("{}{:#x}", if i == 0 { "" } else { "," }, word))
+            .unwrap_or_else(|_| super::halt());
+    }
+    serial::write(format_args!("\n")).unwrap_or_else(|_| super::halt());
+    if status == cap::Error::Full as i64 {
+        s.gates |= 1;
+    }
+    if op == v05::CHANNEL_SEND_CAP && status == 0 {
+        s.gates |= 1 << 26;
+    }
+    let bit = match (op, status) {
+        (1, 0) => Some(37),
+        (0x17, 0) => Some(26),
+        (0x17, -33) => Some(27),
+        (0x17, -18) => Some(28),
+        (0x18, 0) => Some(29),
+        (0x18, -22) => Some(30),
+        (0x18, -36) => Some(31),
+        (v05::TEST_READ, 0) => Some(if active.node == s.a.unwrap() { 32 } else { 33 }),
+        (v05::TEST_READ, -17) => Some(34),
+        (0x14, -36) => Some(35),
+        (0x16, -36) => Some(36),
+        _ => None,
+    };
+    publish(s, *r, bit).unwrap_or_else(|_| super::halt());
+    Ok(outcome)
 }
 pub fn gates(_objects: &Objects) -> cap::Result<u64> {
     tx(|s| Ok(s.gates))

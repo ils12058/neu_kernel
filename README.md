@@ -5,27 +5,30 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K6 / Phase 6B adds real blocking scalar IPC. Ring 3 Threads that find an empty
-inbound FIFO or a full peer FIFO register one owned wait, enter the scheduler's
-`Blocked` state, leave the runnable FIFO, and resume through a validated
-post-SYSCALL continuation when a peer commits the matching operation. Close,
-peer retirement and Node faults cancel pending waits and release their pins
-exactly once. The legacy ABI 0.3 nonblocking operations remain immediate.
+K7 / Phase 7A adds atomic move-only transfer of Flag/Counter authority through
+the existing bounded Channel. A successful send invalidates one source handle
+and queues its owned reference; a later receive installs a fresh Node-local
+handle with unchanged rights. Full, wrong-kind and recipient-capacity failures
+preserve the corresponding ownership. K6B scalar blocking IPC, scheduler
+wait/wake and cancellation remain supported.
 
 **Nodes execute. Capabilities authorize. Kernel objects provide mechanisms.**
 
-The suite passes **190 host tests and 115 QEMU scenarios**, retaining the 164/105
-K6A baseline and all earlier regressions. [Implementation status](docs/IMPLEMENTATION_STATUS.md)
-records evidence and limits. [Experimental ABI 0.4](docs/abi/experimental-v0.4.md)
-adds blocking send/receive while preserving ABI 0.1/0.2/0.3.
-[ADR 0019](docs/adr/0019-blocking-channel-waits.md) records the wait,
-suspension, wake, pin and cancellation decision. The architecture v0.2 baseline
-and accepted ADR history remain intact.
+[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the executed
+validation, including the 190-host/115-QEMU K6B baseline and new movement tests.
+Current results are **208 host tests, 123 QEMU scenarios**, six repeat runs and
+two independent clean-directory builds/QMP boots.
+[Experimental ABI 0.5](docs/abi/experimental-v0.5.md) adds nonblocking capability
+send/receive while retaining ABI 0.1–0.4 configurations.
+[ADR 0020](docs/adr/0020-atomic-capability-moves.md) records the transfer,
+queued-reference, capacity, mixed-message and cleanup decisions. Architecture
+v0.2 and earlier accepted ADR rationale remain intact.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private
-Thread stacks. Public creation, public timeouts/deadlines, capability transport,
-derivation, revocation, shared memory, SMP, TLS/SIMD and ELF runtime remain deferred.
+Thread stacks. Public creation, public timeouts/deadlines, AddressSpace/endpoint
+transfer, derivation, revocation, shared memory, SMP, TLS/SIMD and ELF runtime
+remain deferred.
 The platform remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB, UEFI/OVMF, Rust 1.95.0
 and Limine 12.9.4/base 6 on Apple Silicon.
 
@@ -62,6 +65,12 @@ closure, `--case channels-wait-fault` for Node-fault cancellation, or
 `--case channels-wait-deadlock` for bounded all-blocked quiescence.
 `--case channels-legacy` rechecks immediate ABI 0.3 behavior, and
 `--case native-abi04-disabled` checks legacy rejection of the blocking operations.
+Run `--case cap-moves` for Ring 3 move, Full rollback, recipient-capacity retry
+and mixed FIFO evidence; `--case cap-moves-discard` for receiver-fault reference
+cleanup; or `--case cap-moves-xapic` for xAPIC. The `native-move-send-disabled`,
+`native-move-receive-disabled`, `address-space-move-disabled`,
+`channels-move-disabled` and `channels-wait-move-disabled` images test rejection
+of movement by earlier ABI versions.
 Run `python3 tools/neu.py test --case address-space` for live ABI 0.2
 inspection, `--case address-space-a2-fault` for capability/root teardown,
 `--case address-space-rollback` for failed grants and pool exhaustion, or

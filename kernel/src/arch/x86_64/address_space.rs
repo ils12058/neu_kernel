@@ -197,6 +197,8 @@ pub fn bootstrap(
             s.objects.release(r)?;
         }
         for owner in [a, b] {
+            #[cfg(feature = "cap-move-test")]
+            model(nodes.authority_mut(owner))?.configure_moves()?;
             model(nodes.authority_mut(owner))?.seal_bootstrap();
         }
         let stats = s.objects.stats();
@@ -380,8 +382,12 @@ pub fn request(active: ActiveContext, frame: Frame, address: u64, top: u64) -> O
         ]);
         #[cfg(feature = "channel-test")]
         if neu_kernel::syscall::v03::owns(op)
+            || cfg!(feature = "cap-move-test")
+                && (neu_kernel::syscall::v05::owns(op)
+                    || op == neu_kernel::syscall::v05::TEST_READ
+                    || op == neu_kernel::syscall::ABI_QUERY)
             || (cfg!(feature = "channel-wait-test") && neu_kernel::syscall::v04::owns(op))
-            || (op == v02::CAP_CLOSE && (h.raw() as u32) >= 5)
+            || (op == v02::CAP_CLOSE && ((h.raw() as u32) >= 5 || cfg!(feature = "cap-move-test")))
         {
             let outcome =
                 super::ipc::request(&mut s.objects, &mut lease, active, frame, address, top)?;
@@ -530,6 +536,7 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
         let before = s.objects.stats();
         #[cfg(feature = "channel-test")]
         let channel_before = s.objects.channel_state().snapshot();
+        let queued_before = s.objects.queued_references();
         let count = model(nodes.authority_mut(node))?.drain(&mut s.objects, node)?;
         #[cfg(feature = "channel-test")]
         super::ipc::cleanup(node, channel_before, &s.objects)?;
@@ -540,9 +547,17 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
         }
         let after = s.objects.stats();
         let node_pins = after.pins.saturating_sub(s.objects.pins_outside_node(node));
-        if before.references - after.references != count as u32 || node_pins != 0 {
+        let queued_discarded = queued_before
+            .checked_sub(s.objects.queued_references())
+            .ok_or(cap::Error::Object)?;
+        if before.references.checked_sub(after.references)
+            != (count as u32).checked_add(queued_discarded)
+            || node_pins != 0
+        {
             return Err(cap::Error::Object);
         }
+        #[cfg(feature = "cap-move-test")]
+        serial::write(format_args!("[NEU] Move cleanup: node={} handles={} queued_discarded={} references_released={} pins=0\n",node.raw(),count,queued_discarded,before.references-after.references)).map_err(|_|cap::Error::Object)?;
         serial::write(format_args!("[NEU] AS cleanup: node={} handles={} objects_before={} after={} references_before={} after={} pins=0 root_ref=released lease=none\n",node.raw(),count,before.live,after.live,before.references,after.references)).map_err(|_|cap::Error::Object)
     })
 }

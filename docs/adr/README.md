@@ -210,3 +210,13 @@ ADR 0019 extends ADR 0017/0018 with a real `Blocked` Thread state, owned wait
 registrations, lost-wakeup-safe check/register/wake ordering, continuation-based
 resume, peer-close and Node-fault cancellation, and bounded no-runnable
 quiescence. Capability movement and revocation remain future work.
+
+## Phase 7A record — atomic capability moves
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0020: Atomic move-only capability transfer](0020-atomic-capability-moves.md) | Accepted, bounded Flag/Counter movement, experimental ABI 0.5 | NEU-005/006/007/008/009/010/011/013/014/021/023/024 scoped subsets |
+
+ADR 0020 extends the existing FIFO with owned capability messages and separate
+sender/receiver commits. It preserves prior ADR rationale and does not accept
+AddressSpace/endpoint transfer, derivation or revocation proposals.

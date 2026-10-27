@@ -193,6 +193,10 @@ neu_multi_failed:
     neu_as_user_body
 .endif
 .if {channels}
+    .if {ipc_move}
+    neu_move_user_body
+    .else
     neu_ipc_user_body
+    .endif
 .endif
 neu_multi_payload_end:

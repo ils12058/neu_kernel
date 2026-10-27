@@ -65,9 +65,16 @@ FEATURES.update({name:'test-'+name for name in AS_CASES})
 FEATURES['native-abi02-disabled']='test-native-abi02-disabled'
 NATIVE_CASES['native-abi02-disabled']=1
 IPC_CASES=('channels','channels-legacy','channels-xapic','channels-a-fault','channels-b-fault','channels-rollback','channels-stress')
-WAIT_CASES=('channels-wait','channels-wait-send','channels-wait-fifo','channels-wait-close-receive','channels-wait-close-send','channels-wait-fault','channels-wait-deadlock','channels-wait-xapic')
+WAIT_CASES=('channels-wait','channels-wait-send','channels-wait-fifo','channels-wait-close-receive','channels-wait-close-send','channels-wait-fault','channels-wait-deadlock','channels-wait-xapic','channels-wait-move-disabled')
 IPC_CASES+=WAIT_CASES
+MOVE_CASES=('cap-moves','cap-moves-xapic','cap-moves-discard')
+IPC_CASES+=MOVE_CASES
+IPC_CASES+=('channels-move-disabled',)
 FEATURES.update({name:'test-'+name for name in IPC_CASES})
+for name in ('native-move-send-disabled','native-move-receive-disabled'):
+    FEATURES[name]='test-'+name;NATIVE_CASES[name]=1
+AS_CASES+=('address-space-move-disabled',)
+FEATURES['address-space-move-disabled']='test-address-space-move-disabled'
 FEATURES['native-abi03-disabled']='test-native-abi03-disabled';NATIVE_CASES['native-abi03-disabled']=1
 FEATURES['native-abi04-disabled']='test-native-abi04-disabled';NATIVE_CASES['native-abi04-disabled']=1
 AS_CASES+=('address-space-channel-disabled',)
@@ -171,7 +178,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
@@ -1240,7 +1247,36 @@ def observe_ipc_request(qmp,cpu,symbols,record):
         if actual!=w[34+5*i:39+5*i]:raise Failure('Actual FIFO head/tail/length/payload differs from operation witness.')
         queues.append(actual);walks.append(walk)
     if w[15] and ((not wait and w[15]!=1) or (wait and not 1<=w[15]<=3) or w[12]!=4 or w[24]>1 or w[25]!=record['node']):raise Failure('Authorized Channel operation did not pin its owned typed endpoint.')
-    return {'cpu':cpu,'words':w,'frame':frame,'queues':queues,'walks':walks}
+    result={'cpu':cpu,'words':w,'frame':frame,'queues':queues,'walks':walks}
+    if 'neu_move_witness' in symbols:
+        evidence=debug_words(qmp,symbols['neu_move_witness'],170)
+        if evidence[:8]!=[w[0],w[6],w[1],w[2],w[7],w[8],w[9],w[10]]:raise Failure('Move ownership witness belongs to a different native request.')
+        def word32(address):
+            raw=qmp.call('human-monitor-command',{'command-line':f'x /1wx {address:#x}'})
+            values=re.findall(r'0x[0-9a-fA-F]+',raw)
+            if len(values)!=1:raise Failure('Missing direct object/table accounting observation.')
+            return int(values[0],16)
+        for i in range(6):
+            identity,refs,pins=evidence[114+i*3:117+i*3]
+            addresses=evidence[136+i*3:139+i*3]
+            actual=[word32(address) for address in addresses]
+            if actual[1:]!=[refs,pins] or identity and actual[0]!=(identity>>8)&0xffffffff:raise Failure('Actual registry references/pins/generation differ from move witness.')
+        for i in range(8):
+            handle,obj,rights,movable=evidence[40+i*4:44+i*4]
+            generation_address,entry_address=evidence[154+i*2:156+i*2]
+            generation=word32(generation_address)
+            if bool(handle)!=bool(entry_address) or handle and generation!=handle>>32:raise Failure('Recipient table slot generation differs from installed handle.')
+            if entry_address:
+                entry=debug_words(qmp,entry_address,3)
+                if entry[0]!=(obj&255)-1 or entry[1]&0xffffffff!=(obj>>8)&0xffffffff or (entry[1]>>32)&255!=obj>>40 or entry[2]&0xffffff!=(obj>>40)|(rights<<8)|(movable<<16):raise Failure('Actual typed table entry differs from authority witness.')
+        if evidence[132]:
+            raw=qmp.call('human-monitor-command',{'command-line':f'x /1bx {evidence[132]:#x}'})
+            values=re.findall(r'0x[0-9a-fA-F]+',raw)
+            if len(values)!=1 or int(values[0],16)!=evidence[133]:raise Failure('Transferred Flag read differs from actual supervisor object storage.')
+            walk=switch_walk(qmp,record['root'],evidence[132])
+            if not walk['present'] or any(e&4 for e in walk['entries']):raise Failure('Transferred object is not supervisor-owned.')
+        result['move']=evidence
+    return result
 
 
 def check_wait_multi(case,text,symbols,observations,kernel_root,qmp):
@@ -1686,7 +1722,108 @@ def check_ipc_wait(case,text,symbols,members,state):
     return {'records':records,'wait_witness':witness,'registered':registered,'commits':commits,'failed':failed,'canceled':canceled,'quiesces':quiesces,'sent':sent,'received':received,'discarded':discard,'blocked':blocked_seen,'woken':woken_seen,'settled':settled,'errors':sorted({x[1] for x in failed}),'final_channels':0,'final_endpoints':0,'final_messages':0}
 
 
+def check_moves(case,text,symbols,members,state):
+    owners=[members['threads'][1]['node'],members['threads'][3]['node']]
+    object_ids=[(kind<<40)|0x100|slot for slot,kind in enumerate((3,2,3,2,4,4),1)]
+    tables=[];generations=[[1]*8 for _ in owners]
+    for side in range(2):
+        ids=[object_ids[side*2]]*3+[object_ids[side*2+1]]+[object_ids[4+side]]*4
+        tables.append({(1<<32)|(i+1):[obj,[16,16,0,1,224,96,32,64][i],int(i==3)] for i,obj in enumerate(ids)})
+    queues=[[],[]];slots=[[None,None],[None,None]];heads=[0,0];tails=[0,0];ends=[0x101,0x102]
+    sent=[0,0];received=[0,0];discarded=[0,0];closed=set();errors=set();moves=[];deliveries=[];reads=[]
+    rows=[list(map(lambda v:int(v,0),line.split(','))) for line in re.findall(r'IPC record: words=([^\n]+)',text)]
+    evidence={w[0]:w for w in [list(map(lambda v:int(v,0),line.split(','))) for line in re.findall(r'Move record: words=([^\n]+)',text)]}
+    def table_words(side):
+        words=[0]*32
+        for handle,entry in tables[side].items():words[((handle&0xffffffff)-1)*4:((handle&0xffffffff)-1)*4+4]=[handle,*entry]
+        return words
+    def counts():
+        result={obj:0 for obj in object_ids}
+        for table in tables:
+            for obj,_,_ in table.values():result[obj]+=1
+        for queue in queues:
+            for message in queue:
+                if message[0]=='cap':result[message[1]]+=1
+        return result
+    def objects_words():
+        c=counts();return [v for obj in object_ids for v in ([obj,c[obj],0] if c[obj] else [0,0,0])]
+    def qwords(side):return [heads[side],tails[side],len(queues[side]),*[m[1] if m and m[0]=='scalar' else 0 for m in slots[side]]]
+    def tags():return [v for side in range(2) for m in slots[side] for v in ([1,m[1],m[2]] if m and m[0]=='cap' else [0,0,0])]
+    def snapshot():return [0x101,int(any(ends)),*ends,*owners,*qwords(0),*qwords(1),*sent,*received,*discarded]
+    def append(side,message):queues[side].append(message);slots[side][tails[side]]=message;tails[side]=(tails[side]+1)%2
+    def pop(side):
+        m=queues[side].pop(0);slots[side][heads[side]]=None;heads[side]=(heads[side]+1)%2;received[side]+=1;return m
+    def handle_error(side,handle):
+        slot=handle&0xffffffff;gen=handle>>32
+        return -16 if not 1<=slot<=8 or not gen else -17 if handle not in tables[side] else 0
+    for seq,w in enumerate(rows,1):
+        if len(w)!=64 or w[0]!=seq:raise Failure('Malformed capability-move transaction ledger.')
+        side=owners.index(w[1]);peer=1-side;op,h,value,status,scalar=w[6:11];status=status-(1<<64) if status>>63 else status
+        if w[50:60]!=qwords(0)+qwords(1):raise Failure('Move request before-state lost an earlier committed message.')
+        if op==(1<<64)-2:
+            if side in closed:raise Failure('Duplicate move Node cleanup.')
+            tables[side].clear();discarded[side]+=len(queues[side]);queues[side].clear();slots[side]=[None,None];heads[side]=tails[side]=0;ends[side]=0;closed.add(side)
+        else:
+            ev=evidence.get(seq)
+            if ev is None or len(ev)!=170 or ev[:8]!=[seq,op,w[1],w[2],h,value,w[9],scalar]:raise Failure('Missing exact ownership transition evidence.')
+            owner=next((entry for entry in members['threads'].values() if entry['thread']==w[2]),None)
+            if owner is None or w[1:6]!=[owner['node'],owner['thread'],owner['space'],owner['root'],owner['node']] or w[20:22]!=[owner['top'],owner['top']-160] or w[22]&0x600 or w[18] not in (multi_site(symbols,'neu_ipc_syscall_resume'),multi_site(symbols,'neu_multi_syscall_resume')):raise Failure('Move transaction used a foreign active Node/Thread/root/stack publication.')
+            if ev[8:40]!=table_words(side) or ev[72:84]!=tags() or ev[96:114]!=objects_words():raise Failure('Source ownership/accounting before move differs from independent model.')
+            if side in closed:raise Failure('Terminal Node performed a new capability operation.')
+            error=handle_error(side,h);entry=tables[side].get(h);expected_scalar=0
+            if op==1:
+                error=0;expected_scalar=0x5000000ff
+            elif op==0x11:
+                if not error:del tables[side][h]
+            elif op==0xfffffffffffffc00:
+                if not error and entry[0]>>40!=2:error=-19
+                if not error and not entry[1]&1:error=-18
+                if not error:expected_scalar=1;reads.append((side,entry[0],seq))
+            else:
+                if not error and entry[0]>>40!=4:error=-19
+                right=128 if op==0x17 else 32 if op in (0x13,0x15) else 64
+                if not error and entry[1]&right!=right:error=-18
+                if op==0x17:
+                    if not error:error=handle_error(side,value)
+                    source=tables[side].get(value)
+                    if not error and source[0]>>40 not in (1,2):error=-19
+                    if not error and not source[2]:error=-37
+                if not error:
+                    if op in (0x13,0x15,0x17):
+                        if not ends[peer]:error=-34
+                        elif len(queues[peer])==2:error=-33
+                        else:
+                            if op==0x17:
+                                source=tables[side].pop(value);message=('cap',source[0],source[1]);moves.append((seq,side,source[0],source[1]))
+                            else:message=('scalar',value)
+                            append(peer,message);sent[side]+=1
+                    else:
+                        if not queues[side]:error=-32 if ends[peer] else -34
+                        elif (queues[side][0][0]=='cap')!=(op==0x18):error=-36
+                        elif op==0x18:
+                            free=next((i for i in range(8) if not any((handle&0xffffffff)==i+1 for handle in tables[side]) and generations[side][i]<0xffffffff),None)
+                            if free is None:error=-22
+                            else:
+                                message=pop(side);generations[side][free]+=1;expected_scalar=(generations[side][free]<<32)|(free+1)
+                                tables[side][expected_scalar]=[message[1],message[2],1];deliveries.append((seq,side,expected_scalar,message[1]))
+                        else:expected_scalar=pop(side)[1]
+            if status!=error or scalar!=expected_scalar:raise Failure(f'Move status/result differs from authorization/FIFO model at {seq}: {status},{scalar} expected {error},{expected_scalar}.')
+            if error:errors.add(error)
+            if ev[40:72]!=table_words(side) or ev[84:96]!=tags() or ev[114:132]!=objects_words():raise Failure('Move duplicated/lost/amplified a table or queued reference.')
+            if w[23]&1 and (seq not in state['native'] or state['native'][seq]['words']!=w or state['native'][seq].get('move')!=ev):raise Failure('Missing paused-CPU move/table/object observation.')
+        if w[28:50]!=snapshot() or w[62]!=sum(counts().values()):raise Failure('Move FIFO or reference accounting differs from committed ownership.')
+        if any(sent[1-i]!=received[i]+len(queues[i])+discarded[i] for i in (0,1)):raise Failure('Mixed-message conservation failed.')
+    if closed!={0,1} or any(queues) or sum(counts().values()):raise Failure('Queued move or handle reference survived final teardown.')
+    if len(moves)!=1 or len(deliveries)!=(0 if case=='cap-moves-discard' else 1):raise Failure('Wrong move/delivery commit count.')
+    if not {-16,-17,-18,-19,-22,-33,-36}<=errors or len(state['native'])<9:raise Failure('Incomplete move authorization/rollback/QMP evidence.')
+    if case!='cap-moves-discard' and not any(side==1 and obj==object_ids[1] for side,obj,_ in reads):raise Failure('No actual receiver use of sender Flag.')
+    if case=='cap-moves-discard' and discarded[1]!=2:raise Failure('Fault did not discard exactly the queued capability and pending scalar.')
+    if not any(p['words'][6]==1 and p['words'][10]==0x5000000ff for p in state['native'].values()):raise Failure('Missing QMP ABI 0.5 query result.')
+    return {'moves':moves,'deliveries':deliveries,'reads':reads,'errors':sorted(errors),'sent':sent,'received':received,'discarded':discarded,'qmp_probes':len(state['native']),'records':len(rows),'final_references':0,'final_observed_objects':state['final_move_accounting']}
+
+
 def check_ipc(case,text,symbols,members,state):
+    if case in MOVE_CASES:return check_moves(case,text,symbols,members,state)
     a=members['threads'][1]['node'];b=members['threads'][3]['node'];owners=[a,b]
     if f'IPC bootstrap: A={a} B={b} objects=6 references=16 handles=8,8 endpoints=2 channels=1 queues=2 capacity=2 ABI=0.3' not in text:raise Failure('Missing complete trusted Channel bootstrap.')
     records=[list(map(lambda v:int(v,0),s.split(','))) for s in re.findall(r'IPC record: words=([^\n]+)',text)]
@@ -2192,7 +2329,8 @@ def check_native(case, text, symbols, observed):
     contexts = re.findall(r"Native kernel: CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) frame=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) CR3=(0x[0-9a-f]+)", text)
     canaries = re.findall(r"Native canaries: RBX=(0x[0-9a-f]+) RBP=(0x[0-9a-f]+) R12=(0x[0-9a-f]+) R13=(0x[0-9a-f]+) R14=(0x[0-9a-f]+) R15=(0x[0-9a-f]+)", text)
     query, exit_op = symbols["neu_abi_query"], symbols["neu_abi_exit"]
-    operations = [query, query, exit_op] if kind == 0 else ([query, (0x13 if case=="native-abi03-disabled" else (0x15 if case=="native-abi04-disabled" else (0x12 if case=="native-abi02-disabled" else (0xfffffffffffffd00 if case=="native-cap-disabled" else (1 << 64) - 1)))), query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
+    unsupported_op={'native-abi03-disabled':0x13,'native-abi04-disabled':0x15,'native-abi02-disabled':0x12,'native-cap-disabled':0xfffffffffffffd00,'native-move-send-disabled':0x17,'native-move-receive-disabled':0x18}.get(case,(1<<64)-1)
+    operations = [query, query, exit_op] if kind == 0 else ([query, unsupported_op, query, exit_op] if kind == 1 else ([query, exit_op, query, exit_op] if kind == 2 else ([] if kind == 7 else [query])))
     arguments = [11, 11, 0] if kind == 0 else ([11, 11, 11, 0] if kind == 1 else ([11, 256, 11, 0] if kind == 2 else ([] if kind == 7 else [11])))
     if len(entries) != len(operations) or len(contexts) != len(entries) or len(canaries) != len(entries):
         raise Failure("Incorrect native entry/context count.")
@@ -2436,7 +2574,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -2564,17 +2702,30 @@ def run_case(case, esp, timeout):
                 timer = check_timer(case,text,symbols,timer_observations,paging["root"],qmp) if case in TIMER_CASES else None
                 switching = check_switch(case,text,symbols,switch_observations,paging["root"],qmp) if case in SWITCH_CASES else None
                 preemption=check_preempt(case,text,symbols,preempt_observations,paging["root"],qmp) if case in PREEMPT_CASES else None
-                member_case={'capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault','channels-xapic':'threads-xapic','channels-a-fault':'threads-a1-fault','channels-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES or case in IPC_CASES else case)
+                member_case={'cap-moves-xapic':'threads-xapic','cap-moves-discard':'threads-b-fault','capabilities-xapic':'threads-xapic','capabilities-a-fault':'threads-a1-fault','capabilities-a2-fault':'threads-a2-fault','capabilities-b-fault':'threads-b-fault','address-space-xapic':'threads-xapic','address-space-a-fault':'threads-a1-fault','address-space-a2-fault':'threads-a2-fault','address-space-b-fault':'threads-b-fault','channels-xapic':'threads-xapic','channels-a-fault':'threads-a1-fault','channels-b-fault':'threads-b-fault'}.get(case,'threads' if case in CAP_CASES or case in AS_CASES or case in IPC_CASES else case)
                 if case in WAIT_CASES:
-                    members=check_wait_multi(case,text,symbols,multi_observations,paging["root"],qmp)
+                    members=check_wait_multi('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,multi_observations,paging["root"],qmp)
                 else:
                     members=check_multi(member_case,text,symbols,multi_observations,paging["root"],qmp,case in CAP_CASES or case in AS_CASES or case in IPC_CASES) if case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else None
+                if case in MOVE_CASES:
+                    addresses=debug_words(qmp,symbols['neu_move_witness']+136*8,18)
+                    final=[]
+                    for i in range(6):
+                        row=[]
+                        for address in addresses[i*3+1:i*3+3]:
+                            raw=qmp.call('human-monitor-command',{'command-line':f'x /1wx {address:#x}'})
+                            values=re.findall(r'0x[0-9a-fA-F]+',raw)
+                            if len(values)!=1:raise Failure('Missing final real registry accounting.')
+                            row.append(int(values[0],16))
+                        if row!=[0,0]:raise Failure('Actual object reference/pin survived final move cleanup.')
+                        final.append(row)
+                    cap_state['final_move_accounting']=final
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
                 capabilities=check_capabilities(case,text,symbols,members,cap_state) if case in CAP_CASES else None
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
-                ipc=check_ipc_wait(case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
+                ipc=check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
                 result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)

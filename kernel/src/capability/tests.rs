@@ -1925,3 +1925,117 @@ fn a_woken_receiver_drains_a_committed_message_before_observing_peer_close() {
     close_all(&mut n, &mut o, b1.node);
     assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
 }
+
+fn movable_wait_fixture() -> (
+    Nodes,
+    Objects,
+    ActiveContext,
+    ActiveContext,
+    ActiveContext,
+    Handle,
+) {
+    let (mut n, mut o, a1, a2, b1) = waiters();
+    let endpoint = endpoint(&n, &o, a1.node, 4);
+    let flag = o.flag(true).unwrap();
+    let table = n.authority_mut(a1.node).unwrap();
+    table.sealed = false;
+    let source = table.grant_movable(&mut o, &flag, Rights::READ).unwrap();
+    table.slots[endpoint.parts().unwrap().0]
+        .entry
+        .as_mut()
+        .unwrap()
+        .rights = Rights(224);
+    table.seal_bootstrap();
+    o.release(flag).unwrap();
+    (n, o, a1, a2, b1, source)
+}
+
+#[test]
+fn capability_enqueue_wakes_scalar_waiter_to_kind_error_without_consuming_authority() {
+    let (mut n, mut o, a, _, b, source) = movable_wait_fixture();
+    let ah = endpoint(&n, &o, a.node, 4);
+    let bh = endpoint(&n, &o, b.node, 4);
+    assert_eq!(receive_start(&n, &mut o, b, bh), Ok(WaitStart::Blocked));
+    n.authority_mut(a.node)
+        .unwrap()
+        .send_cap(&mut o, a.node, ah, source)
+        .unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    let before = o.channel_state().snapshot();
+    let tags = o.channel_state().transfer_snapshot();
+    assert_eq!(o.settle_wait(b.thread), Settle::Failed(Error::MessageKind));
+    assert_eq!(o.stats().pins, 0);
+    assert_eq!(o.channel_state().snapshot(), before);
+    assert_eq!(o.channel_state().transfer_snapshot(), tags);
+    let received = n
+        .authority_mut(b.node)
+        .unwrap()
+        .receive_cap(&mut o, b.node, bh)
+        .unwrap();
+    assert_eq!(
+        n.authority(b.node)
+            .unwrap()
+            .lookup(&mut o, b.node, received, ObjectType::Flag, Rights::READ)
+            .unwrap()
+            .read(),
+        Ok(1)
+    );
+    n.authority_mut(b.node)
+        .unwrap()
+        .close(&mut o, b.node, received)
+        .unwrap();
+    close_all(&mut n, &mut o, a.node);
+    close_all(&mut n, &mut o, b.node);
+    assert_eq!(o.stats(), Stats::default());
+}
+
+#[test]
+fn capability_dequeue_wakes_full_scalar_sender_and_settlement_commits_once() {
+    let (mut n, mut o, a, a2, b, source) = movable_wait_fixture();
+    let ah = endpoint(&n, &o, a.node, 4);
+    let bh = endpoint(&n, &o, b.node, 4);
+    n.authority_mut(a.node)
+        .unwrap()
+        .send_cap(&mut o, a.node, ah, source)
+        .unwrap();
+    send(&n, &mut o, a.node, ah, 77).unwrap();
+    assert_eq!(send_start(&n, &mut o, a2, ah, 88), Ok(WaitStart::Blocked));
+    let received = n
+        .authority_mut(b.node)
+        .unwrap()
+        .receive_cap(&mut o, b.node, bh)
+        .unwrap();
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a2.thread), Settle::Committed(0));
+    assert_eq!(receive(&n, &mut o, b.node, bh), Ok(77));
+    assert_eq!(receive(&n, &mut o, b.node, bh), Ok(88));
+    assert_eq!(o.stats().pins, 0);
+    n.authority_mut(b.node)
+        .unwrap()
+        .close(&mut o, b.node, received)
+        .unwrap();
+    close_all(&mut n, &mut o, a.node);
+    close_all(&mut n, &mut o, b.node);
+    assert_eq!(o.stats(), Stats::default());
+}
+
+#[test]
+fn cancellation_of_scalar_wait_and_discard_of_queued_move_release_distinct_pins_and_refs() {
+    let (mut n, mut o, a, a2, b, source) = movable_wait_fixture();
+    let ah = endpoint(&n, &o, a.node, 4);
+    let bh = endpoint(&n, &o, b.node, 4);
+    assert_eq!(receive_start(&n, &mut o, b, bh), Ok(WaitStart::Blocked));
+    n.authority_mut(a.node)
+        .unwrap()
+        .send_cap(&mut o, a.node, ah, source)
+        .unwrap();
+    assert_eq!(receive_start(&n, &mut o, a2, ah), Ok(WaitStart::Blocked));
+    assert_eq!(o.cancel_node_waits(b.node), 1);
+    close_all(&mut n, &mut o, b.node);
+    assert_eq!(o.channel_state().stats().queued, 0);
+    assert_eq!(queued(&mut o).1, 1);
+    assert_eq!(o.settle_wait(a2.thread), Settle::Failed(Error::PeerClosed));
+    assert_eq!(o.stats().pins, 0);
+    close_all(&mut n, &mut o, a.node);
+    assert_eq!(o.stats(), Stats::default());
+}

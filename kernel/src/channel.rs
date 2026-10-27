@@ -1,7 +1,7 @@
 //! One bounded duplex Channel. Mechanism identities are never user handles.
 //! Mutation requires the registry's exclusive IF=0 transaction in the kernel.
 use crate::{
-    capability::{Error, Result},
+    capability::{Error, OwnedTransfer, Result},
     node::NodeId,
 };
 pub const MESSAGES: usize = 2;
@@ -42,12 +42,12 @@ pub struct EndpointInfo {
     pub owner: NodeId,
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct Fifo {
     head: u64,
     tail: u64,
     len: u64,
     values: [u64; MESSAGES],
+    transfers: [Option<OwnedTransfer>; MESSAGES],
 }
 impl Fifo {
     const EMPTY: Self = Self {
@@ -55,6 +55,7 @@ impl Fifo {
         tail: 0,
         len: 0,
         values: [0; MESSAGES],
+        transfers: [const { None }; MESSAGES],
     };
     fn validate(&self) -> Result<()> {
         let capacity = MESSAGES as u64;
@@ -64,6 +65,12 @@ impl Fifo {
             || (self.head + self.len) % capacity != self.tail
         {
             return Err(Error::Terminal);
+        }
+        for (slot, transfer) in self.transfers.iter().enumerate() {
+            let occupied = (slot as u64 + capacity - self.head) % capacity < self.len;
+            if transfer.is_some() && (!occupied || self.values[slot] != 0) {
+                return Err(Error::Terminal);
+            }
         }
         Ok(())
     }
@@ -83,12 +90,15 @@ impl Fifo {
             return Ok(None);
         }
         let v = self.values[self.head as usize];
+        if self.transfers[self.head as usize].is_some() {
+            return Err(Error::MessageKind);
+        }
         self.values[self.head as usize] = 0;
         self.head = (self.head + 1) % MESSAGES as u64;
         self.len -= 1;
         Ok(Some(v))
     }
-    fn words(self) -> [u64; 5] {
+    fn words(&self) -> [u64; 5] {
         [
             self.head,
             self.tail,
@@ -136,7 +146,7 @@ impl Channels {
                 generation: 0,
                 info: None,
             }; 2],
-            queues: [Fifo::EMPTY; 2],
+            queues: [const { Fifo::EMPTY }; 2],
             sent: [0; 2],
             received: [0; 2],
             discarded: [0; 2],
@@ -152,6 +162,13 @@ impl Channels {
         {
             Err(Error::Capacity)
         } else {
+            if self
+                .queues
+                .iter()
+                .any(|q| q.len != 0 || q.transfers.iter().any(Option::is_some))
+            {
+                return Err(Error::Terminal);
+            }
             Ok(())
         }
     }
@@ -162,7 +179,7 @@ impl Channels {
         }
         self.generation += 1;
         self.live = true;
-        self.queues = [Fifo::EMPTY; 2];
+        self.queues = [const { Fifo::EMPTY }; 2];
         self.sent = [0; 2];
         self.received = [0; 2];
         self.discarded = [0; 2];
@@ -225,16 +242,72 @@ impl Channels {
             }
         }
     }
-    pub(crate) fn send(&mut self, id: EndpointId, owner: NodeId, payload: u64) -> Result<()> {
+    pub(crate) fn can_send(&self, id: EndpointId, owner: NodeId) -> Result<EndpointInfo> {
         let i = self.owned(id, owner)?;
         let peer = 1 - i.side;
         if !self.peer_live(i)? {
             return Err(Error::PeerClosed);
         }
-        let count = self.sent[i.side].checked_add(1).ok_or(Error::Capacity)?;
+        self.sent[i.side].checked_add(1).ok_or(Error::Capacity)?;
+        self.queues[peer].validate()?;
+        if self.queues[peer].len == MESSAGES as u64 {
+            return Err(Error::Full);
+        }
+        Ok(i)
+    }
+    pub(crate) fn send(&mut self, id: EndpointId, owner: NodeId, payload: u64) -> Result<()> {
+        let i = self.can_send(id, owner)?;
+        let peer = 1 - i.side;
+        let count = self.sent[i.side] + 1;
         self.queues[peer].push(payload)?; // linearization: scalar becomes queued
         self.sent[i.side] = count;
         Ok(())
+    }
+    pub(crate) fn send_transfer(&mut self, id: EndpointId, owner: NodeId, transfer: OwnedTransfer) {
+        let i = self
+            .can_send(id, owner)
+            .expect("exclusive send-cap preflight");
+        let q = &mut self.queues[1 - i.side];
+        q.transfers[q.tail as usize] = Some(transfer);
+        q.values[q.tail as usize] = 0;
+        q.tail = (q.tail + 1) % MESSAGES as u64;
+        q.len += 1;
+        self.sent[i.side] += 1;
+    }
+    pub(crate) fn peek_transfer(&self, id: EndpointId, owner: NodeId) -> Result<&OwnedTransfer> {
+        let i = self.owned(id, owner)?;
+        let live = self.peer_live(i)?;
+        let q = &self.queues[i.side];
+        q.validate()?;
+        if q.len == 0 {
+            return Err(if live {
+                Error::Empty
+            } else {
+                Error::PeerClosed
+            });
+        }
+        self.received[i.side]
+            .checked_add(1)
+            .ok_or(Error::Capacity)?;
+        q.transfers[q.head as usize]
+            .as_ref()
+            .ok_or(Error::MessageKind)
+    }
+    pub(crate) fn receive_transfer(
+        &mut self,
+        id: EndpointId,
+        owner: NodeId,
+    ) -> Result<OwnedTransfer> {
+        self.peek_transfer(id, owner)?;
+        let i = self.owned(id, owner)?;
+        let q = &mut self.queues[i.side];
+        let transfer = q.transfers[q.head as usize]
+            .take()
+            .expect("checked capability head");
+        q.head = (q.head + 1) % MESSAGES as u64;
+        q.len -= 1;
+        self.received[i.side] += 1;
+        Ok(transfer)
     }
     pub(crate) fn receive(&mut self, id: EndpointId, owner: NodeId) -> Result<u64> {
         let i = self.owned(id, owner)?;
@@ -254,7 +327,10 @@ impl Channels {
         self.received[i.side] = count;
         Ok(value)
     }
-    pub(crate) fn retire(&mut self, reference: EndpointRef) -> Result<()> {
+    pub(crate) fn retire_owned(
+        &mut self,
+        reference: EndpointRef,
+    ) -> Result<[Option<OwnedTransfer>; MESSAGES]> {
         let i = self.info(reference.id)?;
         self.queues[i.side].validate()?;
         // Retirement cannot publish a partially accounted discard. The sole
@@ -263,13 +339,52 @@ impl Channels {
             .checked_add(self.queues[i.side].len)
             .ok_or(Error::Terminal)?;
         self.discarded[i.side] = discarded;
+        let transfers = core::mem::replace(
+            &mut self.queues[i.side].transfers,
+            [const { None }; MESSAGES],
+        );
         self.queues[i.side] = Fifo::EMPTY;
         self.ends[i.side] = None;
         self.endpoints[reference.id.slot].info = None;
         if self.ends == [None; 2] {
             self.live = false;
         }
+        Ok(transfers)
+    }
+    #[cfg(test)]
+    fn retire(&mut self, reference: EndpointRef) -> Result<()> {
+        let transfers = self.retire_owned(reference)?;
+        assert!(
+            transfers.iter().all(Option::is_none),
+            "scalar fixture cannot discard owned authority"
+        );
         Ok(())
+    }
+    /// Supervisor-only per-slot tags and transfer identity/rights for QMP.
+    pub fn transfer_snapshot(&self) -> [u64; 12] {
+        let mut words = [0; 12];
+        for (side, q) in self.queues.iter().enumerate() {
+            for (slot, transfer) in q.transfers.iter().enumerate() {
+                if let Some(t) = transfer {
+                    let (id, rights) = t.description();
+                    let offset = side * 6 + slot * 3;
+                    words[offset..offset + 3].copy_from_slice(&[1, id.raw(), rights.bits()]);
+                }
+            }
+        }
+        words
+    }
+    pub fn queued_capabilities(&self) -> u32 {
+        self.queues
+            .iter()
+            .map(|q| q.transfers.iter().filter(|t| t.is_some()).count() as u32)
+            .sum()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_counters(&mut self, sent: [u64; 2], received: [u64; 2]) {
+        // Boundary injection exists only in host tests, never a guest ABI.
+        self.sent = sent;
+        self.received = received;
     }
     pub fn stats(&self) -> Stats {
         Stats {

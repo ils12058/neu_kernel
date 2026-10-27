@@ -52,6 +52,10 @@ neu_as_user_steps:
     as_call 0x13,0,0,-1,0
     as_call 0x14,0,0,-1,0
     .endif
+    .if {move_disabled}
+    as_call 0x17,0,0,-1,0
+    as_call 0x18,0,0,-1,0
+    .endif
     as_get 0,16
     as_get 1,24
     as_get 2,32

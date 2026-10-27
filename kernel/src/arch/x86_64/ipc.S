@@ -127,6 +127,10 @@ neu_ipc_user_steps:
     cmp rdx,rcx
     jne neu_multi_failed
     mov r12d,4
+    .if {move_disabled}
+    ipc_call 0x17,0,0,-1,0
+    ipc_call 0x18,0,0,-1,0
+    .endif
     mov r13d,0x402110
 .Lipc_discover:
     mov eax,0x10

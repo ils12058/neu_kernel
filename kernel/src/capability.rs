@@ -24,6 +24,7 @@ impl Rights {
     pub const SEND: Self = Self(32);
     pub const RECEIVE: Self = Self(64);
     pub const SEND_RECEIVE: Self = Self(96);
+    pub const SEND_CAPS: Self = Self(128);
     pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
         if bits == 0 || bits & !0x73 != 0 {
@@ -40,7 +41,7 @@ impl Rights {
             ObjectType::Counter => self.0 != 0 && self.0 & !3 == 0,
             ObjectType::Flag => self.0 == 1,
             ObjectType::AddressSpace => self.0 & !16 == 0,
-            ObjectType::ChannelEndpoint => self.0 != 0 && self.0 & !96 == 0,
+            ObjectType::ChannelEndpoint => self.0 != 0 && self.0 & !224 == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -79,6 +80,7 @@ impl TableId {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct ObjectId {
     slot: usize,
     generation: u32,
@@ -107,6 +109,8 @@ pub enum Error {
     Full = -33,
     PeerClosed = -34,
     Terminal = -35,
+    MessageKind = -36,
+    Transfer = -37,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +161,18 @@ impl Object {
 pub struct ObjectRef {
     id: ObjectId,
 }
+/// Exactly one existing reference, moved from a table into one FIFO slot.
+/// No Clone/Copy, borrow, pointer, or user-selected object identity.
+#[must_use = "install the queued reference in a table or release it on discard"]
+pub(crate) struct OwnedTransfer {
+    reference: ObjectRef,
+    rights: Rights,
+}
+impl OwnedTransfer {
+    pub(crate) fn description(&self) -> (ObjectId, Rights) {
+        (self.reference.id, self.rights)
+    }
+}
 impl ObjectRef {
     pub fn id(&self) -> ObjectId {
         self.id
@@ -202,6 +218,40 @@ impl Objects {
     }
     pub fn channel_state(&self) -> &crate::channel::Channels {
         &self.channels
+    }
+    pub fn queued_references(&self) -> u32 {
+        self.channels.queued_capabilities()
+    }
+    #[cfg(feature = "cap-move-test")]
+    pub fn move_objects(&self) -> [u64; 18] {
+        let mut words = [0; 18];
+        for (i, o) in self.slots.iter().enumerate() {
+            if let Some(value) = o.value.as_ref() {
+                words[i * 3..i * 3 + 3].copy_from_slice(&[
+                    ObjectId {
+                        slot: i,
+                        generation: o.generation,
+                        kind: value.kind(),
+                    }
+                    .raw(),
+                    o.references as u64,
+                    o.pins as u64,
+                ]);
+            }
+        }
+        words
+    }
+    #[cfg(feature = "cap-move-test")]
+    pub fn move_object_addresses(&self) -> [u64; 18] {
+        let mut addresses = [0; 18];
+        for (i, o) in self.slots.iter().enumerate() {
+            addresses[i * 3..i * 3 + 3].copy_from_slice(&[
+                core::ptr::from_ref(&o.generation) as u64,
+                core::ptr::from_ref(&o.references) as u64,
+                core::ptr::from_ref(&o.pins) as u64,
+            ]);
+        }
+        addresses
     }
     pub fn wait_stats(&self) -> crate::wait::Stats {
         self.waits.stats()
@@ -598,7 +648,7 @@ impl Objects {
         }
     }
     /// Supervisor-only QMP instrumentation, never returned through the ABI.
-    #[cfg(feature = "cap-test")]
+    #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
     pub fn value_address(&self, id: ObjectId) -> Result<u64> {
         match self.object(id)?.value.as_ref() {
             Some(Value::Counter(value)) => Ok(value as *const u64 as u64),
@@ -632,9 +682,14 @@ impl Objects {
         {
             let retired = self.slots[slot].value.take();
             if let Some(Value::Endpoint(reference)) = retired {
-                self.channels
-                    .retire(reference)
+                let discarded = self
+                    .channels
+                    .retire_owned(reference)
                     .expect("last unpinned endpoint reference");
+                for transfer in discarded.into_iter().flatten() {
+                    self.release(transfer.reference)
+                        .expect("queued reference ownership");
+                }
             }
         }
     }
@@ -670,10 +725,12 @@ impl Objects {
         self.collect(id.slot);
     }
 }
+#[repr(C)]
 struct Entry {
     target: ObjectId,
     kind: ObjectType,
     rights: Rights,
+    transferable: bool,
 }
 struct Slot {
     generation: u32,
@@ -697,6 +754,33 @@ pub struct Table {
     sealed: bool,
 }
 impl Table {
+    #[cfg(feature = "cap-move-test")]
+    pub fn move_slots(&self) -> [u64; 32] {
+        let mut words = [0; 32];
+        for (i, s) in self.slots.iter().enumerate() {
+            if let Some(e) = s.entry.as_ref() {
+                words[i * 4..i * 4 + 4].copy_from_slice(&[
+                    Handle::new(i, s.generation).raw(),
+                    e.target.raw(),
+                    e.rights.bits(),
+                    e.transferable as u64,
+                ]);
+            }
+        }
+        words
+    }
+    #[cfg(feature = "cap-move-test")]
+    pub fn move_slot_addresses(&self) -> [u64; 16] {
+        let mut addresses = [0; 16];
+        for (i, s) in self.slots.iter().enumerate() {
+            addresses[i * 2] = core::ptr::from_ref(&s.generation) as u64;
+            addresses[i * 2 + 1] = s
+                .entry
+                .as_ref()
+                .map_or(0, |e| core::ptr::from_ref(e) as u64);
+        }
+        addresses
+    }
     pub(crate) fn new(owner: NodeId) -> Self {
         Self {
             live: true,
@@ -771,6 +855,7 @@ impl Table {
                 target: id,
                 kind: id.kind,
                 rights,
+                transferable: false,
             }),
         };
         Ok(Handle::new(slot, generation))
@@ -789,8 +874,164 @@ impl Table {
         self.bootstrap[index] = Some(handle);
         Ok(handle)
     }
+    /// Trusted bootstrap grant for the supported move-only object subset.
+    pub fn grant_movable(
+        &mut self,
+        objects: &mut Objects,
+        reference: &ObjectRef,
+        rights: Rights,
+    ) -> Result<Handle> {
+        if !matches!(reference.id.kind, ObjectType::Flag | ObjectType::Counter) {
+            return Err(Error::Type);
+        }
+        if self.sealed {
+            return Err(Error::InUse);
+        }
+        let handle = self.grant(objects, reference, rights)?;
+        self.slots[handle.parts()?.0]
+            .entry
+            .as_mut()
+            .unwrap()
+            .transferable = true;
+        Ok(handle)
+    }
     pub fn seal_bootstrap(&mut self) {
         self.sealed = true;
+    }
+    /// Trusted bootstrap configuration only. Index meanings and table capacity
+    /// are unchanged. Legacy grants do not acquire these permissions implicitly.
+    pub fn configure_moves(&mut self) -> Result<()> {
+        if self.sealed || !self.live {
+            return Err(Error::InUse);
+        }
+        let flag = self.bootstrap[3].ok_or(Error::Handle)?;
+        let endpoint = self.bootstrap[4].ok_or(Error::Handle)?;
+        if self.entry(self.id.owner(), flag)?.kind != ObjectType::Flag
+            || self.entry(self.id.owner(), endpoint)?.kind != ObjectType::ChannelEndpoint
+        {
+            return Err(Error::Type);
+        }
+        self.slots[flag.parts()?.0]
+            .entry
+            .as_mut()
+            .unwrap()
+            .transferable = true;
+        self.slots[endpoint.parts()?.0]
+            .entry
+            .as_mut()
+            .unwrap()
+            .rights = Rights(224);
+        Ok(())
+    }
+    fn move_endpoint(
+        &self,
+        objects: &Objects,
+        caller: NodeId,
+        handle: Handle,
+        right: Rights,
+    ) -> Result<crate::channel::EndpointInfo> {
+        if !self.live {
+            return Err(Error::Owner);
+        }
+        let entry = self.entry(caller, handle)?;
+        let object = objects.object(entry.target)?;
+        if object.references == 0 {
+            return Err(Error::Object);
+        }
+        if entry.kind != ObjectType::ChannelEndpoint || entry.target.kind != entry.kind {
+            return Err(Error::Type);
+        }
+        if !entry.rights.valid(entry.kind) || !entry.rights.contains(right) {
+            return Err(Error::Rights);
+        }
+        let Some(Value::Endpoint(reference)) = object.value.as_ref() else {
+            return Err(Error::Type);
+        };
+        let info = objects.channels.info(reference.id())?;
+        if info.owner != caller {
+            return Err(Error::Owner);
+        }
+        Ok(info)
+    }
+    /// One exclusive registry/table transaction. Ordinary failures precede
+    /// detachment; the source reference is moved, never retained or released.
+    pub fn send_cap(
+        &mut self,
+        objects: &mut Objects,
+        caller: NodeId,
+        endpoint: Handle,
+        source: Handle,
+    ) -> Result<()> {
+        let info = self.move_endpoint(objects, caller, endpoint, Rights::SEND_CAPS)?;
+        let entry = self.entry(caller, source)?;
+        if objects.object(entry.target)?.references == 0 {
+            return Err(Error::Object);
+        }
+        if entry.target.kind != entry.kind
+            || !matches!(entry.kind, ObjectType::Flag | ObjectType::Counter)
+        {
+            return Err(Error::Type);
+        }
+        if !entry.rights.valid(entry.kind) {
+            return Err(Error::Rights);
+        }
+        if !entry.transferable {
+            return Err(Error::Transfer);
+        }
+        objects.channels.can_send(info.id, caller)?;
+        let entry = self.slots[source.parts()?.0]
+            .entry
+            .take()
+            .expect("preflighted source");
+        let transfer = OwnedTransfer {
+            reference: ObjectRef { id: entry.target },
+            rights: entry.rights,
+        };
+        objects.channels.send_transfer(info.id, caller, transfer);
+        objects.wake_receive(info);
+        Ok(())
+    }
+    /// Delivery is a separate atomic transaction. No free slot means the owned
+    /// token remains at the FIFO head, with counters and generations unchanged.
+    pub fn receive_cap(
+        &mut self,
+        objects: &mut Objects,
+        caller: NodeId,
+        endpoint: Handle,
+    ) -> Result<Handle> {
+        let info = self.move_endpoint(objects, caller, endpoint, Rights::RECEIVE)?;
+        let (id, _) = objects
+            .channels
+            .peek_transfer(info.id, caller)?
+            .description();
+        objects.object(id)?;
+        let slot = self
+            .slots
+            .iter()
+            .position(|s| s.entry.is_none() && s.generation != u32::MAX)
+            .ok_or(Error::Capacity)?;
+        let generation = self.slots[slot].generation + 1;
+        let OwnedTransfer {
+            reference: ObjectRef { id },
+            rights,
+        } = objects.channels.receive_transfer(info.id, caller)?;
+        self.slots[slot] = Slot {
+            generation,
+            entry: Some(Entry {
+                target: id,
+                kind: id.kind,
+                rights,
+                transferable: true,
+            }),
+        };
+        // The consumed token's reference is now owned by the installed entry.
+        objects.wake_send(info);
+        if objects.channels.snapshot()[8 + info.side * 5] != 0 {
+            objects
+                .waits
+                .wake(info.channel, info.side, Kind::Receive, false);
+        }
+        Ok(Handle::new(slot, generation))
     }
     pub fn bootstrap_get(&self, objects: &Objects, caller: NodeId, index: u64) -> Result<Handle> {
         self.owner(caller)?;
@@ -869,7 +1110,7 @@ pub struct Guard<'a> {
     rights: Rights,
 }
 impl Guard<'_> {
-    #[cfg(feature = "cap-test")]
+    #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
     pub fn value_address(&self) -> u64 {
         self.objects.value_address(self.id).expect("guarded value")
     }
@@ -1028,5 +1269,7 @@ impl Lease {
     }
 }
 
+#[cfg(test)]
+mod moves_tests;
 #[cfg(test)]
 mod tests;
