@@ -41,13 +41,30 @@ pub struct EndpointInfo {
     pub side: usize,
     pub owner: NodeId,
 }
+/// Explicit live identity plus the non-copyable ownership token. QMP reads
+/// only the mirrored identity/rights fields; the token remains private.
+#[repr(C)]
+struct TransferSlot {
+    live: bool,
+    object: crate::capability::ObjectId,
+    rights: crate::capability::Rights,
+    owned: Option<OwnedTransfer>,
+}
+impl TransferSlot {
+    const EMPTY: Self = Self {
+        live: false,
+        object: crate::capability::ObjectId::EMPTY,
+        rights: crate::capability::Rights::NONE,
+        owned: None,
+    };
+}
 #[repr(C)]
 struct Fifo {
     head: u64,
     tail: u64,
     len: u64,
     values: [u64; MESSAGES],
-    transfers: [Option<OwnedTransfer>; MESSAGES],
+    transfers: [TransferSlot; MESSAGES],
 }
 impl Fifo {
     const EMPTY: Self = Self {
@@ -55,7 +72,7 @@ impl Fifo {
         tail: 0,
         len: 0,
         values: [0; MESSAGES],
-        transfers: [const { None }; MESSAGES],
+        transfers: [const { TransferSlot::EMPTY }; MESSAGES],
     };
     fn validate(&self) -> Result<()> {
         let capacity = MESSAGES as u64;
@@ -68,7 +85,18 @@ impl Fifo {
         }
         for (slot, transfer) in self.transfers.iter().enumerate() {
             let occupied = (slot as u64 + capacity - self.head) % capacity < self.len;
-            if transfer.is_some() && (!occupied || self.values[slot] != 0) {
+            if transfer.live {
+                if !occupied
+                    || self.values[slot] != 0
+                    || transfer.owned.is_none()
+                    || transfer.object == crate::capability::ObjectId::EMPTY
+                {
+                    return Err(Error::Terminal);
+                }
+            } else if transfer.owned.is_some()
+                || transfer.object != crate::capability::ObjectId::EMPTY
+                || transfer.rights != crate::capability::Rights::NONE
+            {
                 return Err(Error::Terminal);
             }
         }
@@ -79,7 +107,11 @@ impl Fifo {
         if self.len == MESSAGES as u64 {
             return Err(Error::Full);
         }
-        self.values[self.tail as usize] = value;
+        let slot = self.tail as usize;
+        if self.transfers[slot].live {
+            return Err(Error::Terminal);
+        }
+        self.values[slot] = value;
         self.tail = (self.tail + 1) % MESSAGES as u64;
         self.len += 1;
         Ok(())
@@ -90,7 +122,7 @@ impl Fifo {
             return Ok(None);
         }
         let v = self.values[self.head as usize];
-        if self.transfers[self.head as usize].is_some() {
+        if self.transfers[self.head as usize].live {
             return Err(Error::MessageKind);
         }
         self.values[self.head as usize] = 0;
@@ -165,7 +197,7 @@ impl Channels {
             if self
                 .queues
                 .iter()
-                .any(|q| q.len != 0 || q.transfers.iter().any(Option::is_some))
+                .any(|q| q.len != 0 || q.transfers.iter().any(|t| t.live))
             {
                 return Err(Error::Terminal);
             }
@@ -268,8 +300,15 @@ impl Channels {
             .can_send(id, owner)
             .expect("exclusive send-cap preflight");
         let q = &mut self.queues[1 - i.side];
-        q.transfers[q.tail as usize] = Some(transfer);
-        q.values[q.tail as usize] = 0;
+        let slot = q.tail as usize;
+        let (object, rights) = transfer.description();
+        q.transfers[slot] = TransferSlot {
+            live: true,
+            object,
+            rights,
+            owned: Some(transfer),
+        };
+        q.values[slot] = 0;
         q.tail = (q.tail + 1) % MESSAGES as u64;
         q.len += 1;
         self.sent[i.side] += 1;
@@ -290,6 +329,7 @@ impl Channels {
             .checked_add(1)
             .ok_or(Error::Capacity)?;
         q.transfers[q.head as usize]
+            .owned
             .as_ref()
             .ok_or(Error::MessageKind)
     }
@@ -302,8 +342,10 @@ impl Channels {
         let i = self.owned(id, owner)?;
         let q = &mut self.queues[i.side];
         let transfer = q.transfers[q.head as usize]
+            .owned
             .take()
             .expect("checked capability head");
+        q.transfers[q.head as usize] = TransferSlot::EMPTY;
         q.head = (q.head + 1) % MESSAGES as u64;
         q.len -= 1;
         self.received[i.side] += 1;
@@ -341,7 +383,7 @@ impl Channels {
         self.discarded[i.side] = discarded;
         let transfers = core::mem::replace(
             &mut self.queues[i.side].transfers,
-            [const { None }; MESSAGES],
+            [const { TransferSlot::EMPTY }; MESSAGES],
         );
         self.queues[i.side] = Fifo::EMPTY;
         self.ends[i.side] = None;
@@ -349,7 +391,7 @@ impl Channels {
         if self.ends == [None; 2] {
             self.live = false;
         }
-        Ok(transfers)
+        Ok(transfers.map(|mut slot| slot.owned.take()))
     }
     #[cfg(test)]
     fn retire(&mut self, reference: EndpointRef) -> Result<()> {
@@ -365,10 +407,13 @@ impl Channels {
         let mut words = [0; 12];
         for (side, q) in self.queues.iter().enumerate() {
             for (slot, transfer) in q.transfers.iter().enumerate() {
-                if let Some(t) = transfer {
-                    let (id, rights) = t.description();
+                if transfer.live {
                     let offset = side * 6 + slot * 3;
-                    words[offset..offset + 3].copy_from_slice(&[1, id.raw(), rights.bits()]);
+                    words[offset..offset + 3].copy_from_slice(&[
+                        1,
+                        transfer.object.raw(),
+                        transfer.rights.bits(),
+                    ]);
                 }
             }
         }
@@ -377,8 +422,47 @@ impl Channels {
     pub fn queued_capabilities(&self) -> u32 {
         self.queues
             .iter()
-            .map(|q| q.transfers.iter().filter(|t| t.is_some()).count() as u32)
+            .map(|q| q.transfers.iter().filter(|t| t.live).count() as u32)
             .sum()
+    }
+    /// Test-only schema for the independent stopped-CPU observer.
+    #[cfg(feature = "cap-move-test")]
+    pub fn diagnostic_layout(&self) -> [u64; 32] {
+        use core::mem::{offset_of as off, size_of as size};
+        [
+            1,
+            self as *const Self as u64,
+            size::<Self>() as u64,
+            off!(Self, generation) as u64,
+            off!(Self, live) as u64,
+            off!(Self, ends) as u64,
+            off!(Self, owners) as u64,
+            off!(Self, endpoints) as u64,
+            off!(Self, queues) as u64,
+            off!(Self, sent) as u64,
+            off!(Self, received) as u64,
+            off!(Self, discarded) as u64,
+            size::<Fifo>() as u64,
+            off!(Fifo, head) as u64,
+            off!(Fifo, tail) as u64,
+            off!(Fifo, len) as u64,
+            off!(Fifo, values) as u64,
+            off!(Fifo, transfers) as u64,
+            size::<TransferSlot>() as u64,
+            off!(TransferSlot, live) as u64,
+            off!(TransferSlot, object) as u64,
+            off!(TransferSlot, rights) as u64,
+            off!(TransferSlot, owned) as u64,
+            size::<Endpoint>() as u64,
+            off!(Endpoint, generation) as u64,
+            off!(Endpoint, info) as u64,
+            size::<EndpointId>() as u64,
+            size::<ChannelId>() as u64,
+            MESSAGES as u64,
+            ENDPOINTS as u64,
+            0,
+            0,
+        ]
     }
     #[cfg(test)]
     pub(crate) fn test_counters(&mut self, sent: [u64; 2], received: [u64; 2]) {

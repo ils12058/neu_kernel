@@ -9,17 +9,35 @@ pub const BOOTSTRAP: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjectType {
+    None = 0,
     Counter = 1,
     Flag = 2,
     AddressSpace = 3,
     ChannelEndpoint = 4,
+    MemoryObject = 5,
+}
+impl ObjectType {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Counter,
+            2 => Self::Flag,
+            3 => Self::AddressSpace,
+            4 => Self::ChannelEndpoint,
+            5 => Self::MemoryObject,
+            _ => Self::None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Rights(u8);
 impl Rights {
     pub const READ: Self = Self(1);
     pub const WRITE: Self = Self(2);
     pub const READ_WRITE: Self = Self(3);
+    pub const MAP: Self = Self(4);
+    pub const TRANSFER: Self = Self(8);
+    pub const MEMORY_OBJECT: Self = Self(15);
     pub const INSPECT: Self = Self(16);
     pub const SEND: Self = Self(32);
     pub const RECEIVE: Self = Self(64);
@@ -27,7 +45,7 @@ impl Rights {
     pub const SEND_CAPS: Self = Self(128);
     pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
-        if bits == 0 || bits & !0x73 != 0 {
+        if bits == 0 || bits & !0x7f != 0 {
             Err(Error::Rights)
         } else {
             Ok(Self(bits as u8))
@@ -38,10 +56,12 @@ impl Rights {
     }
     fn valid(self, kind: ObjectType) -> bool {
         match kind {
+            ObjectType::None => false,
             ObjectType::Counter => self.0 != 0 && self.0 & !3 == 0,
             ObjectType::Flag => self.0 == 1,
             ObjectType::AddressSpace => self.0 & !16 == 0,
             ObjectType::ChannelEndpoint => self.0 != 0 && self.0 & !224 == 0,
+            ObjectType::MemoryObject => self.0 != 0 && self.0 & !0x0f == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -49,6 +69,7 @@ impl Rights {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Handle(u64);
 impl Handle {
     pub fn from_raw(raw: u64) -> Self {
@@ -80,18 +101,24 @@ impl TableId {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct ObjectId {
-    slot: usize,
-    generation: u32,
-    kind: ObjectType,
-}
+#[repr(transparent)]
+pub struct ObjectId(u64);
 impl ObjectId {
+    pub(crate) const EMPTY: Self = Self(0);
+    fn new(slot: usize, generation: u32, kind: ObjectType) -> Self {
+        Self((kind as u64) << 40 | (generation as u64) << 8 | (slot as u64 + 1))
+    }
     pub fn raw(self) -> u64 {
-        (self.kind as u64) << 40 | (self.generation as u64) << 8 | (self.slot as u64 + 1)
+        self.0
     }
     pub fn kind(self) -> ObjectType {
-        self.kind
+        ObjectType::from_raw((self.0 >> 40) as u8)
+    }
+    fn generation(self) -> u32 {
+        (self.0 >> 8) as u32
+    }
+    fn slot(self) -> usize {
+        (self.0 as u8).wrapping_sub(1) as usize
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +152,7 @@ pub enum Settle {
     Failed(Error),
 }
 enum Value {
+    None,
     Endpoint(crate::channel::EndpointRef),
     Counter(u64),
     Flag(bool),
@@ -132,30 +160,53 @@ enum Value {
         owner: NodeId,
         reference: crate::paging::SpaceRef,
     },
+    MemoryObject(crate::paging::MemoryObjectRef),
 }
 impl Value {
     fn kind(&self) -> ObjectType {
         match self {
+            Self::None => ObjectType::None,
             Self::Endpoint(_) => ObjectType::ChannelEndpoint,
             Self::Counter(_) => ObjectType::Counter,
             Self::Flag(_) => ObjectType::Flag,
             Self::AddressSpace { .. } => ObjectType::AddressSpace,
+            Self::MemoryObject(_) => ObjectType::MemoryObject,
+        }
+    }
+    fn target(&self) -> u64 {
+        match self {
+            Self::Endpoint(reference) => reference.id().raw(),
+            Self::AddressSpace { reference, .. } => reference.id().raw(),
+            Self::MemoryObject(reference) => reference.id().raw(),
+            Self::None | Self::Counter(_) | Self::Flag(_) => 0,
         }
     }
 }
+/// Field order and explicit live/kind state are a stable diagnostic schema.
+/// The values themselves remain private; QMP only reads raw production fields.
+#[repr(C)]
 struct Object {
     generation: u32,
-    value: Option<Value>,
     references: u32,
     pins: u32,
+    live: bool,
+    kind: ObjectType,
+    target: u64,
+    value: Value,
 }
 impl Object {
     const EMPTY: Self = Self {
         generation: 0,
-        value: None,
         references: 0,
         pins: 0,
+        live: false,
+        kind: ObjectType::None,
+        target: 0,
+        value: Value::None,
     };
+    fn free(&self) -> bool {
+        !self.live && self.generation != u32::MAX
+    }
 }
 #[must_use = "release the trusted creator reference after publishing explicit grants"]
 pub struct ObjectRef {
@@ -195,6 +246,11 @@ pub struct Objects {
     limit: usize,
     channels: crate::channel::Channels,
     waits: Waits,
+    /// Dead MemoryObject capability objects whose paging reference cannot be
+    /// released without the architecture registry. Bounded so collection can
+    /// never grow without limit; a full pending array leaves the dead slot
+    /// occupied until the next architecture reap.
+    pending: [Option<crate::paging::MemoryObjectRef>; CHANNEL_OBJECTS],
 }
 impl Default for Objects {
     fn default() -> Self {
@@ -208,6 +264,7 @@ impl Objects {
             limit: OBJECTS,
             channels: crate::channel::Channels::new(),
             waits: Waits::new(),
+            pending: [const { None }; CHANNEL_OBJECTS],
         }
     }
     pub const fn with_channels() -> Self {
@@ -215,6 +272,59 @@ impl Objects {
             limit: CHANNEL_OBJECTS,
             ..Self::new()
         }
+    }
+    /// Test-only schema for the independent stopped-CPU observer. The
+    /// descriptor contains addresses and offsets, never authority.
+    #[cfg(feature = "cap-move-test")]
+    pub fn diagnostic_layout(&self) -> [u64; 18] {
+        use core::mem::{offset_of as off, size_of as size};
+        [
+            1,
+            self as *const Self as u64,
+            size::<Self>() as u64,
+            CHANNEL_OBJECTS as u64,
+            self.slots.as_ptr() as u64,
+            size::<Object>() as u64,
+            off!(Object, generation) as u64,
+            off!(Object, references) as u64,
+            off!(Object, pins) as u64,
+            off!(Object, live) as u64,
+            off!(Object, kind) as u64,
+            off!(Object, target) as u64,
+            off!(Object, value) as u64,
+            size::<ObjectId>() as u64,
+            size::<Handle>() as u64,
+            size::<ObjectType>() as u64,
+            size::<Rights>() as u64,
+            size::<Value>() as u64,
+        ]
+    }
+    pub fn pending_memory_objects(&self) -> usize {
+        self.pending.iter().flatten().count()
+    }
+    pub fn drain_memory_object(&mut self) -> Option<crate::paging::MemoryObjectRef> {
+        let index = self.pending.iter().position(Option::is_some)?;
+        self.pending[index].take()
+    }
+    /// Retry dead MemoryObject slots that could not be queued while the
+    /// architecture-owned pending batch was full. Called only after a drain.
+    pub fn retry_pending_memory_objects(&mut self) -> usize {
+        let mut moved = 0;
+        for slot in 0..self.limit {
+            let object = &self.slots[slot];
+            if object.live
+                && object.references == 0
+                && object.pins == 0
+                && matches!(object.value, Value::MemoryObject(_))
+            {
+                let before = self.pending_memory_objects();
+                self.collect(slot);
+                if self.pending_memory_objects() > before {
+                    moved += 1;
+                }
+            }
+        }
+        moved
     }
     pub fn channel_state(&self) -> &crate::channel::Channels {
         &self.channels
@@ -226,14 +336,9 @@ impl Objects {
     pub fn move_objects(&self) -> [u64; 18] {
         let mut words = [0; 18];
         for (i, o) in self.slots.iter().enumerate() {
-            if let Some(value) = o.value.as_ref() {
+            if o.live {
                 words[i * 3..i * 3 + 3].copy_from_slice(&[
-                    ObjectId {
-                        slot: i,
-                        generation: o.generation,
-                        kind: value.kind(),
-                    }
-                    .raw(),
+                    ObjectId::new(i, o.generation, o.kind).raw(),
                     o.references as u64,
                     o.pins as u64,
                 ]);
@@ -298,7 +403,11 @@ impl Objects {
         self.waits.retry(token)
     }
     fn endpoint_of(&self, id: ObjectId) -> Option<(crate::channel::EndpointInfo, ObjectId)> {
-        match self.slots.get(id.slot)?.value.as_ref()? {
+        let object = self.slots.get(id.slot())?;
+        if !object.live || object.generation != id.generation() {
+            return None;
+        }
+        match &object.value {
             Value::Endpoint(reference) => self
                 .channels
                 .info(reference.id())
@@ -491,7 +600,8 @@ impl Objects {
                 if self.waits.mark_terminal(token, Error::PeerClosed)
                     && self.waits.release_pin(token)
                 {
-                    self.slots[object.slot].pins = self.slots[object.slot].pins.saturating_sub(1);
+                    self.slots[object.slot()].pins =
+                        self.slots[object.slot()].pins.saturating_sub(1);
                 }
             } else if waiter.channel == info.channel {
                 self.waits.mark_ready(token);
@@ -508,24 +618,24 @@ impl Objects {
         self.slots
             .iter()
             .take(self.limit)
-            .position(|s| s.value.is_none() && s.generation != u32::MAX)
+            .position(Object::free)
             .ok_or(Error::Capacity)
     }
     fn create_at(&mut self, slot: usize, value: Value) -> ObjectRef {
         let generation = self.slots[slot].generation + 1;
         let kind = value.kind();
+        let target = value.target();
         self.slots[slot] = Object {
             generation,
-            value: Some(value),
             references: 1,
             pins: 0,
+            live: true,
+            kind,
+            target,
+            value,
         };
         ObjectRef {
-            id: ObjectId {
-                slot,
-                generation,
-                kind,
-            },
+            id: ObjectId::new(slot, generation, kind),
         }
     }
     fn create(&mut self, value: Value) -> Result<ObjectRef> {
@@ -544,6 +654,18 @@ impl Objects {
         };
         Ok(self.create_at(slot, Value::AddressSpace { owner, reference }))
     }
+    /// The capability object owns exactly one paging reference. Failure
+    /// returns the non-copyable token so the caller can release it.
+    pub fn memory_object(
+        &mut self,
+        reference: crate::paging::MemoryObjectRef,
+    ) -> core::result::Result<ObjectRef, (Error, crate::paging::MemoryObjectRef)> {
+        let slot = match self.free_slot() {
+            Ok(slot) => slot,
+            Err(e) => return Err((e, reference)),
+        };
+        Ok(self.create_at(slot, Value::MemoryObject(reference)))
+    }
     /// Trusted atomic two-table construction. All capacity/generation/manifest
     /// checks precede mutation. The exclusive transaction makes commit infallible;
     /// no userspace or IRQ can observe a half-published pair.
@@ -557,7 +679,7 @@ impl Objects {
             }
             if t.slots
                 .iter()
-                .filter(|s| s.entry.is_none() && s.generation != u32::MAX)
+                .filter(|s| !s.live && s.generation != u32::MAX)
                 .count()
                 < 4
             {
@@ -571,7 +693,7 @@ impl Objects {
             .slots
             .iter()
             .take(self.limit)
-            .filter(|s| s.value.is_none() && s.generation != u32::MAX)
+            .filter(|s| Object::free(s))
             .count()
             < 2
         {
@@ -600,9 +722,16 @@ impl Objects {
     }
     pub fn reap_space(&mut self) -> Option<crate::paging::SpaceRef> {
         let slot = self.slots.iter().position(|o| {
-            o.references == 0 && o.pins == 0 && matches!(o.value, Some(Value::AddressSpace { .. }))
+            o.live
+                && o.references == 0
+                && o.pins == 0
+                && matches!(o.value, Value::AddressSpace { .. })
         })?;
-        match self.slots[slot].value.take()? {
+        let retired = core::mem::replace(&mut self.slots[slot].value, Value::None);
+        self.slots[slot].live = false;
+        self.slots[slot].kind = ObjectType::None;
+        self.slots[slot].target = 0;
+        match retired {
             Value::AddressSpace { reference, .. } => Some(reference),
             _ => unreachable!(),
         }
@@ -611,31 +740,35 @@ impl Objects {
         self.slots
             .iter()
             .filter(|o| {
-                o.references == 0
+                o.live
+                    && o.references == 0
                     && o.pins == 0
-                    && matches!(o.value, Some(Value::AddressSpace { .. }))
+                    && matches!(o.value, Value::AddressSpace { .. })
             })
             .count()
     }
     fn object(&self, id: ObjectId) -> Result<&Object> {
         self.slots
-            .get(id.slot)
+            .get(id.slot())
             .filter(|s| {
-                s.generation == id.generation
-                    && s.value.is_some()
+                s.live
+                    && s.generation == id.generation()
+                    && s.kind == id.kind()
                     && (s.references != 0 || s.pins != 0)
             })
             .ok_or(Error::Object)
-            .and_then(|s| {
-                if s.value.as_ref().unwrap().kind() == id.kind {
-                    Ok(s)
-                } else {
-                    Err(Error::Type)
-                }
-            })
     }
     pub fn info(&self, id: ObjectId) -> Result<ObjectInfo> {
-        let s = self.object(id)?;
+        let s = self.slots.get(id.slot()).ok_or(Error::Object)?;
+        if !s.live || s.generation != id.generation() {
+            return Err(Error::Object);
+        }
+        if s.kind != id.kind() {
+            return Err(Error::Type);
+        }
+        if s.references == 0 && s.pins == 0 {
+            return Err(Error::Object);
+        }
         Ok(ObjectInfo {
             id,
             references: s.references,
@@ -644,26 +777,30 @@ impl Objects {
     }
     #[cfg(feature = "cap-test")]
     pub fn debug_value(&self, id: ObjectId) -> Result<u64> {
-        match self.object(id)?.value.as_ref() {
-            Some(Value::Counter(v)) => Ok(*v),
-            Some(Value::Flag(v)) => Ok(*v as u64),
-            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
-            None => Err(Error::Object),
+        match &self.object(id)?.value {
+            Value::Counter(v) => Ok(*v),
+            Value::Flag(v) => Ok(*v as u64),
+            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
+                Err(Error::Type)
+            }
+            Value::None => Err(Error::Object),
         }
     }
     /// Supervisor-only QMP instrumentation, never returned through the ABI.
     #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
     pub fn value_address(&self, id: ObjectId) -> Result<u64> {
-        match self.object(id)?.value.as_ref() {
-            Some(Value::Counter(value)) => Ok(value as *const u64 as u64),
-            Some(Value::Flag(value)) => Ok(value as *const bool as u64),
-            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
-            None => Err(Error::Object),
+        match &self.object(id)?.value {
+            Value::Counter(value) => Ok(value as *const u64 as u64),
+            Value::Flag(value) => Ok(value as *const bool as u64),
+            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
+                Err(Error::Type)
+            }
+            Value::None => Err(Error::Object),
         }
     }
     pub fn stats(&self) -> Stats {
         let mut result = Stats::default();
-        for s in self.slots.iter().filter(|s| s.value.is_some()) {
+        for s in self.slots.iter().filter(|s| s.live) {
             result.live += 1;
             result.references += s.references;
             result.pins += s.pins;
@@ -676,16 +813,31 @@ impl Objects {
             .references
             .checked_add(1)
             .ok_or(Error::Capacity)?;
-        self.slots[id.slot].references = refs;
+        self.slots[id.slot()].references = refs;
         Ok(())
     }
     fn collect(&mut self, slot: usize) {
-        if self.slots[slot].references == 0
-            && self.slots[slot].pins == 0
-            && !matches!(self.slots[slot].value, Some(Value::AddressSpace { .. }))
+        let object = &self.slots[slot];
+        if !object.live
+            || object.references != 0
+            || object.pins != 0
+            || matches!(object.value, Value::AddressSpace { .. })
         {
-            let retired = self.slots[slot].value.take();
-            if let Some(Value::Endpoint(reference)) = retired {
+            return;
+        }
+        // A dead MemoryObject keeps its slot until the architecture transaction
+        // can release the paging reference. This keeps both registries bounded.
+        if matches!(object.value, Value::MemoryObject(_))
+            && self.pending.iter().all(Option::is_some)
+        {
+            return;
+        }
+        let retired = core::mem::replace(&mut self.slots[slot].value, Value::None);
+        self.slots[slot].live = false;
+        self.slots[slot].kind = ObjectType::None;
+        self.slots[slot].target = 0;
+        match retired {
+            Value::Endpoint(reference) => {
                 let discarded = self
                     .channels
                     .retire_owned(reference)
@@ -695,6 +847,15 @@ impl Objects {
                         .expect("queued reference ownership");
                 }
             }
+            Value::MemoryObject(reference) => {
+                let index = self
+                    .pending
+                    .iter()
+                    .position(Option::is_none)
+                    .expect("pending capacity preflight");
+                self.pending[index] = Some(reference);
+            }
+            Value::None | Value::Counter(_) | Value::Flag(_) | Value::AddressSpace { .. } => {}
         }
     }
     fn release_id(&mut self, id: ObjectId) -> Result<()> {
@@ -703,11 +864,11 @@ impl Objects {
             .references
             .checked_sub(1)
             .ok_or(Error::Object)?;
-        self.slots[id.slot].references = references;
+        self.slots[id.slot()].references = references;
         if references == 0 {
             self.terminate_endpoint(id);
         }
-        self.collect(id.slot);
+        self.collect(id.slot());
         Ok(())
     }
     pub fn release(&mut self, reference: ObjectRef) -> Result<()> {
@@ -719,33 +880,38 @@ impl Objects {
             .pins
             .checked_add(1)
             .ok_or(Error::Capacity)?;
-        self.slots[id.slot].pins = pins;
+        self.slots[id.slot()].pins = pins;
         Ok(())
     }
     fn unpin(&mut self, id: ObjectId) {
         let s = self.object(id).expect("live capability operation");
         let pins = s.pins.checked_sub(1).expect("capability pin ownership");
-        self.slots[id.slot].pins = pins;
-        self.collect(id.slot);
+        self.slots[id.slot()].pins = pins;
+        self.collect(id.slot());
     }
 }
+/// Explicit live/kind storage is a stable diagnostic schema. A slot is the
+/// sole owner of one object reference while `live` is true.
 #[repr(C)]
-struct Entry {
-    target: ObjectId,
+struct Slot {
+    generation: u32,
+    live: bool,
     kind: ObjectType,
+    target: ObjectId,
     rights: Rights,
     transferable: bool,
 }
-struct Slot {
-    generation: u32,
-    entry: Option<Entry>,
-}
 impl Slot {
-    const fn new() -> Self {
-        Self {
-            generation: 0,
-            entry: None,
-        }
+    const EMPTY: Self = Self {
+        generation: 0,
+        live: false,
+        kind: ObjectType::None,
+        target: ObjectId::EMPTY,
+        rights: Rights::NONE,
+        transferable: false,
+    };
+    fn free(&self) -> bool {
+        !self.live && self.generation != u32::MAX
     }
 }
 /// Not Copy/Clone: moving a table transfers its actual reference ownership.
@@ -762,12 +928,12 @@ impl Table {
     pub fn move_slots(&self) -> [u64; 32] {
         let mut words = [0; 32];
         for (i, s) in self.slots.iter().enumerate() {
-            if let Some(e) = s.entry.as_ref() {
+            if s.live {
                 words[i * 4..i * 4 + 4].copy_from_slice(&[
                     Handle::new(i, s.generation).raw(),
-                    e.target.raw(),
-                    e.rights.bits(),
-                    e.transferable as u64,
+                    s.target.raw(),
+                    s.rights.bits(),
+                    s.transferable as u64,
                 ]);
             }
         }
@@ -778,18 +944,46 @@ impl Table {
         let mut addresses = [0; 16];
         for (i, s) in self.slots.iter().enumerate() {
             addresses[i * 2] = core::ptr::from_ref(&s.generation) as u64;
-            addresses[i * 2 + 1] = s
-                .entry
-                .as_ref()
-                .map_or(0, |e| core::ptr::from_ref(e) as u64);
+            addresses[i * 2 + 1] = if s.live {
+                core::ptr::from_ref(s) as u64
+            } else {
+                0
+            };
         }
         addresses
+    }
+    /// Test-only schema for the independent stopped-CPU observer.
+    #[cfg(feature = "cap-move-test")]
+    pub fn diagnostic_layout(&self) -> [u64; 20] {
+        use core::mem::{offset_of as off, size_of as size};
+        [
+            1,
+            self as *const Self as u64,
+            size::<Self>() as u64,
+            self.slots.as_ptr() as u64,
+            size::<Slot>() as u64,
+            HANDLES as u64,
+            off!(Slot, generation) as u64,
+            off!(Slot, live) as u64,
+            off!(Slot, kind) as u64,
+            off!(Slot, target) as u64,
+            off!(Slot, rights) as u64,
+            off!(Slot, transferable) as u64,
+            self.live as u64,
+            self.sealed as u64,
+            self.bootstrap.as_ptr() as u64,
+            size::<Handle>() as u64,
+            BOOTSTRAP as u64,
+            self.bootstrap_limit as u64,
+            self.id.raw(),
+            size::<ObjectType>() as u64,
+        ]
     }
     pub(crate) fn new(owner: NodeId) -> Self {
         Self {
             live: true,
             id: TableId(owner),
-            slots: [const { Slot::new() }; HANDLES],
+            slots: [const { Slot::EMPTY }; HANDLES],
             bootstrap: [None; BOOTSTRAP],
             bootstrap_limit: 4,
             sealed: false,
@@ -802,7 +996,7 @@ impl Table {
         self.id
     }
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.entry.is_some()).count()
+        self.slots.iter().filter(|s| s.live).count()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -814,7 +1008,7 @@ impl Table {
             Err(Error::Owner)
         }
     }
-    fn entry(&self, caller: NodeId, handle: Handle) -> Result<&Entry> {
+    fn entry(&self, caller: NodeId, handle: Handle) -> Result<&Slot> {
         self.owner(caller)?;
         let (slot, generation) = handle.parts()?;
         let s = &self.slots[slot];
@@ -824,7 +1018,10 @@ impl Table {
         if s.generation != generation {
             return Err(Error::Stale);
         }
-        s.entry.as_ref().ok_or(Error::Stale)
+        if !s.live {
+            return Err(Error::Stale);
+        }
+        Ok(s)
     }
     /// Trusted grant only: no user request accepts ObjectRef or ObjectId.
     pub fn grant(
@@ -838,29 +1035,28 @@ impl Table {
         }
         let id = reference.id;
         let object = objects.object(id)?;
-        if let Some(Value::Endpoint(reference)) = object.value.as_ref()
+        if let Value::Endpoint(reference) = &object.value
             && objects.channels.info(reference.id())?.owner != self.id.owner()
         {
             return Err(Error::Owner);
         }
-        if !rights.valid(id.kind) {
+        if !rights.valid(id.kind()) {
             return Err(Error::Rights);
         }
         let slot = self
             .slots
             .iter()
-            .position(|s| s.entry.is_none() && s.generation != u32::MAX)
+            .position(Slot::free)
             .ok_or(Error::Capacity)?;
         let generation = self.slots[slot].generation + 1;
         objects.retain(id)?;
         self.slots[slot] = Slot {
             generation,
-            entry: Some(Entry {
-                target: id,
-                kind: id.kind,
-                rights,
-                transferable: false,
-            }),
+            live: true,
+            kind: id.kind(),
+            target: id,
+            rights,
+            transferable: false,
         };
         Ok(Handle::new(slot, generation))
     }
@@ -902,18 +1098,17 @@ impl Table {
         reference: &ObjectRef,
         rights: Rights,
     ) -> Result<Handle> {
-        if !matches!(reference.id.kind, ObjectType::Flag | ObjectType::Counter) {
+        if !matches!(
+            reference.id.kind(),
+            ObjectType::Flag | ObjectType::Counter | ObjectType::MemoryObject
+        ) {
             return Err(Error::Type);
         }
         if self.sealed {
             return Err(Error::InUse);
         }
         let handle = self.grant(objects, reference, rights)?;
-        self.slots[handle.parts()?.0]
-            .entry
-            .as_mut()
-            .unwrap()
-            .transferable = true;
+        self.slots[handle.parts()?.0].transferable = true;
         Ok(handle)
     }
     pub fn seal_bootstrap(&mut self) {
@@ -932,16 +1127,33 @@ impl Table {
         {
             return Err(Error::Type);
         }
-        self.slots[flag.parts()?.0]
-            .entry
-            .as_mut()
-            .unwrap()
-            .transferable = true;
-        self.slots[endpoint.parts()?.0]
-            .entry
-            .as_mut()
-            .unwrap()
-            .rights = Rights(224);
+        self.slots[flag.parts()?.0].transferable = true;
+        self.slots[endpoint.parts()?.0].rights = Rights(224);
+        Ok(())
+    }
+    /// K8B bootstrap: index 3 is a MemoryObject capability, not a Flag. The
+    /// capability must itself carry TRANSFER; only the endpoint rights are
+    /// widened to SEND|RECEIVE|SEND_CAPS.
+    #[cfg(any(feature = "cap-move-test", test))]
+    pub fn configure_memory_object_moves(&mut self) -> Result<()> {
+        if self.sealed || !self.live {
+            return Err(Error::InUse);
+        }
+        let object = self.bootstrap[3].ok_or(Error::Handle)?;
+        let endpoint = self.bootstrap[4].ok_or(Error::Handle)?;
+        let object_slot = object.parts()?.0;
+        let endpoint_slot = endpoint.parts()?.0;
+        let entry = self.entry(self.id.owner(), object)?;
+        if entry.kind != ObjectType::MemoryObject
+            || self.entry(self.id.owner(), endpoint)?.kind != ObjectType::ChannelEndpoint
+        {
+            return Err(Error::Type);
+        }
+        if !entry.rights.contains(Rights::TRANSFER) {
+            return Err(Error::Rights);
+        }
+        self.slots[object_slot].transferable = true;
+        self.slots[endpoint_slot].rights = Rights(224);
         Ok(())
     }
     fn move_endpoint(
@@ -959,13 +1171,13 @@ impl Table {
         if object.references == 0 {
             return Err(Error::Object);
         }
-        if entry.kind != ObjectType::ChannelEndpoint || entry.target.kind != entry.kind {
+        if entry.kind != ObjectType::ChannelEndpoint || entry.target.kind() != entry.kind {
             return Err(Error::Type);
         }
         if !entry.rights.valid(entry.kind) || !entry.rights.contains(right) {
             return Err(Error::Rights);
         }
-        let Some(Value::Endpoint(reference)) = object.value.as_ref() else {
+        let Value::Endpoint(reference) = &object.value else {
             return Err(Error::Type);
         };
         let info = objects.channels.info(reference.id())?;
@@ -984,29 +1196,39 @@ impl Table {
         source: Handle,
     ) -> Result<()> {
         let info = self.move_endpoint(objects, caller, endpoint, Rights::SEND_CAPS)?;
+        let source_slot = source.parts()?.0;
         let entry = self.entry(caller, source)?;
         if objects.object(entry.target)?.references == 0 {
             return Err(Error::Object);
         }
-        if entry.target.kind != entry.kind
-            || !matches!(entry.kind, ObjectType::Flag | ObjectType::Counter)
+        if entry.target.kind() != entry.kind
+            || !matches!(
+                entry.kind,
+                ObjectType::Flag | ObjectType::Counter | ObjectType::MemoryObject
+            )
         {
             return Err(Error::Type);
         }
         if !entry.rights.valid(entry.kind) {
             return Err(Error::Rights);
         }
+        if entry.kind == ObjectType::MemoryObject && !entry.rights.contains(Rights::TRANSFER) {
+            return Err(Error::Rights);
+        }
         if !entry.transferable {
             return Err(Error::Transfer);
         }
         objects.channels.can_send(info.id, caller)?;
-        let entry = self.slots[source.parts()?.0]
-            .entry
-            .take()
-            .expect("preflighted source");
+        let target = entry.target;
+        let rights = entry.rights;
+        self.slots[source_slot].live = false;
+        self.slots[source_slot].kind = ObjectType::None;
+        self.slots[source_slot].target = ObjectId::EMPTY;
+        self.slots[source_slot].rights = Rights::NONE;
+        self.slots[source_slot].transferable = false;
         let transfer = OwnedTransfer {
-            reference: ObjectRef { id: entry.target },
-            rights: entry.rights,
+            reference: ObjectRef { id: target },
+            rights,
         };
         objects.channels.send_transfer(info.id, caller, transfer);
         objects.wake_receive(info);
@@ -1021,15 +1243,18 @@ impl Table {
         endpoint: Handle,
     ) -> Result<Handle> {
         let info = self.move_endpoint(objects, caller, endpoint, Rights::RECEIVE)?;
-        let (id, _) = objects
+        let (id, rights) = objects
             .channels
             .peek_transfer(info.id, caller)?
             .description();
         objects.object(id)?;
+        if !rights.valid(id.kind()) {
+            return Err(Error::Rights);
+        }
         let slot = self
             .slots
             .iter()
-            .position(|s| s.entry.is_none() && s.generation != u32::MAX)
+            .position(Slot::free)
             .ok_or(Error::Capacity)?;
         let generation = self.slots[slot].generation + 1;
         let OwnedTransfer {
@@ -1038,12 +1263,11 @@ impl Table {
         } = objects.channels.receive_transfer(info.id, caller)?;
         self.slots[slot] = Slot {
             generation,
-            entry: Some(Entry {
-                target: id,
-                kind: id.kind,
-                rights,
-                transferable: true,
-            }),
+            live: true,
+            kind: id.kind(),
+            target: id,
+            rights,
+            transferable: true,
         };
         // The consumed token's reference is now owned by the installed entry.
         objects.wake_send(info);
@@ -1084,7 +1308,7 @@ impl Table {
         }
         let e = self.entry(caller, handle)?;
         objects.object(e.target)?;
-        if e.kind != kind || e.target.kind != kind {
+        if e.kind != kind || e.target.kind() != kind {
             return Err(Error::Type);
         }
         if required.bits() == 0 || !required.valid(kind) || !e.rights.contains(required) {
@@ -1095,7 +1319,8 @@ impl Table {
             objects,
             id: e.target,
             caller,
-            rights: required,
+            requested: required,
+            actual: e.rights,
         })
     }
     pub fn close(&mut self, objects: &mut Objects, caller: NodeId, handle: Handle) -> Result<()> {
@@ -1103,14 +1328,18 @@ impl Table {
         objects.object(id)?;
         objects.release_id(id)?;
         let (slot, _) = handle.parts()?;
-        self.slots[slot].entry = None;
+        self.slots[slot].live = false;
+        self.slots[slot].kind = ObjectType::None;
+        self.slots[slot].target = ObjectId::EMPTY;
+        self.slots[slot].rights = Rights::NONE;
+        self.slots[slot].transferable = false;
         Ok(())
     }
     pub fn drain(&mut self, objects: &mut Objects, owner: NodeId) -> Result<usize> {
         self.owner(owner)?;
         let mut released = 0;
         for slot in 0..HANDLES {
-            if self.slots[slot].entry.is_some() {
+            if self.slots[slot].live {
                 self.close(
                     objects,
                     owner,
@@ -1128,7 +1357,12 @@ pub struct Guard<'a> {
     objects: &'a mut Objects,
     id: ObjectId,
     caller: NodeId,
-    rights: Rights,
+    /// Rights requested at lookup; existing operations keep the historical
+    /// no-amplification checks.
+    requested: Rights,
+    /// Rights actually held by the table entry. MemoryObject mapping authority
+    /// is derived from this, never from the request.
+    actual: Rights,
 }
 impl Guard<'_> {
     #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
@@ -1141,33 +1375,52 @@ impl Guard<'_> {
             .expect("guard pins exact generation")
     }
     pub fn read(&self) -> Result<u64> {
-        if !self.rights.contains(Rights::READ) {
+        if !self.requested.contains(Rights::READ) {
             return Err(Error::Rights);
         }
-        match self.objects.object(self.id)?.value.as_ref() {
-            Some(Value::Counter(v)) => Ok(*v),
-            Some(Value::Flag(v)) => Ok(*v as u64),
-            Some(Value::AddressSpace { .. } | Value::Endpoint(_)) => Err(Error::Type),
-            None => Err(Error::Object),
+        match &self.objects.object(self.id)?.value {
+            Value::Counter(v) => Ok(*v),
+            Value::Flag(v) => Ok(*v as u64),
+            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
+                Err(Error::Type)
+            }
+            Value::None => Err(Error::Object),
         }
     }
     pub fn address_space(&self) -> Result<(NodeId, &crate::paging::SpaceRef)> {
-        if !self.rights.contains(Rights::INSPECT) {
+        if !self.requested.contains(Rights::INSPECT) {
             return Err(Error::Rights);
         }
-        match self.objects.object(self.id)?.value.as_ref() {
-            Some(Value::AddressSpace { owner, reference }) => Ok((*owner, reference)),
+        match &self.objects.object(self.id)?.value {
+            Value::AddressSpace { owner, reference } => Ok((*owner, reference)),
+            _ => Err(Error::Type),
+        }
+    }
+    /// Mapping authority is derived from the entry's actual rights, not from
+    /// the lookup request. A read-only capability can never authorize a
+    /// writable mapping, and MAP alone authorizes no data access.
+    pub fn memory_object(&self, writable: bool) -> Result<&crate::paging::MemoryObjectRef> {
+        let required = if writable {
+            Rights(Rights::MAP.bits() as u8 | Rights::READ_WRITE.bits() as u8)
+        } else {
+            Rights(Rights::MAP.bits() as u8 | Rights::READ.bits() as u8)
+        };
+        if !self.actual.contains(required) {
+            return Err(Error::Rights);
+        }
+        match &self.objects.object(self.id)?.value {
+            Value::MemoryObject(reference) => Ok(reference),
             _ => Err(Error::Type),
         }
     }
     pub fn endpoint_info(&self) -> Result<crate::channel::EndpointInfo> {
-        match self.objects.object(self.id)?.value.as_ref() {
-            Some(Value::Endpoint(r)) => self.objects.channels.info(r.id()),
+        match &self.objects.object(self.id)?.value {
+            Value::Endpoint(r) => self.objects.channels.info(r.id()),
             _ => Err(Error::Type),
         }
     }
     pub fn channel_send(&mut self, payload: u64) -> Result<()> {
-        if !self.rights.contains(Rights::SEND) {
+        if !self.requested.contains(Rights::SEND) {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
@@ -1176,7 +1429,7 @@ impl Guard<'_> {
         Ok(())
     }
     pub fn channel_receive(&mut self) -> Result<u64> {
-        if !self.rights.contains(Rights::RECEIVE) {
+        if !self.requested.contains(Rights::RECEIVE) {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
@@ -1187,7 +1440,7 @@ impl Guard<'_> {
     /// Commits immediately when possible; otherwise registers the Thread's one
     /// pending operation and returns `Blocked` without touching the queue count.
     pub fn channel_send_wait(&mut self, active: ActiveContext, payload: u64) -> Result<WaitStart> {
-        if !self.rights.contains(Rights::SEND) {
+        if !self.requested.contains(Rights::SEND) {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
@@ -1204,7 +1457,7 @@ impl Guard<'_> {
         }
     }
     pub fn channel_receive_wait(&mut self, active: ActiveContext) -> Result<WaitStart> {
-        if !self.rights.contains(Rights::RECEIVE) {
+        if !self.requested.contains(Rights::RECEIVE) {
             return Err(Error::Rights);
         }
         let info = self.endpoint_info()?;
@@ -1240,17 +1493,17 @@ impl Guard<'_> {
         self.objects.channels.queue_addresses()
     }
     pub fn write(&mut self, value: u64) -> Result<()> {
-        if self.id.kind != ObjectType::Counter {
+        if self.id.kind() != ObjectType::Counter {
             return Err(Error::Type);
         }
-        if !self.rights.contains(Rights::WRITE) {
+        if !self.requested.contains(Rights::WRITE) {
             return Err(Error::Rights);
         }
-        self.objects.slots[self.id.slot].value = Some(Value::Counter(value));
+        self.objects.slots[self.id.slot()].value = Value::Counter(value);
         Ok(())
     }
     pub fn exchange(&mut self, value: u64) -> Result<u64> {
-        if !self.rights.contains(Rights::READ_WRITE) {
+        if !self.requested.contains(Rights::READ_WRITE) {
             return Err(Error::Rights);
         }
         let previous = self.read()?;

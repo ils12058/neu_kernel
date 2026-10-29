@@ -1,11 +1,13 @@
-# MemoryObject QMP evidence (bounded Phase 8A-1 and 8A-2)
+# MemoryObject QMP evidence (bounded Phase 8A-1, 8A-2 and 8B)
 
 The Phase 8A-1 `memory-object-*` images run trusted kernel code with one CPU,
 IF=0 and inactive user roots; they do not execute shared-memory accesses in
 Ring 3. The Phase 8A-2 `memory-object-user-*` images then execute real Ring 3
 writes/reads through the installed shared leaves and, in the fault profile,
-produce a genuine hardware `#PF`. Architecture v0.2 and ABI 0.5 remain the design
-and ABI baselines.
+produce a genuine hardware `#PF`. The Phase 8B `memory-object-cap` image moves a
+MemoryObject capability between two Nodes over the K7 Channel operations and
+inspects the transfer with production state. Architecture v0.2 and ABI 0.5
+remain the design and ABI baselines.
 
 ## Profiles
 
@@ -104,6 +106,71 @@ the unchanged physical values after A's root is destroyed.
 Serial output alone never satisfies these profiles: missing or mismatched raw QMP
 state fails the case.
 
+## MemoryObject capability transfer (Phase 8B)
+
+| Case | Purpose |
+| --- | --- |
+| `memory-object-cap` | A1 sends one MemoryObject capability over `CHANNEL_SEND_CAP`; B1 receives it over `CHANNEL_RECEIVE_CAP` and sends it back; teardown discards the queued reference exactly once and collection restores the baseline |
+
+### Fixed Phase 8B contract
+
+- One trusted RAM-backed two-page object. Trusted setup retains one paging
+  capability reference while the creator is live, installs Node A's manifest
+  index 3 as a `MemoryObject` capability with `READ|WRITE|MAP|TRANSFER` (15) and
+  the transferable marker, maps the object at `0x600000` user RW/NX through that
+  capability, then releases the creator. Node B's index 3 remains a Flag.
+- The mapping is honestly **staged**: it is authorized by the capability's
+  actual rights during trusted setup, before Thread execution. The transferred
+  capability does not create a new mapping and there is no runtime mmap.
+- Endpoint rights are widened only to `SEND|RECEIVE|SEND_CAPS` (224). A's
+  capability handle is slot 3 (raw handle `(1<<32)|4`), B receives into a fresh
+  slot generation, and the received rights must be exactly 15.
+- A1 sends, exits at its sent gate, and is retired first. B1 receives, sends the
+  capability back, exits, and is destroyed. The return transfer stays queued in
+  A's FIFO until both endpoints retire; retirement discards it exactly once.
+
+### Phase 8B checkpoints
+
+The descriptor is `neu_memory_cap_witness` (194 atomic u64 words). QMP stops the
+sole CPU inside `neu_memory_cap_wait`, rechecks RIP/CPL/CR3/IF, and requires all
+ten stages in order:
+
+| Stage | Observed state |
+| --- | --- |
+| 0 | Exact allocator/table baseline; no test object, Node, table or mapping |
+| 1 | Two-page object live with creator reference and zero capability references |
+| 2 | Both Node tables public; A holds the MemoryObject (15, transferable) at slot 3 plus four endpoint handles; the object is mapped twice in A; creator released; capability paging reference 1; registry `(6,16)` |
+| 3 | A at its fail gate; B has closed its third endpoint handle; registry `(6,15)` |
+| 4 | A sent the capability: A slot 3 empty, B's receive queue holds one MemoryObject/15 transfer, send counter 1 |
+| 5 | B received into fresh slot generation 2; queue empty; A's Node exited and its table inactive; registry `(6,15)` |
+| 6 | B exited after sending the capability back; both tables inactive; A's queue holds one MemoryObject/15 transfer |
+| 7 | B cleaned and destroyed; A's inactive table still owns the AddressSpace/endpoint references; registry `(3,8)` |
+| 8 | A cleaned and destroyed; the queued transfer is discarded exactly once; capability registry empty; object live with zero references and zero mappings |
+| 9 | Object collected; exact baseline bitmap, table and frame inventory restored |
+
+### What the Phase 8B oracle proves
+
+The observer reads the production capability slots, both handle tables, the
+Channel FIFO transfer slots and counters, paging object/frame/space/mapping
+records, table owners, allocator counters/bitmap, raw physical page-table pages
+and both Nodes' saved Ring 3 frames. Required raw relationships:
+
+- every handle and queue entry names a live capability object, and each live
+  object's `references` equals its handle count plus queued transfers;
+- the MemoryObject capability's target equals the production object id and its
+  backing identity/creator/capability-reference/mapping counts follow the stage
+  model above;
+- the queued transfer carries the exact object identity and rights 15, with no
+  scalar message or stale transfer identity in the FIFO;
+- Node A's slot generations stay 1 and its freed slot is empty; B's receive slot
+  generation advances to 2 with the transferable bit set;
+- the queued return transfer is discarded exactly once (channel discarded
+  counters), the capability pending batch is empty at every checkpoint, and the
+  final allocator/table/frame state equals the stage-0 baseline.
+
+Serial `verified=true` is never accepted. Missing or mismatched raw state fails
+the case.
+
 ## Production integration
 
 `Paging::map_memory_backing` checks the exact registered root, inactive/unpinned
@@ -195,8 +262,13 @@ successful rollback or a reusable address space.
 
 No Phase 8A-1 checkpoint claims Ring 3 shared execution, a hardware read-only
 fault, capability transfer of a MemoryObject, SMP safety or production readiness.
-The Phase 8A-2 live checkpoints above do claim the bounded trusted Ring 3 access
-and fault containment described in [ADR 0023](../adr/0023-live-userspace-memoryobject-sharing.md).
+The Phase 8A-2 live checkpoints claim the bounded trusted Ring 3 access and fault
+containment described in [ADR 0023](../adr/0023-live-userspace-memoryobject-sharing.md).
+The Phase 8B `memory-object-cap` checkpoints claim bounded MemoryObject
+capability transfer, rights preservation, cross-registry lifetime and
+exactly-once discard described in
+[ADR 0024](../adr/0024-memoryobject-capability-authority-and-transfer.md); they
+do not claim runtime mapping from a received capability, public syscalls or SMP.
 
 ## Live observer corrections retained during finalization
 

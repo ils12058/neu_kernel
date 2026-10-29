@@ -59,6 +59,15 @@ unsafe impl Sync for MoveWitness {}
 #[cfg(feature = "cap-move-test")]
 #[unsafe(no_mangle)]
 static neu_move_witness: MoveWitness = MoveWitness(UnsafeCell::new([0; 170]));
+#[cfg(feature = "cap-move-test")]
+struct MoveLayout(UnsafeCell<[u64; 20]>);
+// SAFETY: Same IF=0 exclusive transaction as the move witness. The stopped-CPU
+// observer reads offsets only and never dereferences them on the guest's behalf.
+#[cfg(feature = "cap-move-test")]
+unsafe impl Sync for MoveLayout {}
+#[cfg(feature = "cap-move-test")]
+#[unsafe(no_mangle)]
+static neu_move_table_layout: MoveLayout = MoveLayout(UnsafeCell::new([0; 20]));
 #[cfg(feature = "test-cap-moves-terminal-order")]
 struct TerminalWitness(UnsafeCell<[u64; 10]>);
 // SAFETY: The controller publishes queue addresses before user entry and the
@@ -472,6 +481,10 @@ fn move_request(
     // Reused, bounded 1360-byte witness. All entries are recorded in serial;
     // selected transactions are independently sampled at a stopped native CPU.
     unsafe {
+        ptr::write_volatile(
+            neu_move_table_layout.0.get(),
+            lease.table().diagnostic_layout(),
+        );
         ptr::write_volatile(neu_move_witness.0.get(), evidence);
     }
     serial::write(format_args!("[NEU] Move record: words=")).unwrap_or_else(|_| super::halt());
@@ -547,6 +560,7 @@ fn move_request(
     publish(s, *r, bit).unwrap_or_else(|_| super::halt());
     Ok(outcome)
 }
+#[allow(dead_code)]
 pub fn gates(_objects: &Objects) -> cap::Result<u64> {
     tx(|s| Ok(s.gates))
 }
@@ -554,6 +568,7 @@ pub fn gates(_objects: &Objects) -> cap::Result<u64> {
 /// named Node. Move fixtures use it instead of probing a dead peer with
 /// repeated syscalls, keeping the bounded transaction ledger deterministic.
 #[cfg(feature = "cap-move-test")]
+#[allow(dead_code)]
 pub fn mark_reclaimed(node: NodeId) -> cap::Result<()> {
     tx(|s| {
         if s.a == Some(node) {
@@ -567,6 +582,7 @@ pub fn mark_reclaimed(node: NodeId) -> cap::Result<()> {
     })
 }
 #[cfg(feature = "cap-move-test")]
+#[allow(dead_code)]
 pub fn mark_wait_settled() -> cap::Result<()> {
     tx(|s| {
         s.gates |= 1 << 34;

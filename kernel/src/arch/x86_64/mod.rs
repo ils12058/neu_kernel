@@ -8,6 +8,8 @@ pub mod cooperative;
 pub mod exceptions;
 #[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub mod interrupts;
+#[cfg(feature = "memory-object-cap-test")]
+pub mod memory_object_cap;
 #[cfg(feature = "multi-test")]
 pub mod multithread;
 #[cfg(feature = "native-test")]

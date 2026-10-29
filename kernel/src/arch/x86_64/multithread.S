@@ -213,6 +213,10 @@ neu_multi_live_entry:
     je neu_multi_live_b_wait
     cmp rax, 13
     je neu_multi_live_b
+    cmp rax, 14
+    je neu_multi_cap_a
+    cmp rax, 15
+    je neu_multi_cap_b
     jmp neu_multi_failed
 
 neu_multi_live_a:
@@ -342,6 +346,137 @@ neu_multi_live_b_fault:
 neu_multi_live_b_store_site:
     mov qword ptr [0x602000], 0
     ud2
+
+# K8B capability-authority roles. A owns the bootstrap MemoryObject capability,
+# proves a SEND-only endpoint cannot move it, then transfers it with the
+# SEND_CAPS endpoint. B receives it, transfers it back, and exits without A
+# consuming the queued return authority.
+neu_multi_cap_a:
+    mov rbx, 0x402240
+    mov eax, 0x10
+    mov edi, 3
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r12, rdx
+    mov [rbx + 0x48], r12
+    mov eax, 0x10
+    mov edi, 6
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r13, rdx
+    mov eax, 0x10
+    mov edi, 4
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r14, rdx
+    movabs rax, 0x4e45554d4f434150
+    mov qword ptr [0x600000], rax
+    mov [rbx + 0x00], rax
+    movabs rax, 0x5a5a0123456789ac
+    mov qword ptr [0x600008], rax
+    mov [rbx + 0x08], rax
+    mov rax, qword ptr [0x600000]
+    mov [rbx + 0x30], rax
+    movabs rcx, 0x4e45554d4f434150
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x600008]
+    movabs rcx, 0x5a5a0123456789ac
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c49564543415001
+    mov [rbx + 0x18], rax
+    mov eax, 0x17
+    mov rdi, r13
+    mov rsi, r12
+    call neu_multi_invoke
+    mov [rbx + 0x38], rax
+    cmp rax, -18
+    jne neu_multi_failed
+    mov qword ptr [rbx + 0x10], 1
+.global neu_multi_cap_a_fail_gate,neu_multi_cap_a_fail_gate_end
+neu_multi_cap_a_fail_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_cap_a_fail_gate
+neu_multi_cap_a_fail_gate_end:
+    mov eax, 0x17
+    mov rdi, r14
+    mov rsi, r12
+    call neu_multi_invoke
+    mov [rbx + 0x40], rax
+    test rax, rax
+    jne neu_multi_failed
+    mov qword ptr [rbx + 0x10], 2
+.global neu_multi_cap_a_send_gate,neu_multi_cap_a_send_gate_end
+neu_multi_cap_a_send_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x58], 1
+    jne neu_multi_cap_a_send_gate
+neu_multi_cap_a_send_gate_end:
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_cap_b:
+    mov rbx, 0x4022c0
+    mov eax, 0x10
+    mov edi, 7
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r12, rdx
+    mov eax, 0x10
+    mov edi, 4
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r13, rdx
+    # The bootstrap table is full (eight handles). B does not need its SEND-only
+    # endpoint, so close it to make the one slot the receive transaction needs.
+    mov eax, 0x10
+    mov edi, 6
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov rdi, rdx
+    mov eax, 0x11
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+.global neu_multi_cap_b_receive_gate,neu_multi_cap_b_receive_gate_end
+neu_multi_cap_b_receive_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_cap_b_receive_gate
+neu_multi_cap_b_receive_gate_end:
+    mov eax, 0x18
+    mov rdi, r12
+    call neu_multi_invoke
+    mov [rbx + 0x50], rdx
+    test rax, rax
+    jne neu_multi_failed
+    movabs rax, 0x4c49564543415001
+    mov [rbx + 0x18], rax
+    mov qword ptr [rbx + 0x10], 1
+.global neu_multi_cap_b_send_gate,neu_multi_cap_b_send_gate_end
+neu_multi_cap_b_send_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x58], 1
+    jne neu_multi_cap_b_send_gate
+neu_multi_cap_b_send_gate_end:
+    mov eax, 0x17
+    mov rdi, r13
+    mov rsi, qword ptr [rbx + 0x50]
+    call neu_multi_invoke
+    mov [rbx + 0x40], rax
+    test rax, rax
+    jne neu_multi_failed
+    mov qword ptr [rbx + 0x10], 2
+    xor edi, edi
+    jmp neu_multi_live_exit
 
 neu_multi_live_exit:
     mov eax, 2

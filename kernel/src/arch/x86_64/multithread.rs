@@ -1109,8 +1109,437 @@ fn run_live(paging: &mut Paging<'_, '_>) -> Result<()> {
     .map_err(|_| Error::Corrupt)
 }
 
+#[cfg(feature = "memory-object-cap-test")]
+struct CapState {
+    stage: u64,
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+fn cap_word(
+    paging: &mut Paging<'_, '_>,
+    space: &UserSpace,
+    block: usize,
+    offset: usize,
+) -> Result<u64> {
+    let words = paging.live_words(space)?;
+    words
+        .get((block + offset) / 8)
+        .copied()
+        .ok_or(Error::Corrupt)
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+fn cap_write(
+    paging: &mut Paging<'_, '_>,
+    space: &UserSpace,
+    block: usize,
+    offset: usize,
+    value: u64,
+) -> Result<()> {
+    paging.live_write(space, block + offset, value)
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+fn cap_saved(nodes: &Nodes, members: &[Member; 2]) -> Result<[Option<u64>; 2]> {
+    Ok([
+        nodes
+            .live_saved_frame(members[0].active.thread)
+            .map_err(|_| Error::Corrupt)?,
+        nodes
+            .live_saved_frame(members[1].active.thread)
+            .map_err(|_| Error::Corrupt)?,
+    ])
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+fn cap_table(nodes: &Nodes, id: NodeId) -> Option<[u64; 20]> {
+    nodes
+        .authority(id)
+        .ok()
+        .map(|table| table.diagnostic_layout())
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+#[allow(clippy::too_many_arguments)]
+fn cap_checkpoint(
+    paging: &Paging<'_, '_>,
+    stage: u64,
+    object: Option<logic::MemoryObjectId>,
+    a: Option<&UserSpace>,
+    b: Option<&UserSpace>,
+    saved: [Option<u64>; 2],
+    ids: &super::memory_object_cap::CapIds,
+    table_a: Option<[u64; 20]>,
+    table_b: Option<[u64; 20]>,
+) -> Result<()> {
+    super::memory_object_cap::checkpoint(paging, stage, object, a, b, saved, ids, table_a, table_b)
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+#[allow(clippy::too_many_arguments)]
+fn cap_progress(
+    paging: &mut Paging<'_, '_>,
+    nodes: &mut Nodes,
+    a: &mut Domain,
+    b: &mut Domain,
+    members: &mut [Member; 2],
+    state: &mut CapState,
+    object: logic::MemoryObjectId,
+    ids: &super::memory_object_cap::CapIds,
+) -> Result<()> {
+    use super::memory_object_cap::{
+        CAP_BLOCK_A, CAP_BLOCK_B, CAP_GATE_FAILED, CAP_GATE_SENT, CAP_READY,
+    };
+    if a.space.is_some() && members[0].stack.is_some() && members[0].outcome.is_some() {
+        retire(paging, nodes, a, &mut members[0])?;
+    }
+    if b.space.is_some() && members[1].stack.is_some() && members[1].outcome.is_some() {
+        retire(paging, nodes, b, &mut members[1])?;
+    }
+    loop {
+        let stage = state.stage;
+        match stage {
+            2 => {
+                if cap_word(paging, space(a)?, CAP_BLOCK_A, CAP_READY)? != 1 {
+                    break;
+                }
+                cap_checkpoint(
+                    paging,
+                    3,
+                    Some(object),
+                    Some(space(a)?),
+                    Some(space(b)?),
+                    cap_saved(nodes, members)?,
+                    ids,
+                    cap_table(nodes, a.id),
+                    cap_table(nodes, b.id),
+                )?;
+                cap_write(paging, space(a)?, CAP_BLOCK_A, CAP_GATE_FAILED, 1)?;
+                state.stage = 3;
+            }
+            3 => {
+                if cap_word(paging, space(a)?, CAP_BLOCK_A, CAP_READY)? != 2 {
+                    break;
+                }
+                cap_checkpoint(
+                    paging,
+                    4,
+                    Some(object),
+                    Some(space(a)?),
+                    Some(space(b)?),
+                    cap_saved(nodes, members)?,
+                    ids,
+                    cap_table(nodes, a.id),
+                    cap_table(nodes, b.id),
+                )?;
+                cap_write(paging, space(a)?, CAP_BLOCK_A, CAP_GATE_SENT, 1)?;
+                cap_write(paging, space(b)?, CAP_BLOCK_B, CAP_GATE_FAILED, 1)?;
+                state.stage = 4;
+            }
+            4 => {
+                if cap_word(paging, space(b)?, CAP_BLOCK_B, CAP_READY)? != 1 {
+                    break;
+                }
+                cap_checkpoint(
+                    paging,
+                    5,
+                    Some(object),
+                    Some(space(a)?),
+                    Some(space(b)?),
+                    cap_saved(nodes, members)?,
+                    ids,
+                    cap_table(nodes, a.id),
+                    cap_table(nodes, b.id),
+                )?;
+                cap_write(paging, space(b)?, CAP_BLOCK_B, CAP_GATE_SENT, 1)?;
+                state.stage = 5;
+            }
+            5 => {
+                if check(nodes.node(b.id))?.state != NodeState::Exited {
+                    break;
+                }
+                cap_checkpoint(
+                    paging,
+                    6,
+                    Some(object),
+                    Some(space(a)?),
+                    Some(space(b)?),
+                    [None, None],
+                    ids,
+                    cap_table(nodes, a.id),
+                    cap_table(nodes, b.id),
+                )?;
+                state.stage = 6;
+            }
+            6 => {
+                super::address_space::cleanup(nodes, b.id, paging).map_err(|_| Error::Corrupt)?;
+                live_destroy(paging, nodes, b)?;
+                cap_checkpoint(
+                    paging,
+                    7,
+                    Some(object),
+                    a.space.as_ref(),
+                    None,
+                    [None, None],
+                    ids,
+                    cap_table(nodes, a.id),
+                    None,
+                )?;
+                state.stage = 7;
+            }
+            7 => {
+                if check(nodes.node(a.id))?.state != NodeState::Exited {
+                    break;
+                }
+                super::address_space::cleanup(nodes, a.id, paging).map_err(|_| Error::Corrupt)?;
+                live_destroy(paging, nodes, a)?;
+                cap_checkpoint(
+                    paging,
+                    8,
+                    Some(object),
+                    None,
+                    None,
+                    [None, None],
+                    ids,
+                    None,
+                    None,
+                )?;
+                state.stage = 8;
+            }
+            8 => {
+                paging.live_collect(object)?;
+                cap_checkpoint(
+                    paging,
+                    9,
+                    Some(object),
+                    None,
+                    None,
+                    [None, None],
+                    ids,
+                    None,
+                    None,
+                )?;
+                state.stage = 9;
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "memory-object-cap-test")]
+fn run_cap_live(paging: &mut Paging<'_, '_>) -> Result<()> {
+    use super::memory_object_cap::{CAP_VA, CapIds};
+    let before = paging.stats();
+    let tables = paging.table_count();
+    serial::write(format_args!(
+        "[NEU] Cap baseline: allocated={} free={} tables={} root={:#x} threads=2
+",
+        before.allocated,
+        before.free,
+        tables,
+        paging.root()
+    ))
+    .map_err(|_| Error::Corrupt)?;
+    preemptive::start(paging)?;
+    let mut nodes = Nodes::new();
+    let mut queue = Queue::new();
+    let mut state = CapState { stage: 0 };
+    let empty = CapIds {
+        node_a: 0,
+        node_b: 0,
+        space_a: 0,
+        space_b: 0,
+        thread_a1: 0,
+        thread_b1: 0,
+    };
+    cap_checkpoint(
+        paging,
+        0,
+        None,
+        None,
+        None,
+        [None, None],
+        &empty,
+        None,
+        None,
+    )?;
+    let object = paging.create_memory_object(2)?;
+    cap_checkpoint(
+        paging,
+        1,
+        Some(object),
+        None,
+        None,
+        [None, None],
+        &empty,
+        None,
+        None,
+    )?;
+    let (mut a, mut a1) = create_live(paging, &mut nodes, 1, 0, 35)?;
+    let (mut b, mut b1) = create_live(paging, &mut nodes, 3, 1, 77)?;
+    let ids = CapIds {
+        node_a: a.id.raw(),
+        node_b: b.id.raw(),
+        space_a: space(&a)?.id().raw(),
+        space_b: space(&b)?.id().raw(),
+        thread_a1: a1.active.thread.raw(),
+        thread_b1: b1.active.thread.raw(),
+    };
+    super::address_space::bootstrap(
+        &mut nodes,
+        paging,
+        a.id,
+        space(&a)?,
+        b.id,
+        space(&b)?,
+        Some(object),
+    )
+    .map_err(|_| Error::Corrupt)?;
+    super::address_space::map_memory_object_capability(
+        &mut nodes,
+        paging,
+        a.id,
+        space_mut(&mut a)?,
+        3,
+        CAP_VA,
+        2,
+        logic::Permissions::RW,
+    )
+    .map_err(|_| Error::Corrupt)?;
+    paging.live_release_creator(object)?;
+    install(paging, &mut nodes, &mut queue, &mut a, &mut a1, 14)?;
+    install(paging, &mut nodes, &mut queue, &mut b, &mut b1, 15)?;
+    let mut members = [a1, b1];
+    cap_checkpoint(
+        paging,
+        2,
+        Some(object),
+        Some(space(&a)?),
+        Some(space(&b)?),
+        cap_saved(&nodes, &members)?,
+        &ids,
+        cap_table(&nodes, a.id),
+        cap_table(&nodes, b.id),
+    )?;
+    let mut dispatches = 0;
+    let mut printed = 0;
+    state.stage = 2;
+    while let Some(dispatch) = check(queue.next(&mut nodes))? {
+        dispatches += 1;
+        if dispatches > 512 {
+            return Err(Error::Corrupt);
+        }
+        let index = members
+            .iter()
+            .position(|member| member.active == dispatch.active)
+            .ok_or(Error::Corrupt)?;
+        let active = dispatch.active;
+        let domain = if index == 0 { &a } else { &b };
+        if members[index].outcome.is_some()
+            || (!dispatch.saved.fresh && members[index].last != Some(dispatch.saved.frame))
+        {
+            return Err(Error::Corrupt);
+        }
+        serial::write(format_args!(
+            "[NEU] Cap selected: sequence={} label={} node={} thread={} space={} root={:#x} fresh={}
+",
+            dispatches,
+            members[index].label,
+            active.node.raw(),
+            active.thread.raw(),
+            active.context.space.raw(),
+            active.context.root,
+            dispatch.saved.fresh
+        ))
+        .map_err(|_| Error::Corrupt)?;
+        let binding = members[index].stack.ok_or(Error::Corrupt)?;
+        let publication = preemptive::arm(active, binding, true)?;
+        super::address_space::enter(check(nodes.take_authority(active))?)
+            .map_err(|_| Error::Corrupt)?;
+        let execution = native::execute_slice(paging, space(domain)?, dispatch, 96);
+        check(
+            nodes.restore_authority(
+                super::address_space::leave(active).map_err(|_| Error::Corrupt)?,
+            ),
+        )?;
+        super::address_space::reap(paging).map_err(|_| Error::Corrupt)?;
+        preemptive::settle()?;
+        preemptive::print_records(&mut printed)?;
+        let event = execution?;
+        match event {
+            SliceEvent::Preempted(frame) => {
+                let saved = preemptive::consume(publication, frame)?;
+                members[index].last = Some(frame);
+                members[index].preemptions += 1;
+                check(queue.preempted(&mut nodes, saved))?;
+            }
+            SliceEvent::Exited(reason) => {
+                preemptive::terminal(publication)?;
+                members[index].last = None;
+                members[index].outcome = Some(reason);
+                check(queue.finish(&mut nodes, active, reason))?;
+                serial::write(format_args!(
+                    "[NEU] Cap outcome: label={} thread={} reason={}
+",
+                    members[index].label,
+                    active.thread.raw(),
+                    if matches!(reason, ExitReason::Normal(_)) {
+                        "normal"
+                    } else if matches!(reason, ExitReason::UserFault(_)) {
+                        "fault"
+                    } else {
+                        "cancelled"
+                    }
+                ))
+                .map_err(|_| Error::Corrupt)?;
+            }
+            _ => return Err(Error::Corrupt),
+        }
+        cap_progress(
+            paging,
+            &mut nodes,
+            &mut a,
+            &mut b,
+            &mut members,
+            &mut state,
+            object,
+            &ids,
+        )?;
+    }
+    if nodes.active().is_some()
+        || !queue.is_empty()
+        || members
+            .iter()
+            .any(|member| member.outcome.is_none() || member.stack.is_some())
+        || a.space.is_some()
+        || b.space.is_some()
+        || state.stage != 9
+    {
+        return Err(Error::Corrupt);
+    }
+    let captures = preemptive::stop(paging)?;
+    if paging.stats() != before || paging.table_count() != tables {
+        return Err(Error::Corrupt);
+    }
+    super::address_space::finish().map_err(|_| Error::Corrupt)?;
+    serial::write(format_args!(
+        "[NEU] MemoryObject capability test passed: dispatches={} captures={} allocations=restored
+",
+        dispatches, captures
+    ))
+    .map_err(|_| Error::Corrupt)
+}
+
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
-    #[cfg(feature = "memory-object-live-test")]
+    #[cfg(feature = "memory-object-cap-test")]
+    {
+        run_cap_live(paging)
+    }
+    #[cfg(all(
+        feature = "memory-object-live-test",
+        not(feature = "memory-object-cap-test")
+    ))]
     {
         run_live(paging)
     }
@@ -1185,8 +1614,16 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
         #[cfg(feature = "cap-test")]
         let mut caps_ready = false;
         #[cfg(feature = "abi-02")]
-        super::address_space::bootstrap(&mut nodes, paging, a.id, space(&a)?, b.id, space(&b)?)
-            .map_err(|_| Error::Corrupt)?;
+        super::address_space::bootstrap(
+            &mut nodes,
+            paging,
+            a.id,
+            space(&a)?,
+            b.id,
+            space(&b)?,
+            None,
+        )
+        .map_err(|_| Error::Corrupt)?;
         let mut members = [a1, a2, b1];
         let mut limited = [false; 3];
         let mut printed = 0;

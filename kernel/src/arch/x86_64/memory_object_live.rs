@@ -47,6 +47,16 @@ pub(crate) const LIVE_READBACK: usize = 0x30;
 pub(crate) const LIVE_FAULT_MARKER: usize = 0x38;
 pub(crate) const LIVE_POST: usize = 0x40;
 
+pub(crate) fn cap_space_layout(space: &UserSpace) -> [u64; 5] {
+    [
+        ptr::addr_of!(space.root) as u64,
+        ptr::addr_of!(space.id) as u64,
+        space.tables.as_ptr() as u64,
+        ptr::addr_of!(space.teardown) as u64,
+        space.stack_tables.as_ptr() as u64,
+    ]
+}
+
 impl Paging<'_, '_> {
     pub fn live_authorize(
         &self,
@@ -74,6 +84,25 @@ impl Paging<'_, '_> {
     }
     pub fn live_counts(&self, object: MemoryObjectId) -> Result<(usize, usize, usize)> {
         self.registry.memory_object_counts(object)
+    }
+    /// Supervisor-only descriptors for the K8B capability fixture. These
+    /// expose production storage addresses and field offsets, never values
+    /// interpreted as authority.
+    pub fn cap_registry_layout(&self) -> [u64; 39] {
+        self.registry.diagnostic_layout()
+    }
+    pub fn cap_allocator_layout(&self) -> [u64; 8] {
+        self.memory.frames.diagnostic_layout()
+    }
+    pub fn cap_tables_layout(&self) -> [u64; 6] {
+        [
+            self.memory.tables.as_ptr() as u64,
+            size_of::<TableOwner>() as u64,
+            TABLES as u64,
+            offset_of!(TableOwner, physical) as u64,
+            offset_of!(TableOwner, level) as u64,
+            offset_of!(TableOwner, pinned) as u64,
+        ]
     }
     pub fn live_physical(&self, object: MemoryObjectId, page: usize) -> Result<u64> {
         let frame = self.registry.memory_object_frame(object, page)?;
@@ -152,7 +181,7 @@ impl Paging<'_, '_> {
             ptr::addr_of!(crate::arch::native::NEU_LIVE_FAULT) as u64,
         ]);
         words[14] = LIVE_RESULT;
-        words[16..54].copy_from_slice(&self.registry.diagnostic_layout());
+        words[16..55].copy_from_slice(&self.registry.diagnostic_layout());
         words[64..72].copy_from_slice(&self.memory.frames.diagnostic_layout());
         words[80..86].copy_from_slice(&[
             self.memory.tables.as_ptr() as u64,

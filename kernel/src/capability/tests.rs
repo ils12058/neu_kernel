@@ -169,9 +169,11 @@ fn combined_rights_are_required_for_exchange_and_guard_cannot_amplify() {
 }
 #[test]
 fn unknown_zero_and_object_incompatible_rights_do_not_publish_grants() {
-    for bits in [0, 4, 8, 0x100, u64::MAX] {
+    for bits in [0, 0x100, u64::MAX] {
         assert_eq!(Rights::from_bits(bits), Err(Error::Rights));
     }
+    assert_eq!(Rights::from_bits(4), Ok(Rights::MAP));
+    assert_eq!(Rights::from_bits(8), Ok(Rights::TRANSFER));
     let (mut n, a, _) = owners();
     let mut o = Objects::new();
     let flag = o.flag(true).unwrap();
@@ -213,11 +215,9 @@ fn object_identity_generation_and_type_are_checked_in_the_registry() {
     let mut o = Objects::new();
     let r = o.counter(8).unwrap();
     let id = r.id();
-    let mut bad = id;
-    bad.generation += 1;
+    let bad = ObjectId::new(id.slot(), id.generation() + 1, id.kind());
     assert_eq!(o.info(bad), Err(Error::Object));
-    bad = id;
-    bad.kind = ObjectType::Flag;
+    let bad = ObjectId::new(id.slot(), id.generation(), ObjectType::Flag);
     assert_eq!(o.info(bad), Err(Error::Type));
     o.release(r).unwrap();
     assert_eq!(o.info(id), Err(Error::Object));
@@ -265,7 +265,7 @@ fn recycled_handle_and_object_slots_reject_old_generations() {
     assert_ne!(old, new);
     assert_eq!(old.parts().unwrap().0, new.parts().unwrap().0);
     assert_ne!(old_id, new_id);
-    assert_eq!(old_id.slot, new_id.slot);
+    assert_eq!(old_id.slot(), new_id.slot());
     assert_eq!(o.info(old_id), Err(Error::Object));
     assert_eq!(read(&n, &mut o, a, old), Err(Error::Stale));
     assert_eq!(read(&n, &mut o, a, new), Ok(99));
@@ -301,11 +301,11 @@ fn pinned_generation_cannot_be_recycled_until_guard_drops() {
         pinned_id = g.info().id;
         g.close_handle(t, h).unwrap();
         let r = g.objects.counter(55).unwrap();
-        assert_ne!(r.id().slot, pinned_id.slot);
+        assert_ne!(r.id().slot(), pinned_id.slot());
         g.objects.release(r).unwrap();
     }
     let r = o.counter(66).unwrap();
-    assert_eq!(r.id().slot, pinned_id.slot);
+    assert_eq!(r.id().slot(), pinned_id.slot());
     assert_ne!(r.id(), pinned_id);
 }
 #[test]
@@ -348,7 +348,7 @@ fn reference_overflow_refuses_grant_without_consuming_a_handle_generation() {
     let (mut n, a, _) = owners();
     let mut o = Objects::new();
     let r = o.counter(1).unwrap();
-    o.slots[r.id().slot].references = u32::MAX;
+    o.slots[r.id().slot()].references = u32::MAX;
     let t = n.authority_mut(a).unwrap();
     assert_eq!(t.grant(&mut o, &r, Rights::READ), Err(Error::Capacity));
     assert!(t.is_empty());
@@ -360,7 +360,7 @@ fn exhausted_handle_and_object_generations_never_wrap() {
     let mut o = Objects::new();
     o.slots[0].generation = u32::MAX;
     let r = o.counter(1).unwrap();
-    assert_ne!(r.id().slot, 0);
+    assert_ne!(r.id().slot(), 0);
     let t = n.authority_mut(a).unwrap();
     t.slots[0].generation = u32::MAX;
     let h = t.grant(&mut o, &r, Rights::READ).unwrap();
@@ -1017,7 +1017,7 @@ fn wrong_types_and_malformed_rights_do_not_touch_channel_storage() {
     assert_eq!(send(&n, &mut o, a, h, 9), Err(Error::Type));
     assert_eq!(receive(&n, &mut o, a, h), Err(Error::Type));
     assert_eq!(o.channel_state().snapshot(), before);
-    for bits in [4, 8, 128, u64::MAX] {
+    for bits in [128, u64::MAX] {
         assert_eq!(Rights::from_bits(bits), Err(Error::Rights));
     }
     for rights in [Rights::SEND, Rights::RECEIVE, Rights::SEND_RECEIVE] {
@@ -1788,11 +1788,11 @@ fn operation_pin_exhaustion_never_registers_or_suspends() {
     let (n, mut o, a1, _, _) = waiters();
     let ah = endpoint(&n, &o, a1.node, 7);
     let (id, _) = n.authority(a1.node).unwrap().describe(a1.node, ah).unwrap();
-    o.slots[id.slot].pins = u32::MAX;
+    o.slots[id.slot()].pins = u32::MAX;
     assert_eq!(receive_start(&n, &mut o, a1, ah), Err(Error::Capacity));
     assert!(o.wait_stats() == crate::wait::Stats::default());
     assert!(o.wait_waiter(a1.thread).is_none());
-    o.slots[id.slot].pins = 0;
+    o.slots[id.slot()].pins = 0;
 }
 
 #[test]
@@ -1866,7 +1866,7 @@ fn settling_a_wait_before_its_wake_is_rejected_without_touching_the_pin() {
 
 #[test]
 fn cancelled_wait_tokens_cannot_be_settled_or_revived_into_a_new_channel() {
-    let (mut n, mut o, a1, a2, b1) = waiters();
+    let (n, mut o, a1, a2, b1) = waiters();
     let ah = endpoint(&n, &o, a1.node, 7);
     let bh = endpoint(&n, &o, b1.node, 6);
     assert_eq!(receive_start(&n, &mut o, a1, ah), Ok(WaitStart::Blocked));
@@ -1977,11 +1977,7 @@ fn movable_wait_fixture() -> (
     let table = n.authority_mut(a1.node).unwrap();
     table.sealed = false;
     let source = table.grant_movable(&mut o, &flag, Rights::READ).unwrap();
-    table.slots[endpoint.parts().unwrap().0]
-        .entry
-        .as_mut()
-        .unwrap()
-        .rights = Rights(224);
+    table.slots[endpoint.parts().unwrap().0].rights = Rights(224);
     table.seal_bootstrap();
     o.release(flag).unwrap();
     (n, o, a1, a2, b1, source)

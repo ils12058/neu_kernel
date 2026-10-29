@@ -15,6 +15,7 @@ const _: () = assert!(
         + cfg!(feature = "test-memory-object-user-readonly-fault") as u8
         + cfg!(feature = "test-memory-object-user-a-exit") as u8
         + cfg!(feature = "test-memory-object-user-xapic") as u8
+        + cfg!(feature = "test-memory-object-cap") as u8
         + cfg!(feature = "test-panic") as u8
         + cfg!(feature = "test-missing-memory-map") as u8
         + cfg!(feature = "test-memory") as u8

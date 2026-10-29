@@ -2090,3 +2090,147 @@ fn memory_object_exhausted_generation_is_retired_permanently() {
     assert_ne!(next.slot, object.slot);
     assert_eq!(r.memory_object_counts(object), Err(Error::NotOwned));
 }
+
+#[test]
+fn memory_object_capability_reference_blocks_collection_and_authorizes_mapping() {
+    let (mut r, mut m, a, _, sa, _, frames, object) = object_fixture();
+    let reference = r.retain_memory_object(object).unwrap();
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    r.release_memory_object(object).unwrap();
+    // No further references exist after the creator relinquishes the object.
+    assert!(r.retain_memory_object(object).is_err());
+    assert_eq!(r.collectible_memory_object(object), Err(Error::InUse));
+    assert_eq!(r.collect_memory_object(object), Err(Error::InUse));
+
+    let authority = r
+        .authorize_capability_mapping(&reference, sa, true)
+        .unwrap();
+    map_memory_object(
+        &a,
+        &mut m,
+        &mut r,
+        &authority,
+        0,
+        0x700000,
+        2,
+        Permissions::RW,
+    )
+    .unwrap();
+    assert_eq!(r.memory_object_counts(object), Ok((0, 2, 2)));
+    r.release_memory_object_ref(reference).unwrap();
+    assert_eq!(r.memory_object_capability_refs(object), Ok(0));
+    // Mappings still keep the object alive after the capability reference goes.
+    assert_eq!(r.collect_memory_object(object), Err(Error::InUse));
+    for i in 0..2 {
+        unmap_memory_object(&a, &mut m, &mut r, sa, 0x700000 + i as u64 * PAGE).unwrap();
+    }
+    assert_eq!(
+        r.collect_memory_object(object),
+        Ok([Some(frames[0]), Some(frames[1])])
+    );
+    assert_eq!(r.collect_memory_object(object), Err(Error::NotOwned));
+    for frame in frames {
+        assert_eq!(r.frame_owner(frame), Ok(FrameOwner::Space(SpaceId::KERNEL)));
+        r.retire(frame).unwrap();
+    }
+}
+
+#[test]
+fn memory_object_capability_authority_rejects_escalation_and_stale_references() {
+    let (mut r, mut m, a, _, sa, _, frames, object) = object_fixture();
+    let reference = r.retain_memory_object(object).unwrap();
+    let stale = MemoryObjectRef { id: reference.id() };
+    r.release_memory_object(object).unwrap();
+    let read_only = r
+        .authorize_capability_mapping(&reference, sa, false)
+        .unwrap();
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            0,
+            0x700000,
+            1,
+            Permissions::RW
+        ),
+        Err(Error::Flags)
+    );
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            0,
+            0x700000,
+            1,
+            Permissions::RX
+        ),
+        Err(Error::Flags)
+    );
+    map_memory_object(
+        &a,
+        &mut m,
+        &mut r,
+        &read_only,
+        0,
+        0x700000,
+        1,
+        Permissions::R,
+    )
+    .unwrap();
+    let writable = r
+        .authorize_capability_mapping(&reference, sa, true)
+        .unwrap();
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &writable,
+            0,
+            0x701000,
+            1,
+            Permissions::RX
+        ),
+        Err(Error::Flags)
+    );
+    assert_eq!(r.memory_object_counts(object), Ok((0, 1, 2)));
+    // Authority is re-validated at mapping time, never just at issuance.
+    r.release_memory_object_ref(reference).unwrap();
+    assert_eq!(
+        map_memory_object(
+            &a,
+            &mut m,
+            &mut r,
+            &writable,
+            0,
+            0x701000,
+            1,
+            Permissions::RW
+        ),
+        Err(Error::NotOwned)
+    );
+    assert_eq!(r.memory_object_counts(object), Ok((0, 1, 2)));
+    unmap_memory_object(&a, &mut m, &mut r, sa, 0x700000).unwrap();
+    assert_eq!(
+        r.collect_memory_object(object),
+        Ok([Some(frames[0]), Some(frames[1])])
+    );
+    let next = r.create_memory_object(&frames).unwrap();
+    assert_eq!(next.slot, object.slot);
+    assert_ne!(next.generation, object.generation);
+    assert_eq!(r.validate_memory_object_ref(&stale), Err(Error::NotOwned));
+    assert_eq!(
+        r.authorize_capability_mapping(&stale, sa, true).err(),
+        Some(Error::NotOwned)
+    );
+    let Err((error, returned)) = r.release_memory_object_ref(stale) else {
+        panic!("stale reference must be returned untouched");
+    };
+    assert_eq!(error, Error::NotOwned);
+    assert_eq!(returned.id(), object);
+    assert_eq!(r.memory_object_capability_refs(next), Ok(0));
+}

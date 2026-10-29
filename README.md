@@ -5,34 +5,37 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K8 / Phase 8A-2 completes the bounded MemoryObject backing, mapping and live
-Ring 3 sharing foundation. Trusted setup maps one real two-page RAM object into
-two isolated address spaces with RW/NX and R/NX permissions. Node A performs real
-Ring 3 stores, Node B reads the same physical bytes at a different VA, and an
-unauthorized B store produces a genuine hardware `#PF` without disturbing A.
-Either Node can be torn down first while the other retains access; final
-collection and generation reuse are independently checked through QMP.
+K8 / Phase 8B makes the MemoryObject a real capability-governed resource.
+Trusted setup retains one paging reference, installs a generation-checked
+Node-local MemoryObject capability, and maps the object through that capability
+before execution. Node A moves the capability over the existing Channel
+`SEND_CAP`/`RECEIVE_CAP` operations and exits; Node B receives the exact object
+identity and rights. Teardown drains the single reference exactly once, and the
+stopped-CPU oracle verifies handles, queue state, rights, mappings, Ring 3
+frames and the final allocator/table inventory.
 
 **Nodes execute. Capabilities authorize. MemoryObjects share real backing.**
 
-Current validation is **231 host tests and 142 unique QEMU scenarios**, including
-138 earlier regressions, four live Ring 3 profiles and three focused host tests.
-The live cases require stopped-CPU QMP evidence: raw physical backing bytes,
-user PTE rights, saved Ring 3 frames, the hardware fault record and exact final
-allocator restoration (serial output alone is insufficient). Two independent
-clean source/target builds and QMP boots also passed.
+Current validation is **236 host tests and 143 unique QEMU scenarios**, including
+138 earlier regressions, four live Ring 3 profiles, the new
+`memory-object-cap` transfer profile and five focused host tests. The live and
+transfer cases require stopped-CPU QMP evidence: raw capability slots, Channel
+FIFO transfers, physical backing bytes, user PTE rights, saved Ring 3 frames and
+exact final allocator restoration (serial output alone is insufficient).
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
 observer corrections. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
 covers the backing/lifetime foundation; [ADR 0023](docs/adr/0023-live-userspace-memoryobject-sharing.md)
-covers live sharing and fault containment; [the QMP protocol](docs/testing/memory-object-qmp.md)
-explains the raw production-state checks.
+covers live sharing and fault containment; [ADR 0024](docs/adr/0024-memoryobject-capability-authority-and-transfer.md)
+covers capability authority, transfer and cross-registry lifetime; [the QMP
+protocol](docs/testing/memory-object-qmp.md) explains the raw production-state
+checks.
 
 Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
 the baselines. K7 capability movement and Channel behavior retain their earlier
 contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
 [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
-MemoryObject APIs, capability transfer, mmap, revocation, SMP, TLB shootdown, COW
-and demand paging remain future work.
+MemoryObject syscalls, runtime mapping from a received capability, derivation,
+revocation, mmap, SMP, TLB shootdown, COW and demand paging remain future work.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private

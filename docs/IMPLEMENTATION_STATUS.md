@@ -1,5 +1,127 @@
 # Neu Kernel implementation status
 
+## K8 / Phase 8B — complete for bounded MemoryObject capability transfer (2026-10-29)
+
+Baseline was `d9fd56a60260549eef4a86444f12c3006541959b` on
+`experiment/qwen-k8a1`. Phase 8B makes a MemoryObject a real capability-governed
+resource inside the existing typed registry: Node-local generation-checked
+handles, a bounded `READ | WRITE | MAP | TRANSFER` rights set, transfer through
+the existing K7 `CHANNEL_SEND_CAP` (0x17) / `CHANNEL_RECEIVE_CAP` (0x18)
+operations, one exact paging reference across both registries, and a
+capability-authorized mapping proven by real Ring 3 execution plus independent
+stopped-CPU evidence. [ADR 0024](adr/0024-memoryobject-capability-authority-and-transfer.md)
+accepts only this bounded trusted-test contract. Architecture v0.2, ABI 0.5 and
+all fixed pool limits are unchanged; there is no ABI 0.6.
+
+### Capability representation and rights
+
+`ObjectType::MemoryObject = 5` in the existing `Objects` registry. A live slot
+owns exactly one non-copyable `paging::MemoryObjectRef`; handles are Node-local
+`(slot, generation)` words and `ObjectId` embeds kind, generation and slot, so
+stale, retired, wrong-kind, wrong-table, malformed and forged handles fail
+before any object access. Raw object identifiers are metadata, never authority;
+no userspace operation accepts one.
+
+MemoryObject rights are restricted to `READ` (1), `WRITE` (2), `MAP` (4) and
+`TRANSFER` (8), combined as `MEMORY_OBJECT` (15); the per-kind mask rejects every
+other bit. `EXECUTE`, derivation and revocation remain K10 work. `TRANSFER` is
+distinct from the endpoint's `SEND_CAPS`: an endpoint cannot move a capability
+that lacks it, and a capability cannot widen itself through the endpoint.
+Mapping authority is derived from the entry's actual rights — writable requires
+`MAP | READ_WRITE`, read-only requires `MAP | READ` — so a read-only capability
+cannot authorize a writable leaf, and execute leaves remain rejected.
+
+### Cross-registry lifetime
+
+Trusted bootstrap retains exactly one paging capability reference while the
+creator is live, installs the capability object, then releases the creator.
+That reference belongs to the capability object, not to handles: closing or
+moving a handle never changes it, a queued transfer keeps it alive across sender
+teardown, a received handle keeps the same reference, and mappings are counted
+separately. When the last `Objects` owner dies, the dead slot parks the
+non-copyable reference in a fixed six-entry pending batch; the architecture
+drains it after each reaping transaction and retries slots that were deferred
+while the batch was full. `collect_memory_object` refuses while the creator, any
+capability reference or any mapping exists and then restores the exact frames;
+generations do not wrap and exhausted slots retire permanently.
+
+### Transfer semantics reused from K7
+
+`send_cap` requires endpoint `SEND_CAPS` plus source kind MemoryObject, valid
+rights, `TRANSFER` and the trusted transferable marker. It detaches the source
+handle and enqueues its single `Objects` reference as an `OwnedTransfer` in one
+exclusive transaction. Wrong kind, missing rights, non-transferable source,
+closed peer, full queue and exhausted counters all fail before detachment and
+preserve the source handle, queue and generations. `receive_cap` validates the
+queued kind/rights, installs the moved reference in a fresh slot generation with
+an exact rights copy, and marks the new handle transferable. A full receiver
+table, exhausted generation or invalid queued description leaves the head
+queued and the queued reference intact. Scalar/capability FIFO ordering and
+conservation are unchanged.
+
+### Capability-authorized staging (honest limitation)
+
+The fixture maps the object at `0x600000` (user RW/NX) during trusted setup
+using Node A's bootstrap MemoryObject capability, before Thread execution. The
+mapping is authorized by capability rights (not the creator token), but it is
+**staged**: the later transferred capability does not create a new mapping, and
+there is no runtime `mmap`/re-map operation. `Guard::memory_object(writable)` →
+`authorize_capability_mapping` → `map_memory_object` re-validates the live
+capability reference, exact root, user range, permissions and W^X at commit
+time; a reference released between authorization and mapping cannot map.
+
+### Live Ring 3 contract and independent evidence
+
+The `memory-object-cap` profile runs A1 and B1 through the native syscall entry,
+Node, Thread and lease machinery. A1 sends the MemoryObject capability through
+its endpoint handle and exits; B1 blocks at its receive gate, calls
+`CHANNEL_RECEIVE_CAP`, receives the exact object identity and rights, sends the
+capability back through its own endpoint and exits. The queued return transfer
+is discarded exactly once when the architecture retires Node A and the Channel.
+The controller retires A first, then destroys B and A, and finally collects the
+object. The controller writes only private gate/counter words in each Node's
+DATA page; transfer counts, handle generations, queue state and ownership come
+from production registries.
+
+QMP stops the sole CPU at ten ordered checkpoints (stages 0–9) and reads a
+194-word descriptor containing addresses, strides, field offsets, fixed
+constants and schema identities only. The observer verifies raw capability
+slots and handle tables (generations, rights, transferable bit), Channel FIFO
+transfer slots and conservation counters, paging object/frame/space/mapping
+records and the capability reference count, the allocator counters/bitmap,
+table-owner inventory, physical page-table leaves and effective user rights,
+both Nodes' saved Ring 3 frames and private gate blocks, and the exact final
+baseline bitmap/inventory. Serial `verified=true` is not evidence and is never
+accepted for this case.
+
+### Validation and explicit non-claims
+
+Validation passed: `make doctor`, `make check`, `make build`, and `make test`
+with **236 host tests** (the 231-test baseline plus five focused transfer/
+lifetime tests) and **143 unique QEMU scenarios** (the 142-scenario baseline
+plus `memory-object-cap`). The focused K8B case passed repeated runs, including
+two runs rebuilt from a cleared `target/` directory; the clean rebuild also
+re-ran all 236 host tests and rebuilt the default and K8B images successfully.
+Full-suite evidence is retained at `build/test-results-full.json` and
+`build/test-results-full.log`. No hardware or hosted-CI validation is claimed.
+
+QMP development rejected several observer defects before acceptance, none of
+which were guest success claims: a frozen table inventory that did not model
+kernel-stack table retirement during member exit, an expectation that Node B's
+receive slot still held the capability after B sent it back (it is live only at
+stage 5), a private-frame snapshot that counted shared object frames as Node
+private frames until collection, and a serial marker expectation with a trailing
+space instead of the line terminator. Each was corrected to read the actual
+production distinction; all stages and raw assertions stayed mandatory. A K7
+regression was also corrected: the 8B slot restructure invalidated the K7
+observer's frozen entry offsets, so the K7 oracle now decodes the guest-published
+table layout descriptor. All seven focused K7 profiles passed again.
+
+Excluded: public `memory_create`/`mmap`, runtime mapping from a received
+capability, derivation, revocation, executable shared mappings, SMP, TLB
+shootdown, demand paging, COW, swap, file-backed memory, huge pages, DMA, ELF
+loading and Linux compatibility.
+
 ## K8 / Phase 8A-2 — complete for bounded live Ring 3 sharing (2026-10-28)
 
 Baseline was clean `937a47f340cf559fc8e0187237c955a1677c9e5b` on
@@ -87,7 +209,10 @@ suite and both clean builds passed after that fix.
 
 This completes the trusted live-sharing proof. Public MemoryObject syscalls,
 capability transfer, mmap, revocation, SMP, TLB shootdown, COW and demand paging
-remain outside this scope; there is no ABI 0.6.
+remain outside this scope; there is no ABI 0.6. *(Dated clarification: Phase 8B
+now provides bounded MemoryObject capability transfer and a staged
+capability-authorized mapping in the trusted test profile; public syscalls,
+runtime mapping by a received capability, revocation and SMP remain outside.)*
 
 ## K8 / Phase 8A-1 — complete for bounded trusted bootstrap (2026-10-28)
 

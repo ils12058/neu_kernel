@@ -187,3 +187,7 @@ test-memory-object-user-share = ["memory-object-live-test"]
 test-memory-object-user-readonly-fault = ["memory-object-live-test"]
 test-memory-object-user-a-exit = ["memory-object-live-test"]
 test-memory-object-user-xapic = ["memory-object-live-test"]
+
+# K8B: MemoryObject capability authority, transfer and cross-registry lifetime.
+memory-object-cap-test = ["memory-object-live-test", "cap-move-test"]
+test-memory-object-cap = ["memory-object-cap-test"]

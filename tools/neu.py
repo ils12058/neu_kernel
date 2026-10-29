@@ -49,8 +49,10 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "switch-rollback": "test-switch-rollback", "switch-stale": "test-switch-stale"}
 MEMORY_OBJECT_CASES = memory_object_qmp.CASES
 LIVE_CASES = memory_object_qmp.LIVE_CASES
+MEMORY_CAP_CASES = memory_object_qmp.CAP_CASES
 FEATURES.update({name: "test-" + name for name in MEMORY_OBJECT_CASES})
 FEATURES.update({name: "test-" + name for name in LIVE_CASES})
+FEATURES.update({name: "test-" + name for name in MEMORY_CAP_CASES})
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
@@ -389,6 +391,10 @@ for name in MEMORY_OBJECT_CASES:
 for name in LIVE_CASES:
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Live baseline:",
         "[NEU] Live checkpoint: stage=7 ", "[NEU] MemoryObject live test passed:",
+        "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+for name in MEMORY_CAP_CASES:
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Cap baseline:",
+        "[NEU] Cap checkpoint: stage=9\n", "[NEU] MemoryObject capability test passed:",
         "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
 EXPECT['memory-object-fail-stop'] = (COMMON + PROTOCOL + OWNED + PAGING +
     ['[NEU] Memory checkpoint: stage=8 ', '[NEU] PANIC:', 'memory-object mapping rollback failed'],
@@ -1287,6 +1293,7 @@ def observe_ipc_request(qmp,cpu,symbols,record):
     if 'neu_move_witness' in symbols:
         evidence=debug_words(qmp,symbols['neu_move_witness'],170)
         if evidence[:8]!=[w[0],w[6],w[1],w[2],w[7],w[8],w[9],w[10]]:raise Failure('Move ownership witness belongs to a different native request.')
+        layout=debug_words(qmp,symbols['neu_move_table_layout'],20) if 'neu_move_table_layout' in symbols else None
         def word32(address):
             raw=qmp.call('human-monitor-command',{'command-line':f'x /1wx {address:#x}'})
             values=re.findall(r'0x[0-9a-fA-F]+',raw)
@@ -1303,8 +1310,17 @@ def observe_ipc_request(qmp,cpu,symbols,record):
             generation=word32(generation_address)
             if bool(handle)!=bool(entry_address) or handle and generation!=handle>>32:raise Failure('Recipient table slot generation differs from installed handle.')
             if entry_address:
-                entry=debug_words(qmp,entry_address,3)
-                if entry[0]!=(obj&255)-1 or entry[1]&0xffffffff!=(obj>>8)&0xffffffff or (entry[1]>>32)&255!=obj>>40 or entry[2]&0xffffff!=(obj>>40)|(rights<<8)|(movable<<16):raise Failure('Actual typed table entry differs from authority witness.')
+                if layout is None:raise Failure('Missing capability table layout descriptor.')
+                slot_size=layout[4];gen_off,live_off,kind_off,target_off,rights_off,movable_off=layout[6:12]
+                if layout[0]!=1 or layout[5]!=8 or not 20<=slot_size<=64 or max(gen_off+4,live_off+1,kind_off+1,target_off+8,rights_off+1,movable_off+1)>slot_size:raise Failure('Capability table layout descriptor is inconsistent.')
+                if entry_address!=layout[3]+i*slot_size or generation_address!=entry_address+gen_off:raise Failure('Recipient slot address differs from table layout.')
+                entry=debug_words(qmp,entry_address,(slot_size+7)//8)
+                def field(offset,size):
+                    word,shift=offset//8,(offset%8)*8
+                    value=entry[word]>>shift
+                    if shift and offset%8+size>8:value|=entry[word+1]<<(64-shift)
+                    return value&((1<<(size*8))-1)
+                if field(gen_off,4)!=handle>>32 or field(live_off,1)!=1 or field(kind_off,1)!=obj>>40 or field(target_off,8)!=obj or field(rights_off,1)!=rights or field(movable_off,1)!=movable:raise Failure('Actual typed table entry differs from authority witness.')
         if evidence[132]:
             raw=qmp.call('human-monitor-command',{'command-line':f'x /1bx {evidence[132]:#x}'})
             values=re.findall(r'0x[0-9a-fA-F]+',raw)
@@ -2747,6 +2763,65 @@ def check_live(case, text, symbols, observation):
             'shared_backing': observation['backing']['physical']}
 
 
+def check_cap(case, text, symbols, observation):
+    if case not in MEMORY_CAP_CASES:
+        return None
+    mode = MEMORY_CAP_CASES.index(case)
+    checkpoints = [int(m[1]) for m in re.finditer(r"\[NEU\] Cap checkpoint: stage=(\d+)\n", text)]
+    if checkpoints != list(range(10)):
+        raise Failure("Capability checkpoints differ from the bounded ten-stage model.")
+    baseline = re.search(r"\[NEU\] Cap baseline: allocated=(\d+) free=(\d+) tables=(\d+) root=(0x[0-9a-f]+) threads=2\n", text)
+    if not baseline:
+        raise Failure("Capability baseline accounting is missing.")
+    ready = list(re.finditer(r"Multi Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+)", text))
+    if len(ready) != 2 or {int(m[1]) for m in ready} != {1, 3}:
+        raise Failure("Capability fixture did not install exactly the two expected Threads.")
+    records = {}
+    for match in ready:
+        label = int(match[1])
+        records[label] = {'label': label, 'node': int(match[2]), 'thread': int(match[3]),
+                          'space': int(match[4]), 'root': int(match[5], 16)}
+    selected = list(re.finditer(r"Cap selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false)\n", text))
+    if not selected:
+        raise Failure("Capability fixture recorded no dispatches.")
+    seen = set()
+    for index, match in enumerate(selected, 1):
+        sequence, label = int(match[1]), int(match[2])
+        if sequence != index or label not in records:
+            raise Failure("Capability dispatch sequence/label is not the expected runnable order.")
+        if tuple(int(match[i], 0) for i in (3, 4, 5, 6)) != (records[label]['node'], records[label]['thread'],
+                                                             records[label]['space'], records[label]['root']):
+            raise Failure("Capability dispatch named a foreign Node/Thread/root.")
+        fresh = match[7] == 'true'
+        if fresh != (label not in seen):
+            raise Failure("Capability dispatch freshness differs from the first-selection model.")
+        seen.add(label)
+    outcomes = [(int(m[1]), int(m[2]), m[3]) for m in re.finditer(r"Cap outcome: label=(\d+) thread=(\d+) reason=(\w+)\n", text)]
+    if {label: reason for label, _, reason in outcomes} != {1: 'normal', 3: 'normal'} or len(outcomes) != 2:
+        raise Failure("Capability Threads did not both terminate normally exactly once.")
+    if any(thread != records[label]['thread'] for label, thread, _ in outcomes):
+        raise Failure("Capability outcome named a foreign Thread.")
+    reclaimed = [int(m[1]) for m in re.finditer(r"Live Node reclaimed: node=(\d+) root_retired=true pins=0\n", text)]
+    if reclaimed != [records[3]['node'], records[1]['node']]:
+        raise Failure("Capability reclamation order differs from the receiver-then-sender model.")
+    passed = re.search(r"MemoryObject capability test passed: dispatches=(\d+) captures=(\d+) allocations=restored\n", text)
+    if not passed or int(passed[1]) != len(selected):
+        raise Failure("Capability completion line differs from observed dispatches.")
+    if observation is None:
+        raise Failure("Missing independent stopped-CPU capability evidence.")
+    stages = [snapshot['stage'] for snapshot in observation['checkpoints']]
+    if stages != list(range(10)):
+        raise Failure("Independent capability evidence is missing a checkpoint.")
+    first = observation['checkpoints'][0]
+    if (int(baseline[1]), int(baseline[2]), int(baseline[3])) != (
+            first['allocator']['allocated'], first['allocator']['free'], len(first['live_tables'])):
+        raise Failure("Capability baseline serial line differs from stopped-CPU accounting.")
+    return {'mode': mode, 'name': MEMORY_CAP_CASES[mode], 'stages': stages,
+            'dispatches': len(selected), 'captures': int(passed[2]),
+            'reclaim_order': reclaimed, 'baseline': {
+                'allocated': int(baseline[1]), 'free': int(baseline[2]), 'tables': int(baseline[3])}}
+
+
 def check_fault(case, text, symbols):
     if case not in FAULTS:
         return None
@@ -2828,6 +2903,10 @@ def run_case(case, esp, timeout):
                 live_snapshots = []
                 if case in LIVE_CASES:
                     result["memory_object_live_checkpoints"] = live_snapshots
+                cap_observation = None
+                cap_snapshots = []
+                if case in MEMORY_CAP_CASES:
+                    result["memory_object_cap_checkpoints"] = cap_snapshots
                 user_observation = None
                 native_observation = None
                 node_observations = {}
@@ -2854,6 +2933,11 @@ def run_case(case, esp, timeout):
                         live_observation = memory_object_qmp.observe_live(qmp, serial, symbols, started + timeout,
                             debug_words, native_register, Failure, live_snapshots, LIVE_CASES.index(case), esp / "boot/neu-kernel")
                         result["memory_object_live"] = live_observation
+                    if case in MEMORY_CAP_CASES and cap_observation is None and "[NEU] Cap checkpoint:" in transcript(serial):
+                        if qmp is None: qmp = QMP(endpoint, started + timeout)
+                        cap_observation = memory_object_qmp.observe_cap(qmp, serial, symbols, started + timeout,
+                            debug_words, native_register, Failure, cap_snapshots, MEMORY_CAP_CASES.index(case), esp / "boot/neu-kernel")
+                        result["memory_object_cap"] = cap_observation
                     if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
@@ -2945,8 +3029,11 @@ def run_case(case, esp, timeout):
                     raise Failure("Missing independent MemoryObject checkpoints.")
                 if case in LIVE_CASES and live_observation is None:
                     raise Failure("Missing independent stopped-CPU live checkpoints.")
+                if case in MEMORY_CAP_CASES and cap_observation is None:
+                    raise Failure("Missing independent stopped-CPU capability checkpoints.")
                 fault = check_fault(case, text, symbols)
                 live_evidence = check_live(case, text, symbols, live_observation) if case in LIVE_CASES else None
+                cap_evidence = check_cap(case, text, symbols, cap_observation) if case in MEMORY_CAP_CASES else None
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
                 nodes = check_nodes(case,text,symbols,node_observations) if case in NODE_CASES else None
@@ -2988,7 +3075,7 @@ def run_case(case, esp, timeout):
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
                 ipc=check_ipc(case,text,symbols,members,cap_state) if case in MOVE_CASES else check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence, memory_object_cap_evidence=cap_evidence)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:

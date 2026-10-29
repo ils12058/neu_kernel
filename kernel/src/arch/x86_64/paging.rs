@@ -669,6 +669,39 @@ impl<'a, 'm> Paging<'a, 'm> {
             }
         }
     }
+    /// Trusted setup retains one paging reference per capability object. The
+    /// reference is non-copyable and independent of handle counts.
+    #[cfg(feature = "abi-02")]
+    pub fn retain_capability_reference(
+        &mut self,
+        object: MemoryObjectId,
+    ) -> Result<logic::MemoryObjectRef> {
+        self.registry.retain_memory_object(object)
+    }
+    #[cfg(feature = "abi-02")]
+    pub fn release_capability_reference(
+        &mut self,
+        reference: logic::MemoryObjectRef,
+    ) -> Result<()> {
+        self.registry
+            .release_memory_object_ref(reference)
+            .map_err(|(error, _)| error)
+    }
+    #[cfg(feature = "memory-object-cap-test")]
+    pub fn memory_object_capability_refs(&self, object: MemoryObjectId) -> Result<u8> {
+        self.registry.memory_object_capability_refs(object)
+    }
+    /// Mapping authority derived from the exact live capability reference.
+    #[cfg(feature = "memory-object-live-test")]
+    pub fn authorize_capability_mapping(
+        &self,
+        reference: &logic::MemoryObjectRef,
+        space: SpaceId,
+        writable: bool,
+    ) -> Result<logic::MemoryMapAuthority> {
+        self.registry
+            .authorize_capability_mapping(reference, space, writable)
+    }
     /// Collect only after creator release and mapping removal. Unexpected
     /// allocator corruption is fatal to the caller, as in free_frame.
     #[allow(dead_code)] // Paired with trusted MemoryObject setup.

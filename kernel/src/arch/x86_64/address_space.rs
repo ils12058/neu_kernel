@@ -10,6 +10,8 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
+#[cfg(feature = "memory-object-live-test")]
+use neu_kernel::paging::Permissions;
 #[cfg(feature = "channel-wait-test")]
 use neu_kernel::{
     capability::Settle,
@@ -18,7 +20,7 @@ use neu_kernel::{
 use neu_kernel::{
     capability::{self as cap, Handle, Lease, ObjectType, Objects, Rights},
     node::{ActiveContext, NodeId, Nodes},
-    paging::SpaceRef,
+    paging::{MemoryObjectId, SpaceRef},
     syscall::{Frame, Outcome, v02},
 };
 const LIMIT: usize = 96;
@@ -95,6 +97,7 @@ pub fn bootstrap(
     sa: &UserSpace,
     b: NodeId,
     sb: &UserSpace,
+    memory_object: Option<MemoryObjectId>,
 ) -> cap::Result<()> {
     tx(|s| {
         if s.objects.stats() != cap::Stats::default() || s.lease.is_some() || s.reader.is_some() {
@@ -109,26 +112,55 @@ pub fn bootstrap(
                 paging.release_object_space(r).unwrap();
                 e
             })?;
-            let flag = s.objects.flag(true)?;
             let t = model(nodes.authority_mut(owner))?;
             for (index, rights) in [(0, Rights::INSPECT), (1, Rights::INSPECT)] {
                 t.install_bootstrap(&mut s.objects, &object, rights, index)?;
             }
-            #[cfg(feature = "test-cap-moves-double")]
-            {
-                // Same object/reference totals: the third AddressSpace
-                // reference becomes a second movable reference to this Node's
-                // Flag, so two distinct grants can cross one Channel.
-                t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 2)?;
-                t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 3)?;
-            }
-            #[cfg(not(feature = "test-cap-moves-double"))]
-            {
+            let second = if let Some(id) = memory_object.filter(|_| owner == a) {
                 t.install_bootstrap(&mut s.objects, &object, Rights::NONE, 2)?;
-                t.install_bootstrap(&mut s.objects, &flag, Rights::READ, 3)?;
-            }
+                let retained = paging
+                    .retain_capability_reference(id)
+                    .map_err(|_| cap::Error::Object)?;
+                let capability = match s.objects.memory_object(retained) {
+                    Ok(capability) => capability,
+                    Err((error, retained)) => {
+                        paging
+                            .release_capability_reference(retained)
+                            .map_err(|_| cap::Error::Object)?;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) =
+                    t.install_bootstrap(&mut s.objects, &capability, Rights::MEMORY_OBJECT, 3)
+                {
+                    s.objects.release(capability)?;
+                    while let Some(retained) = s.objects.drain_memory_object() {
+                        paging
+                            .release_capability_reference(retained)
+                            .map_err(|_| cap::Error::Object)?;
+                    }
+                    return Err(error);
+                }
+                capability
+            } else {
+                let flag = s.objects.flag(true)?;
+                #[cfg(feature = "test-cap-moves-double")]
+                {
+                    // Same object/reference totals: the third AddressSpace
+                    // reference becomes a second movable reference to this
+                    // Node's Flag, so two distinct grants can cross one Channel.
+                    t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 2)?;
+                    t.install_bootstrap_movable(&mut s.objects, &flag, Rights::READ, 3)?;
+                }
+                #[cfg(not(feature = "test-cap-moves-double"))]
+                {
+                    t.install_bootstrap(&mut s.objects, &object, Rights::NONE, 2)?;
+                    t.install_bootstrap(&mut s.objects, &flag, Rights::READ, 3)?;
+                }
+                flag
+            };
             creators[n * 2] = Some(object);
-            creators[n * 2 + 1] = Some(flag);
+            creators[n * 2 + 1] = Some(second);
         }
         if cfg!(feature = "test-address-space-rollback") {
             let table = model(nodes.authority_mut(a))?;
@@ -206,7 +238,11 @@ pub fn bootstrap(
         }
         for owner in [a, b] {
             #[cfg(feature = "cap-move-test")]
-            model(nodes.authority_mut(owner))?.configure_moves()?;
+            if memory_object.is_some() && owner == a {
+                model(nodes.authority_mut(owner))?.configure_memory_object_moves()?;
+            } else {
+                model(nodes.authority_mut(owner))?.configure_moves()?;
+            }
             model(nodes.authority_mut(owner))?.seal_bootstrap();
         }
         let stats = s.objects.stats();
@@ -228,6 +264,73 @@ pub fn bootstrap(
         } else {
             serial::write(format_args!("[NEU] AS bootstrap: A={} B={} grants=INSPECT,INSPECT,NONE,Flag.READ handles=4,4 objects=4 references=8 root_refs=2 ABI=0.2\n",a.raw(),b.raw())).map_err(|_|cap::Error::Object)
         }
+    })
+}
+/// Trusted controller setup: map an object into an inactive Node root using
+/// only the Node's own bootstrap capability. The capability's actual rights
+/// authorize the mapping; the creator token is not consulted here.
+#[cfg(feature = "memory-object-live-test")]
+#[allow(clippy::too_many_arguments)] // Trusted fixture setup: explicit Node, root, handle, range and permissions.
+pub fn map_memory_object_capability(
+    nodes: &mut Nodes,
+    paging: &mut Paging<'_, '_>,
+    node: NodeId,
+    space: &mut UserSpace,
+    index: u64,
+    base: u64,
+    pages: usize,
+    permissions: Permissions,
+) -> cap::Result<()> {
+    tx(|s| {
+        let table = model(nodes.authority(node))?;
+        let handle = table.bootstrap_get(&s.objects, node, index)?;
+        let guard = table.lookup(
+            &mut s.objects,
+            node,
+            handle,
+            ObjectType::MemoryObject,
+            Rights::MAP,
+        )?;
+        let writable = permissions.write;
+        let reference = guard.memory_object(writable)?;
+        let grant = paging
+            .authorize_capability_mapping(reference, space.id(), writable)
+            .map_err(|_| cap::Error::Object)?;
+        paging
+            .map_memory_backing(space, &grant, 0, base, pages, permissions)
+            .map_err(|_| cap::Error::Object)
+    })
+}
+/// Drain dead MemoryObject capability objects into paging exactly once. A
+/// full bounded pending batch is retried only after the architecture releases
+/// earlier references.
+#[cfg(feature = "memory-object-live-test")]
+fn drain_memory_objects(s: &mut State, paging: &mut Paging<'_, '_>) -> cap::Result<()> {
+    loop {
+        let mut drained = 0;
+        while let Some(reference) = s.objects.drain_memory_object() {
+            paging
+                .release_capability_reference(reference)
+                .map_err(|_| cap::Error::Object)?;
+            drained += 1;
+        }
+        let requeued = s.objects.retry_pending_memory_objects();
+        if drained == 0 && requeued == 0 {
+            return Ok(());
+        }
+    }
+}
+#[cfg(feature = "memory-object-cap-test")]
+#[allow(clippy::type_complexity)] // Stable diagnostic schema returned to the stopped-CPU observer.
+pub fn capability_diagnostics() -> cap::Result<([u64; 18], [u64; 32], cap::Stats, u32, usize)> {
+    tx(|s| {
+        Ok((
+            s.objects.diagnostic_layout(),
+            s.objects.channel_state().diagnostic_layout(),
+            s.objects.stats(),
+            s.objects.queued_references(),
+            s.objects.pending_memory_objects(),
+        ))
     })
 }
 pub fn enter(lease: Lease) -> cap::Result<()> {
@@ -254,6 +357,7 @@ pub fn take_ready_waits() -> cap::Result<[Option<Waiter>; WAITERS]> {
     tx(|s| Ok(s.objects.take_ready_waits()))
 }
 #[cfg(feature = "channel-wait-test")]
+#[allow(dead_code)]
 pub fn settle(active: ActiveContext) -> cap::Result<Settle> {
     tx(|s| {
         if s.reader.is_some() {
@@ -288,6 +392,7 @@ pub fn wait_stats() -> cap::Result<neu_kernel::wait::Stats> {
     tx(|s| Ok(s.objects.wait_stats()))
 }
 #[cfg(feature = "channel-wait-test")]
+#[allow(dead_code)]
 pub fn wait_waiter(thread: neu_kernel::node::ThreadId) -> cap::Result<Option<Waiter>> {
     tx(|s| Ok(s.objects.wait_waiter(thread)))
 }
@@ -517,6 +622,7 @@ pub fn request(active: ActiveContext, frame: Frame, address: u64, top: u64) -> O
     })
 }
 #[cfg(feature = "channel-test")]
+#[allow(dead_code)]
 pub fn channel_gates() -> cap::Result<u64> {
     tx(|s| super::ipc::gates(&s.objects))
 }
@@ -530,6 +636,8 @@ pub fn reap(paging: &mut Paging<'_, '_>) -> cap::Result<()> {
                 .release_object_space(r)
                 .map_err(|_| cap::Error::Object)?;
         }
+        #[cfg(feature = "memory-object-live-test")]
+        drain_memory_objects(s, paging)?;
         Ok(())
     })
 }
@@ -558,6 +666,8 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
                 .release_object_space(r)
                 .map_err(|_| cap::Error::Object)?;
         }
+        #[cfg(feature = "memory-object-live-test")]
+        drain_memory_objects(s, paging)?;
         let after = s.objects.stats();
         let node_pins = after.pins.saturating_sub(s.objects.pins_outside_node(node));
         let queued_discarded = queued_before
@@ -576,7 +686,11 @@ pub fn cleanup(nodes: &mut Nodes, node: NodeId, paging: &mut Paging<'_, '_>) -> 
 }
 pub fn finish() -> cap::Result<()> {
     tx(|s| {
-        if s.reader.is_some() || s.lease.is_some() || s.objects.stats() != cap::Stats::default() {
+        if s.reader.is_some()
+            || s.lease.is_some()
+            || s.objects.stats() != cap::Stats::default()
+            || s.objects.pending_memory_objects() != 0
+        {
             return Err(cap::Error::Object);
         }
         #[cfg(feature = "channel-test")]

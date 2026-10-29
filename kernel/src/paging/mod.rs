@@ -532,6 +532,24 @@ pub struct MemoryObjectId {
     slot: usize,
     generation: u64,
 }
+impl MemoryObjectId {
+    pub fn raw(self) -> u64 {
+        (self.generation << 8) | (self.slot as u64 + 1)
+    }
+}
+/// Non-copyable cross-registry reference held by exactly one capability object.
+/// Releasing it is the only way to drop the capability registry's paging
+/// reference; the exact generation is validated at every use.
+#[must_use = "release the capability reference when its object is collected"]
+#[derive(Debug)]
+pub struct MemoryObjectRef {
+    id: MemoryObjectId,
+}
+impl MemoryObjectRef {
+    pub fn id(&self) -> MemoryObjectId {
+        self.id
+    }
+}
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct MemoryObject {
@@ -540,6 +558,7 @@ struct MemoryObject {
     creator: bool,
     frames: [FrameId; MEMORY_OBJECT_PAGES],
     pages: usize,
+    capability_refs: u8,
 }
 /// Trusted internal setup authority. Its fields cannot be supplied by userspace;
 /// it never grants access to a different generation, space or stronger rights.
@@ -547,6 +566,7 @@ pub struct MemoryMapAuthority {
     object: MemoryObjectId,
     space: SpaceId,
     writable: bool,
+    capability: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -609,7 +629,7 @@ impl Registry {
     /// Test-only schema: bases, strides and offsets point to production fields.
     /// No data values are projected, and no address authorizes a kernel action.
     #[cfg(any(feature = "memory-object-test", feature = "memory-object-live-test"))]
-    pub fn diagnostic_layout(&self) -> [u64; 38] {
+    pub fn diagnostic_layout(&self) -> [u64; 39] {
         use core::mem::{offset_of as off, size_of as size};
         [
             1,
@@ -650,6 +670,7 @@ impl Registry {
             size::<SpaceId>() as u64,
             size::<MappingObject>() as u64,
             size::<FrameOwner>() as u64,
+            off!(MemoryObject, capability_refs) as u64,
         ]
     }
     pub const fn new() -> Self {
@@ -679,6 +700,7 @@ impl Registry {
                 creator: false,
                 frames: [FrameId::EMPTY; MEMORY_OBJECT_PAGES],
                 pages: 0,
+                capability_refs: 0,
             }; MEMORY_OBJECTS],
             spaces: [Space {
                 generation: 0,
@@ -1101,6 +1123,7 @@ impl Registry {
             creator: true,
             frames: backing,
             pages: frames.len(),
+            capability_refs: 0,
         };
         for frame in frames {
             self.frames[frame.slot].owner = FrameOwner::MemoryObject(id);
@@ -1124,7 +1147,58 @@ impl Registry {
             object: id,
             space,
             writable,
+            capability: false,
         })
+    }
+    /// Trusted setup retains one paging reference per capability object. The
+    /// reference is non-copyable; handle counts never change this count.
+    pub fn retain_memory_object(&mut self, id: MemoryObjectId) -> Result<MemoryObjectRef> {
+        let object = self.object(id)?;
+        if !object.creator || object.capability_refs == u8::MAX {
+            return Err(if object.creator {
+                Error::Capacity
+            } else {
+                Error::NotOwned
+            });
+        }
+        self.objects[id.slot].capability_refs += 1;
+        Ok(MemoryObjectRef { id })
+    }
+    pub fn validate_memory_object_ref(&self, reference: &MemoryObjectRef) -> Result<()> {
+        if self.object(reference.id)?.capability_refs == 0 {
+            return Err(Error::NotOwned);
+        }
+        Ok(())
+    }
+    pub fn release_memory_object_ref(
+        &mut self,
+        reference: MemoryObjectRef,
+    ) -> core::result::Result<(), (Error, MemoryObjectRef)> {
+        if let Err(error) = self.validate_memory_object_ref(&reference) {
+            return Err((error, reference));
+        }
+        self.objects[reference.id.slot].capability_refs -= 1;
+        Ok(())
+    }
+    /// The mapping authority is derived from a live capability-owned reference.
+    /// It is intentionally distinct from the trusted creator authority.
+    pub fn authorize_capability_mapping(
+        &self,
+        reference: &MemoryObjectRef,
+        space: SpaceId,
+        writable: bool,
+    ) -> Result<MemoryMapAuthority> {
+        self.validate_memory_object_ref(reference)?;
+        self.space(space)?;
+        Ok(MemoryMapAuthority {
+            object: reference.id,
+            space,
+            writable,
+            capability: true,
+        })
+    }
+    pub fn memory_object_capability_refs(&self, id: MemoryObjectId) -> Result<u8> {
+        Ok(self.object(id)?.capability_refs)
     }
     pub fn memory_object_counts(&self, id: MemoryObjectId) -> Result<(usize, usize, usize)> {
         let object = self.object(id)?;
@@ -1194,6 +1268,7 @@ impl Registry {
         self.can_allocate(SpaceId::KERNEL)?;
         let object = *self.object(id)?;
         if object.creator
+            || object.capability_refs != 0
             || self
                 .mappings
                 .iter()
@@ -1615,7 +1690,11 @@ pub fn map_memory_object(
     permissions: Permissions,
 ) -> Result<()> {
     let object = *registry.object(authority.object)?;
-    if !object.creator {
+    if authority.capability {
+        if object.capability_refs == 0 {
+            return Err(Error::NotOwned);
+        }
+    } else if !object.creator {
         return Err(Error::NotOwned);
     }
     registry.can_allocate(authority.space)?;

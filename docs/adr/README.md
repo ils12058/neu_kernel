@@ -251,3 +251,17 @@ to two roots, real Ring 3 writes/reads cross the shared backing, a read-only sto
 produces a genuine `#PF`, and both Node teardown orders preserve correct lifetime.
 It does not accept a public MemoryObject ABI, transfer, mmap or SMP. Architecture
 v0.2 and ABI 0.5 remain unchanged.
+
+## K8 / Phase 8B record — MemoryObject capability authority and transfer
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0024: MemoryObject capability authority and transfer](0024-memoryobject-capability-authority-and-transfer.md) | Accepted for bounded Phase 8B; generation-checked Node-local transfer, exactly-once cross-registry lifetime and stopped-CPU evidence verified | NEU-005; NEU-017; NEU-018; NEU-021; NEU-023; NEU-024 |
+
+ADR 0024 extends 0020/0021 from Flag and Counter movement to MemoryObjects, and
+extends 0022/0023 from trusted creator mapping to capability-authorized mapping.
+It reuses the existing `CHANNEL_SEND_CAP`/`CHANNEL_RECEIVE_CAP` operations without
+an ABI change, keeps the fixed pools, and derives mapping rights from the actual
+entry. It does not accept public MemoryObject syscalls, runtime mapping from a
+received capability, derivation, revocation or SMP. ADRs 0022 and 0023 remain
+accepted for their scopes.

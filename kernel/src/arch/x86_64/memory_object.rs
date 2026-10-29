@@ -45,7 +45,7 @@ impl Paging<'_, '_> {
             vas[0],
             vas[1],
         ]);
-        words[16..54].copy_from_slice(&self.registry.diagnostic_layout());
+        words[16..55].copy_from_slice(&self.registry.diagnostic_layout());
         words[64..72].copy_from_slice(&self.memory.frames.diagnostic_layout());
         words[80..86].copy_from_slice(&[
             self.memory.tables.as_ptr() as u64,

@@ -479,7 +479,7 @@ fn movable_counter_keeps_write_only_rights_and_full_width_actual_value() {
     let id = n.authority(b).unwrap().describe(b, received).unwrap().0;
     assert!(matches!(
         o.object(id).unwrap().value,
-        Some(Value::Counter(u64::MAX))
+        Value::Counter(u64::MAX)
     ));
     for node in [a, b] {
         n.authority_mut(node).unwrap().drain(&mut o, node).unwrap();
@@ -1169,5 +1169,284 @@ fn seeded_mixed_fifo_sequences_match_an_independent_ownership_model_after_each_o
             objects.channel_state().stats(),
             crate::channel::Stats::default()
         );
+    }
+}
+
+/// K8B shape: Node A's manifest index 3 is a MemoryObject capability carrying
+/// TRANSFER; Node B keeps four Flags so a full receive table is reachable.
+fn memory_pair() -> (
+    Nodes,
+    Objects,
+    crate::paging::Registry,
+    [NodeId; 2],
+    [[Handle; 8]; 2],
+    crate::paging::MemoryObjectId,
+) {
+    let mut n = Nodes::new();
+    let owners = [n.create().unwrap(), n.create().unwrap()];
+    let mut o = Objects::with_channels();
+    let mut r = crate::paging::Registry::new();
+    let frames = [r.insert(0x200000).unwrap(), r.insert(0x201000).unwrap()];
+    for frame in frames {
+        r.initialize(frame).unwrap();
+    }
+    let object = r.create_memory_object(&frames).unwrap();
+    let reference = r.retain_memory_object(object).unwrap();
+    let capability = o.memory_object(reference).unwrap();
+    let flag = o.flag(true).unwrap();
+    for index in 0..3 {
+        n.authority_mut(owners[0])
+            .unwrap()
+            .install_bootstrap(&mut o, &flag, Rights::READ, index)
+            .unwrap();
+    }
+    n.authority_mut(owners[0])
+        .unwrap()
+        .install_bootstrap(&mut o, &capability, Rights::MEMORY_OBJECT, 3)
+        .unwrap();
+    o.release(flag).unwrap();
+    o.release(capability).unwrap();
+    r.release_memory_object(object).unwrap();
+    let flag = o.flag(false).unwrap();
+    for index in 0..4 {
+        n.authority_mut(owners[1])
+            .unwrap()
+            .install_bootstrap(&mut o, &flag, Rights::READ, index)
+            .unwrap();
+    }
+    o.release(flag).unwrap();
+    n.bootstrap_channel(&mut o, owners[0], owners[1]).unwrap();
+    n.authority_mut(owners[0])
+        .unwrap()
+        .configure_memory_object_moves()
+        .unwrap();
+    n.authority_mut(owners[1])
+        .unwrap()
+        .configure_moves()
+        .unwrap();
+    for owner in owners {
+        n.authority_mut(owner).unwrap().seal_bootstrap();
+    }
+    let handles = owners.map(|owner| {
+        core::array::from_fn(|index| {
+            n.authority(owner)
+                .unwrap()
+                .bootstrap_get(&o, owner, index as u64)
+                .unwrap()
+        })
+    });
+    (n, o, r, owners, handles, object)
+}
+
+#[test]
+fn memory_object_capability_moves_once_with_exact_rights_and_one_paging_reference() {
+    let (mut n, mut o, mut r, [a, b], h, object) = memory_pair();
+    let (id, rights) = n.authority(a).unwrap().describe(a, h[0][3]).unwrap();
+    assert_eq!(id.kind(), ObjectType::MemoryObject);
+    assert_eq!(rights, Rights::MEMORY_OBJECT);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    assert_eq!(r.memory_object_counts(object), Ok((0, 0, 2)));
+
+    let before = o.stats();
+    n.authority_mut(a)
+        .unwrap()
+        .send_cap(&mut o, a, h[0][4], h[0][3])
+        .unwrap();
+    assert_eq!(
+        n.authority(a).unwrap().describe(a, h[0][3]),
+        Err(Error::Stale)
+    );
+    assert_eq!(
+        n.authority_mut(a).unwrap().close(&mut o, a, h[0][3]),
+        Err(Error::Stale)
+    );
+    // The moved reference now lives in the FIFO; totals never change.
+    assert_eq!(o.stats(), before);
+    assert_eq!(o.queued_references(), 1);
+    assert_eq!(o.channel_state().stats().queued, 1);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+
+    // A full receiver table rejects delivery without touching queued authority.
+    let queue = o.channel_state().snapshot();
+    assert_eq!(
+        n.authority_mut(b).unwrap().receive_cap(&mut o, b, h[1][4]),
+        Err(Error::Capacity)
+    );
+    assert_eq!(o.channel_state().snapshot(), queue);
+    assert_eq!(o.stats(), before);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+
+    n.authority_mut(b)
+        .unwrap()
+        .close(&mut o, b, h[1][2])
+        .unwrap();
+    let received = n
+        .authority_mut(b)
+        .unwrap()
+        .receive_cap(&mut o, b, h[1][4])
+        .unwrap();
+    assert_ne!(received, h[0][3]);
+    assert_eq!(
+        n.authority(b).unwrap().describe(b, received),
+        Ok((id, Rights::MEMORY_OBJECT))
+    );
+    {
+        let guard = n
+            .authority(b)
+            .unwrap()
+            .lookup(
+                &mut o,
+                b,
+                received,
+                ObjectType::MemoryObject,
+                Rights::READ_WRITE,
+            )
+            .unwrap();
+        assert_eq!(guard.memory_object(true).map(|r| r.id()), Ok(object));
+        assert_eq!(guard.memory_object(false).map(|r| r.id()), Ok(object));
+        assert_eq!(guard.read(), Err(Error::Type));
+    }
+    assert_eq!(o.queued_references(), 0);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    assert_eq!(r.memory_object_counts(object), Ok((0, 0, 2)));
+
+    // Closing the last capability handle parks exactly one paging reference.
+    n.authority_mut(b)
+        .unwrap()
+        .close(&mut o, b, received)
+        .unwrap();
+    assert_eq!(o.pending_memory_objects(), 1);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    assert_eq!(
+        r.collect_memory_object(object),
+        Err(crate::paging::Error::InUse)
+    );
+    let reference = o.drain_memory_object().unwrap();
+    assert_eq!(reference.id(), object);
+    assert_eq!(o.pending_memory_objects(), 0);
+    r.release_memory_object_ref(reference).unwrap();
+    assert_eq!(r.memory_object_capability_refs(object), Ok(0));
+    let frames = r.collect_memory_object(object).unwrap();
+    assert_eq!(frames.iter().flatten().count(), 2);
+    assert_eq!(
+        r.collect_memory_object(object),
+        Err(crate::paging::Error::NotOwned)
+    );
+    for frame in frames.into_iter().flatten() {
+        r.retire(frame).unwrap();
+    }
+}
+
+#[test]
+fn memory_object_send_requires_transfer_and_failures_preserve_source_and_queue() {
+    let (mut n, mut o, mut r, [a, b], h, object) = memory_pair();
+    let stats = o.stats();
+    // The capability is movable but carries no TRANSFER right.
+    n.authority_mut(a).unwrap().slots[3].rights = Rights::MAP;
+    assert_eq!(
+        n.authority_mut(a)
+            .unwrap()
+            .send_cap(&mut o, a, h[0][4], h[0][3]),
+        Err(Error::Rights)
+    );
+    assert_eq!(o.queued_references(), 0);
+    assert_eq!(o.stats(), stats);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    n.authority_mut(a).unwrap().slots[3].rights = Rights::MEMORY_OBJECT;
+
+    // A closed peer refuses the send before detachment.
+    n.authority_mut(b).unwrap().terminate();
+    n.authority_mut(b).unwrap().drain(&mut o, b).unwrap();
+    let drained = o.stats();
+    assert_eq!(
+        n.authority_mut(a)
+            .unwrap()
+            .send_cap(&mut o, a, h[0][4], h[0][3]),
+        Err(Error::PeerClosed)
+    );
+    assert_eq!(o.stats(), drained);
+    assert_eq!(o.queued_references(), 0);
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    assert_eq!(
+        n.authority(a)
+            .unwrap()
+            .describe(a, h[0][3])
+            .unwrap()
+            .0
+            .kind(),
+        ObjectType::MemoryObject
+    );
+
+    // Sender teardown still parks exactly one reference for the architecture.
+    n.authority_mut(a).unwrap().terminate();
+    n.authority_mut(a).unwrap().drain(&mut o, a).unwrap();
+    assert_eq!(o.pending_memory_objects(), 1);
+    assert_eq!(o.stats(), Stats::default());
+    assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+    let reference = o.drain_memory_object().unwrap();
+    r.release_memory_object_ref(reference).unwrap();
+    let frames = r.collect_memory_object(object).unwrap();
+    assert_eq!(frames.iter().flatten().count(), 2);
+    for frame in frames.into_iter().flatten() {
+        r.retire(frame).unwrap();
+    }
+}
+
+#[test]
+fn queued_memory_object_capability_is_discarded_exactly_once_across_teardown() {
+    for received in [false, true] {
+        let (mut n, mut o, mut r, [a, b], h, object) = memory_pair();
+        n.authority_mut(a)
+            .unwrap()
+            .send_cap(&mut o, a, h[0][4], h[0][3])
+            .unwrap();
+        n.authority_mut(a).unwrap().terminate();
+        n.authority_mut(a).unwrap().drain(&mut o, a).unwrap();
+        // The queued reference outlives its sender and keeps the paging
+        // capability reference alive.
+        assert_eq!(o.queued_references(), 1);
+        assert_eq!(o.pending_memory_objects(), 0);
+        assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+        if received {
+            n.authority_mut(b)
+                .unwrap()
+                .close(&mut o, b, h[1][2])
+                .unwrap();
+            let handle = n
+                .authority_mut(b)
+                .unwrap()
+                .receive_cap(&mut o, b, h[1][4])
+                .unwrap();
+            assert_eq!(
+                n.authority(b).unwrap().describe(b, handle).unwrap().1,
+                Rights::MEMORY_OBJECT
+            );
+            assert_eq!(o.queued_references(), 0);
+        }
+        n.authority_mut(b).unwrap().terminate();
+        n.authority_mut(b).unwrap().drain(&mut o, b).unwrap();
+        assert_eq!(o.queued_references(), 0);
+        assert_eq!(o.channel_state().stats(), crate::channel::Stats::default());
+        assert_eq!(o.stats(), Stats::default());
+        assert_eq!(o.pending_memory_objects(), 1);
+        assert_eq!(r.memory_object_capability_refs(object), Ok(1));
+        assert_eq!(
+            r.collect_memory_object(object),
+            Err(crate::paging::Error::InUse)
+        );
+        let reference = o.drain_memory_object().unwrap();
+        assert_eq!(reference.id(), object);
+        assert_eq!(o.drain_memory_object().map(|r| r.id()), None);
+        r.release_memory_object_ref(reference).unwrap();
+        let frames = r.collect_memory_object(object).unwrap();
+        assert_eq!(frames.iter().flatten().count(), 2);
+        assert_eq!(
+            r.collect_memory_object(object),
+            Err(crate::paging::Error::NotOwned)
+        );
+        for frame in frames.into_iter().flatten() {
+            r.retire(frame).unwrap();
+            assert_eq!(r.retire(frame), Err(crate::paging::Error::NotOwned));
+        }
     }
 }
