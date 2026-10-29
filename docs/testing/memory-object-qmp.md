@@ -1,8 +1,11 @@
-# MemoryObject QMP evidence (bounded Phase 8A-1)
+# MemoryObject QMP evidence (bounded Phase 8A-1 and 8A-2)
 
-The `memory-object-*` images run trusted kernel code with one CPU, IF=0 and
-inactive user roots. They do not execute shared-memory accesses in Ring 3.
-Architecture v0.2 and ABI 0.5 remain the design and ABI baselines.
+The Phase 8A-1 `memory-object-*` images run trusted kernel code with one CPU,
+IF=0 and inactive user roots; they do not execute shared-memory accesses in
+Ring 3. The Phase 8A-2 `memory-object-user-*` images then execute real Ring 3
+writes/reads through the installed shared leaves and, in the fault profile,
+produce a genuine hardware `#PF`. Architecture v0.2 and ABI 0.5 remain the design
+and ABI baselines.
 
 ## Profiles
 
@@ -18,6 +21,88 @@ Architecture v0.2 and ABI 0.5 remain the design and ABI baselines.
 Use `python3 tools/neu.py test --case <name>`. Each case keeps the existing
 30-second default timeout, failure reporting and final QMP CPU halt checks.
 Repeated runs and clean-directory runs are not additional unique scenarios.
+
+## Live Ring 3 profiles (Phase 8A-2)
+
+| Case | Purpose |
+| --- | --- |
+| `memory-object-user-share` | A1 stores and reads back; B1 reads the same physical bytes at a different VA; B destroyed first |
+| `memory-object-user-readonly-fault` | B1's read succeeds, then a user store to its read-only alias raises a real `#PF`; B is contained and reclaimed |
+| `memory-object-user-a-exit` | A finishes and is destroyed first; B waits, then reads the surviving backing before its own teardown |
+| `memory-object-user-xapic` | Same live sharing/teardown contract on the legacy local-APIC fallback |
+
+### Fixed live contract
+
+- One trusted RAM-backed two-page MemoryObject, zeroed before execution.
+- Node A maps both pages at `0x600000` with user RW/NX leaves; Node B maps the
+  same physical pages at `0x602000` with user R/NX leaves. The VAs are distinct,
+  page-aligned and inside the existing `[0x400000, 0x800000)` user range.
+- Only A1 (writer, label 1, slot 0) and B1 (reader or faulting writer, label 3,
+  slot 1) are installed. The two live Threads peak at 14 data frames within the
+  fixed 16-frame pool. The third assembly role remains present but is not run.
+- The trusted controller writes only private gate/counter/observation words in
+  each Node's DATA page. It never writes the shared payload or synthesizes the
+  reader's result. A1 and B1 execute ordinary user stores/loads.
+- The live assembly roles are compiled into the shared 4 KiB user RX fixture
+  page only for `memory-object-live-test`; the legacy multi-Thread payload
+  remains 3688 bytes and no other feature's page budget changes.
+- Preemption is armed with `peer=true` unconditionally so even a single spinning
+  Thread is checkpointable. Queue order is `[A1, B1]`.
+- Share/fault/xAPIC destroy B first while A still maps the object. A-exit destroys
+  A first while B waits at its pre-gate, then B reads and reaches its post gate.
+
+### Live checkpoints
+
+The live descriptor is `neu_memory_live_witness` (128 atomic u64 words). QMP
+stops the sole CPU inside the bounded `neu_memory_live_wait` countdown, rechecks
+RIP/CPL/CR3/IF, then reads only production state. All eight stages must appear in
+order:
+
+| Stage | Observed state |
+| --- | --- |
+| 0 | Exact allocator/table baseline; no test object, Node or mapping |
+| 1 | Two-page object live with creator reference and zeroed physical backing |
+| 2 | Both Nodes/spaces mapped, both Threads installed and queued with fresh saved frames |
+| 3 | Creator released; both mappings still retain the object |
+| 4 | A1 at its post gate and B1 read/gate or the B hardware fault; mode-specific raw blocks and frames |
+| 5 | First Node reclaimed (B for share/fault/xAPIC, A for A-exit); survivor mapping still valid |
+| 6 | Second Node reclaimed (share/fault/xAPIC), or B's post-A-exit read checkpoint (A-exit) |
+| 7 | Object collected; exact baseline bitmap, table and frame inventory restored |
+
+The descriptor carries only addresses/layouts/constants: magic, stage, mode,
+kernel root, A/B VAs, payload constants, schema, Node/Space identities, the
+`NEU_LIVE_FAULT` address, registry layout, allocator layout, table-owner layout,
+both UserSpace root/id/inventory/teardown/stack-table pointers, saved-frame
+pointers, private-block offsets and Thread/stack addresses. It contains no
+guest-calculated “verified” scalar and no permission summary.
+
+### What the live oracle proves
+
+For every stage the observer reads:
+
+- the actual object/frame/space/mapping records and table-owner pool;
+- allocator counters, bitmap and actual memory-map spans, including the exact
+  final bitmap;
+- physical page-table pages, reconstructing each user leaf's physical target and
+  effective U/S, R/W and NX bits;
+- both roots' inventories, workspace aliases and supervisor-only status;
+- the production saved Thread frames from `Nodes.threads[].saved`, including
+  Ring 3 CS/SS/RFLAGS/RSP/RBX and live gate RIP ranges;
+- the physical object pages and each Node's private DATA block;
+- the raw `NEU_LIVE_FAULT` record written by the real `user_fault` path.
+
+In the share profile the physical first page must contain the two A1-written
+values and the second page the sentinel; B1's private block must contain the same
+values read through its R/NX VAs. In the fault profile B1's block must contain
+the successful read, its gate/marker state must match the controller model, and
+the fault record must show vector 14, error `0x7`, `CR2 = 0x602000`, the actual
+store-site RIP, `CS = 0x3b`, `SS = 0x33`, CPL 3, Node/Thread/Space/CR3 of B and a
+handler stack inside B's kernel stack. B's Node must be `Exited`, its mappings
+gone exactly once, and A must still complete. The A-exit profile proves B reads
+the unchanged physical values after A's root is destroyed.
+
+Serial output alone never satisfies these profiles: missing or mismatched raw QMP
+state fails the case.
 
 ## Production integration
 
@@ -108,8 +193,27 @@ absent, no shared record was committed and the allocator bitmap did not change.
 The CPU reaches the panic halt. This is an expected terminal-failure test, not a
 successful rollback or a reusable address space.
 
-No checkpoint claims Ring 3 shared execution, a hardware read-only fault,
-capability transfer of a MemoryObject, SMP safety or production readiness.
+No Phase 8A-1 checkpoint claims Ring 3 shared execution, a hardware read-only
+fault, capability transfer of a MemoryObject, SMP safety or production readiness.
+The Phase 8A-2 live checkpoints above do claim the bounded trusted Ring 3 access
+and fault containment described in [ADR 0023](../adr/0023-live-userspace-memoryobject-sharing.md).
+
+## Live observer corrections retained during finalization
+
+Three initial live-oracle checks were rejected and corrected before acceptance;
+none was accepted as guest success:
+
+- the descriptor-root membership test ran before the production walk populated
+  its root map, so a valid root was reported missing;
+- kernel-stack tables are recorded in both `tables` and `stack_tables` but only
+  non-stack tables receive user-root workspace aliases, so aliases were compared
+  against the wrong inventory;
+- the A-exit wait gate increments its bounded spin counter, so requiring every
+  private word to be zero misclassified a legitimate wait loop as an early read.
+
+The corrected oracle still requires every stage, all raw production assertions,
+the exact fault record and the exact final bitmap. A guest that prints the
+expected completion line but lacks this evidence fails.
 
 ## Observer failures retained during finalization
 

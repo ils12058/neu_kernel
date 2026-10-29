@@ -5,31 +5,34 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K8 / Phase 8A-1 completes the bounded MemoryObject backing and mapping lifetime
-foundation. Trusted setup can map the same real RAM backing into two separate
-address spaces with R or RW non-executable permissions. Newly allocated page
-tables belong to the correct root, workspace aliases stay supervisor-only, and
-either root can be torn down while the other retains its backing. Final collection
-and generation reuse are independently checked through QMP.
+K8 / Phase 8A-2 completes the bounded MemoryObject backing, mapping and live
+Ring 3 sharing foundation. Trusted setup maps one real two-page RAM object into
+two isolated address spaces with RW/NX and R/NX permissions. Node A performs real
+Ring 3 stores, Node B reads the same physical bytes at a different VA, and an
+unauthorized B store produces a genuine hardware `#PF` without disturbing A.
+Either Node can be torn down first while the other retains access; final
+collection and generation reuse are independently checked through QMP.
 
-**Nodes execute. Capabilities authorize. MemoryObjects own shared backing.**
+**Nodes execute. Capabilities authorize. MemoryObjects share real backing.**
 
-Current validation is **228 host tests and 138 unique QEMU scenarios**, including
-132 earlier regressions and six new focused cases. One case deliberately verifies
-a fail-stop panic; normal lifetime cases return to the exact allocator baseline.
-Two independent clean source/target builds and QMP boots also passed.
+Current validation is **231 host tests and 142 unique QEMU scenarios**, including
+138 earlier regressions, four live Ring 3 profiles and three focused host tests.
+The live cases require stopped-CPU QMP evidence: raw physical backing bytes,
+user PTE rights, saved Ring 3 frames, the hardware fault record and exact final
+allocator restoration (serial output alone is insufficient). Two independent
+clean source/target builds and QMP boots also passed.
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
-observer failures/retries. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
-is accepted for this bounded scope; [the QMP protocol](docs/testing/memory-object-qmp.md)
+observer corrections. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
+covers the backing/lifetime foundation; [ADR 0023](docs/adr/0023-live-userspace-memoryobject-sharing.md)
+covers live sharing and fault containment; [the QMP protocol](docs/testing/memory-object-qmp.md)
 explains the raw production-state checks.
 
 Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
 the baselines. K7 capability movement and Channel behavior retain their earlier
 contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
-[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md).
-Phase 8A-2 will prove actual Ring 3 shared-memory reads/writes and hardware
-permission faults. Public MemoryObject APIs, transfer, revocation and SMP remain
-future work.
+[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
+MemoryObject APIs, capability transfer, mmap, revocation, SMP, TLB shootdown, COW
+and demand paging remain future work.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private
@@ -99,6 +102,13 @@ Run `python3 tools/neu.py test --case switch` for cooperative switching,
 `--case switch-a-fault` for suspended-sibling containment, or
 `--case switch-rollback` for construction failure. Earlier `timer`, `timer-xapic`,
 `nodes`, `native` and `user` cases remain available with the same command.
+
+Run `python3 tools/neu.py test --case memory-object-user-share` for real Ring 3
+stores/loads through one shared two-page object, `--case memory-object-user-readonly-fault`
+for the hardware write-protection `#PF` and containment, `--case memory-object-user-a-exit`
+for Node A's exit while B still reads, or `--case memory-object-user-xapic` for
+the live contract on the legacy controller fallback. These four cases fail unless
+their stopped-CPU QMP evidence matches the raw production state.
 
 ## Documentation
 

@@ -1,5 +1,94 @@
 # Neu Kernel implementation status
 
+## K8 / Phase 8A-2 — complete for bounded live Ring 3 sharing (2026-10-28)
+
+Baseline was clean `937a47f340cf559fc8e0187237c955a1677c9e5b` on
+`experiment/qwen-k8a1`. Phase 8A-1's trusted mapping foundation now carries real
+Ring 3 execution: two isolated Nodes map one physical two-page MemoryObject at
+distinct VAs, Node A writes with user RW/NX leaves, Node B reads the same bytes
+through user R/NX leaves, an unauthorized B store produces a genuine hardware
+`#PF`, and both Node teardown orders preserve shared-backing lifetime. No kernel
+copy or synthesized observation supplies the tested values.
+
+[ADR 0023](adr/0023-live-userspace-memoryobject-sharing.md) accepts only this
+bounded trusted-test contract. Architecture v0.2, ABI 0.5 and the fixed pool
+limits are unchanged: 2 Nodes, 3 Threads, 16 data frames, 64 tables, 64 mappings,
+4 MemoryObjects and 2 pages per object. The live profiles install only A1 (writer)
+and B1 (reader or faulting writer), so two live Threads peak at 14 data frames;
+the third assembly role remains present but is not installed.
+
+### Live contract and execution
+
+The object is RAM-backed and zeroed before execution. Node A maps both pages at
+`0x600000`, user RW/NX; Node B maps the same physical pages at `0x602000`, user
+R/NX. The distinct VAs are page-aligned inside the existing
+`[0x400000, 0x800000)` range, and neither root aliases the sibling VAs. The
+trusted controller attaches both mappings before the Thread execution pins and
+then uses the existing two-Node/three-Thread scheduler primitives. Real Ring 3
+stores place `0x4e45554d4f4c4956` and `0x5a5a0123456789ab` in the first shared
+page and a sentinel in the second; B1's ordinary loads record the same values in
+its private DATA block. QMP reads the physical backing and both private blocks.
+
+The four profiles are `memory-object-user-share`, `memory-object-user-readonly-fault`,
+`memory-object-user-a-exit` and `memory-object-user-xapic`. Share/fault/xAPIC
+destroy Node B first while Node A still maps the object; the A-exit profile
+destroys Node A first while B waits, then B reads the surviving bytes before its
+own teardown. Final collection returns the exact allocator bitmap and table/frame
+inventory. The xAPIC case is the same live contract on the legacy controller
+fallback. The live assembly roles are gated on `memory-object-live-test`, so the
+shared 4 KiB RX page used by the other multi-Thread features remains 3688 bytes.
+
+### Hardware fault containment
+
+The fault profile first proves B1's read succeeds, then executes a real store to
+its read-only alias. The actual `user_fault` path records vector 14, error `0x7`,
+`CR2 = 0x602000`, the store-site RIP, `CS = 0x3b`, `SS = 0x33`, CPL 3, Node B /
+Thread B / Space B identities, B's CR3 and a handler stack inside B's kernel
+stack in the production `NEU_LIVE_FAULT` static. B's Thread terminates, its
+mappings are detached exactly once, B is reclaimed, and Node A still exits
+normally.
+
+### Independent stopped-CPU evidence
+
+QMP stops the sole CPU at eight ordered checkpoints (stages 0–7). The descriptor
+publishes addresses, strides, field offsets, fixed payload constants and saved
+frame pointers only. The observer reads production object/frame/space/mapping
+arrays, table owners, allocator counters and bitmap, raw physical PTEs, the
+production saved Thread frames, the raw fault record, physical object bytes and
+both private DATA pages. It verifies effective U/S, R/W/NX leaves, distinct roots,
+exact gate/fault observations, Node/Thread/Space identities and the final bitmap.
+Serial-only success is explicitly insufficient for these cases. See
+[the protocol and commands](testing/memory-object-qmp.md).
+
+Validation passed: `make doctor`, `make check`, `make build`, and `make test`.
+The full suite passed **231 host tests and 142 unique QEMU scenarios** — the
+previous 228 host / 138 QEMU baseline plus three focused live host tests and the
+four live profiles. Focused share/fault repeats passed, and two independent clean
+source/target builds/boots passed. These are repeats, not additional unique
+scenarios. No hardware or hosted CI validation is claimed.
+
+Evidence: `build/k8a2-{doctor,check,build,test}.log` (the full `make test` log
+records the host-test run and all 142 cases), per-case JSON in
+`build/test-logs/`, and the independent clean-build logs
+`build/k8a2-clean-{a,b}.log` with their copied live-case JSONs
+(`build/k8a2-clean-{a,b}-memory-object-user-*.json`). The first QMP attempts
+rejected the live model for three observer defects, not guest success claims: the
+root-membership check ran before the walk populated its map, kernel-stack table
+aliases were not distinguished from user workspace aliases, and the a-exit wait
+gate's counter was treated as a payload write. Each was corrected to read the
+corresponding production distinction; all required stages and raw assertions
+remained mandatory.
+
+An initial full-suite attempt also failed an unrelated ELF fixture bound: the
+added live roles grew the shared multi-Thread RX page to 4326 bytes for the
+`capabilities` profile, whose limit is 4096. The live block is now assembled only
+for `memory-object-live-test`, restoring that payload to 3688 bytes. The full
+suite and both clean builds passed after that fix.
+
+This completes the trusted live-sharing proof. Public MemoryObject syscalls,
+capability transfer, mmap, revocation, SMP, TLB shootdown, COW and demand paging
+remain outside this scope; there is no ABI 0.6.
+
 ## K8 / Phase 8A-1 — complete for bounded trusted bootstrap (2026-10-28)
 
 Baseline was clean `7b3ecf5b8ed59f99c0a6a516321332adffc20afd`. The two remaining

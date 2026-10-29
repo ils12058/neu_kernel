@@ -5,6 +5,8 @@ use super::{
     paging::{self, Paging},
     serial, userspace,
 };
+#[cfg(feature = "memory-object-live-test")]
+use core::sync::atomic::AtomicU64;
 use core::{
     arch::{asm, global_asm, x86_64::__cpuid},
     cell::UnsafeCell,
@@ -111,6 +113,12 @@ static SESSION: Cell<Session> = Cell(UnsafeCell::new(Session {
     event: None,
 }));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Raw hardware fault evidence for the live MemoryObject negative profile.
+/// Written once by the Ring 0 fault handler before native termination; QMP
+/// reads this production record directly rather than a guest success scalar.
+#[cfg(feature = "memory-object-live-test")]
+#[unsafe(no_mangle)]
+pub(crate) static NEU_LIVE_FAULT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Record {
@@ -131,6 +139,35 @@ fn save(value: Session) {
     // SAFETY: No concurrent normal/user execution overlaps this write.
     unsafe {
         ptr::write(SESSION.0.get(), value);
+    }
+}
+#[cfg(feature = "memory-object-live-test")]
+fn record_live_fault(
+    binding: neu_kernel::node::ActiveContext,
+    frame: exceptions::ExceptionFrame,
+    cr2: u64,
+    handler_rsp: u64,
+) {
+    let values = [
+        binding.node.raw(),
+        binding.thread.raw(),
+        binding.context.space.raw(),
+        paging::current_root(),
+        frame.vector,
+        frame.error,
+        frame.rip,
+        frame.rsp,
+        cr2,
+        frame.cs,
+        frame.ss,
+        frame.flags,
+        handler_rsp,
+        1,
+        0,
+        0,
+    ];
+    for (cell, value) in NEU_LIVE_FAULT.iter().zip(values) {
+        cell.store(value, Ordering::Release);
     }
 }
 pub fn running() -> bool {
@@ -576,6 +613,8 @@ pub(super) fn user_fault(frame: exceptions::ExceptionFrame, cr2: u64, handler_rs
         let mut s = s;
         s.outcome = Some(ExitReason::UserFault(fault));
         save(s);
+        #[cfg(feature = "memory-object-live-test")]
+        record_live_fault(binding, frame, cr2, handler_rsp);
         serial::write(format_args!("[NEU] Node user fault: node={} thread={} space={} root={:#x} vector={} error={:#x} RIP={:#x} CR2={:#x} CS={:#x} SS={:#x} RSP={:#x} RFLAGS={:#x} handler_rsp={:#x}\n",binding.node.raw(),binding.thread.raw(),binding.context.space.raw(),s.root,frame.vector,frame.error,frame.rip,cr2,frame.cs,frame.ss,frame.rsp,frame.flags,handler_rsp)).unwrap_or_else(|_|super::halt());
         finish(8, 0);
     }

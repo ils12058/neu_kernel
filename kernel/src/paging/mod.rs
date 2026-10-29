@@ -608,7 +608,7 @@ impl Default for Registry {
 impl Registry {
     /// Test-only schema: bases, strides and offsets point to production fields.
     /// No data values are projected, and no address authorizes a kernel action.
-    #[cfg(feature = "memory-object-test")]
+    #[cfg(any(feature = "memory-object-test", feature = "memory-object-live-test"))]
     pub fn diagnostic_layout(&self) -> [u64; 38] {
         use core::mem::{offset_of as off, size_of as size};
         [

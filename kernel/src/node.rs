@@ -868,6 +868,21 @@ impl Nodes {
         self.nodes[id.slot] = Some(n);
         Ok(())
     }
+    /// Diagnostic address only. QMP reads the raw saved hardware frame while
+    /// the bounded live fixture is stopped; the address grants no authority.
+    #[cfg(feature = "memory-object-live-test")]
+    pub fn live_saved_frame(&self, id: ThreadId) -> Result<Option<u64>> {
+        let thread = self
+            .threads
+            .get(id.slot)
+            .and_then(Option::as_ref)
+            .filter(|thread| thread.id == id)
+            .ok_or(Error::Identity)?;
+        Ok(thread
+            .saved
+            .as_ref()
+            .map(|saved| core::ptr::from_ref(&saved.frame) as u64))
+    }
 }
 
 /// Non-copyable proof: the model cannot be scheduled or mutated while an

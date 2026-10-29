@@ -2440,3 +2440,6 @@ impl Paging<'_, '_> {
 #[cfg(feature = "memory-object-test")]
 #[path = "memory_object.rs"]
 mod memory_object;
+#[cfg(feature = "memory-object-live-test")]
+#[path = "memory_object_live.rs"]
+pub(crate) mod memory_object_live;

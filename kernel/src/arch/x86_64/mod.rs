@@ -14,13 +14,19 @@ pub mod multithread;
 pub mod native;
 #[cfg(all(feature = "node-test", not(feature = "switch-test")))]
 pub mod nodes;
-#[cfg_attr(feature = "memory-object-test", allow(dead_code))]
+#[cfg_attr(
+    any(feature = "memory-object-test", feature = "memory-object-live-test"),
+    allow(dead_code)
+)]
 pub mod paging;
 #[cfg(feature = "preempt-test")]
 pub mod preemptive;
 pub mod serial;
 #[cfg(feature = "user-test")]
-#[cfg_attr(feature = "memory-object-test", allow(dead_code))]
+#[cfg_attr(
+    any(feature = "memory-object-test", feature = "memory-object-live-test"),
+    allow(dead_code)
+)]
 pub mod userspace;
 
 global_asm!(include_str!("entry.S"));

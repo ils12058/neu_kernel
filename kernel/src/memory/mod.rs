@@ -175,7 +175,7 @@ pub struct FrameAllocator<'a> {
 }
 
 impl<'a> FrameAllocator<'a> {
-    #[cfg(feature = "memory-object-test")]
+    #[cfg(any(feature = "memory-object-test", feature = "memory-object-live-test"))]
     pub fn diagnostic_layout(&self) -> [u64; 8] {
         [
             core::ptr::addr_of!(self.total) as u64,

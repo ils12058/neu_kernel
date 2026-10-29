@@ -11,6 +11,10 @@ neu_multi_payload:
     mov [rsp + 32], rcx
     mov [rsp + 40], rdx
     mov [rsp + 48], rax
+    .if {live}
+    cmp rax, 8
+    jae neu_multi_live_entry
+    .endif
     movabs rbx, 0x1122334455667788
     xor rbx, rcx
     movabs rbp, 0x2233445566778899
@@ -186,6 +190,165 @@ neu_multi_ud_site:
     ud2
 neu_multi_failed:
     ud2
+
+.if {live}
+# Live Ring 3 MemoryObject roles. rbx addresses the caller's private 72-byte
+# observation block in its own DATA page; the shared object VAs are fixed by
+# the trusted mapping setup. The kernel never writes the tested payload.
+.global neu_multi_live_entry
+neu_multi_live_entry:
+    mov rbx, qword ptr [rsp + 24]
+    dec rbx
+    lea rbx, [rbx + rbx * 8]
+    shl rbx, 3
+    add rbx, 0x402140
+    mov rax, qword ptr [rsp + 48]
+    cmp rax, 8
+    je neu_multi_live_a
+    cmp rax, 9
+    je neu_multi_live_b
+    cmp rax, 10
+    je neu_multi_live_a2
+    cmp rax, 12
+    je neu_multi_live_b_wait
+    cmp rax, 13
+    je neu_multi_live_b
+    jmp neu_multi_failed
+
+neu_multi_live_a:
+    movabs rax, 0x4e45554d4f4c4956
+.global neu_multi_live_a_store_site
+neu_multi_live_a_store_site:
+    mov qword ptr [0x600000], rax
+    mov [rbx], rax
+    movabs rax, 0x5a5a0123456789ab
+    mov qword ptr [0x600008], rax
+    mov [rbx + 8], rax
+    mov qword ptr [0x601000], 1
+    mov qword ptr [rbx + 0x10], 1
+.global neu_multi_live_a_gate,neu_multi_live_a_gate_end
+neu_multi_live_a_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_live_a_gate
+neu_multi_live_a_gate_end:
+    mov rax, qword ptr [0x600000]
+    mov [rbx + 0x30], rax
+    movabs rcx, 0x4e45554d4f4c4956
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x600008]
+    movabs rcx, 0x5a5a0123456789ab
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c4956454f4b0001
+    mov [rbx + 0x18], rax
+.global neu_multi_live_a_post_gate,neu_multi_live_a_post_gate_end
+neu_multi_live_a_post_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x40], 1
+    jne neu_multi_live_a_post_gate
+neu_multi_live_a_post_gate_end:
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_live_a2:
+.global neu_multi_live_a2_loop,neu_multi_live_a2_loop_end
+neu_multi_live_a2_loop:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [0x601000], 1
+    jne neu_multi_live_a2_loop
+neu_multi_live_a2_loop_end:
+    mov rax, qword ptr [0x600000]
+    mov [rbx], rax
+    movabs rcx, 0x4e45554d4f4c4956
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x600008]
+    mov [rbx + 8], rax
+    movabs rcx, 0x5a5a0123456789ab
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c4956454f4b0001
+    mov [rbx + 0x18], rax
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_live_b:
+.global neu_multi_live_b_ready,neu_multi_live_b_ready_end
+neu_multi_live_b_ready:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [0x603000], 1
+    jne neu_multi_live_b_ready
+neu_multi_live_b_ready_end:
+.global neu_multi_live_b_load_site
+neu_multi_live_b_load_site:
+    mov rax, qword ptr [0x602000]
+    mov [rbx], rax
+    movabs rcx, 0x4e45554d4f4c4956
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x602008]
+    mov [rbx + 8], rax
+    movabs rcx, 0x5a5a0123456789ab
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c4956454f4b0001
+    mov [rbx + 0x18], rax
+    cmp qword ptr [rsp + 48], 13
+    je neu_multi_live_b_fault
+.global neu_multi_live_b_gate,neu_multi_live_b_gate_end
+neu_multi_live_b_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_live_b_gate
+neu_multi_live_b_gate_end:
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_live_b_wait:
+.global neu_multi_live_b_wait_gate,neu_multi_live_b_wait_gate_end
+neu_multi_live_b_wait_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_live_b_wait_gate
+neu_multi_live_b_wait_gate_end:
+.global neu_multi_live_b_after_exit_load_site
+neu_multi_live_b_after_exit_load_site:
+    mov rax, qword ptr [0x602000]
+    mov [rbx], rax
+    movabs rcx, 0x4e45554d4f4c4956
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x602008]
+    mov [rbx + 8], rax
+    movabs rcx, 0x5a5a0123456789ab
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c4956454f4b0001
+    mov [rbx + 0x18], rax
+.global neu_multi_live_b_post_gate,neu_multi_live_b_post_gate_end
+neu_multi_live_b_post_gate:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x40], 1
+    jne neu_multi_live_b_post_gate
+neu_multi_live_b_post_gate_end:
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_live_b_fault:
+    mov qword ptr [rbx + 0x38], 1
+.global neu_multi_live_b_store_site
+neu_multi_live_b_store_site:
+    mov qword ptr [0x602000], 0
+    ud2
+
+neu_multi_live_exit:
+    mov eax, 2
+    call neu_multi_invoke
+    ud2
+.endif
+
 .if {capabilities}
     neu_cap_user_body
 .endif

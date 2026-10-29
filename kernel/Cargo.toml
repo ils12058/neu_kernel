@@ -180,3 +180,10 @@ test-memory-object-new-tables = ["memory-object-test"]
 test-memory-object-map-rollback = ["memory-object-test"]
 test-memory-object-new-tables-reverse = ["memory-object-test"]
 test-memory-object-fail-stop = ["memory-object-test"]
+
+# Live Ring 3 sharing over one MemoryObject. Trusted bootstrap only; no ABI.
+memory-object-live-test = ["multi-test"]
+test-memory-object-user-share = ["memory-object-live-test"]
+test-memory-object-user-readonly-fault = ["memory-object-live-test"]
+test-memory-object-user-a-exit = ["memory-object-live-test"]
+test-memory-object-user-xapic = ["memory-object-live-test"]

@@ -239,3 +239,15 @@ for the exact evidence and the still-unverified Ready ordering.
 | ADR | Status | Related register entries |
 | --- | --- | --- |
 | [0022: MemoryObject backing and lifetime](0022-memoryobject-backing-and-lifetime.md) | Accepted for bounded Phase 8A-1; dynamic inventory and independent QMP verified | NEU-018; NEU-005; NEU-024 |
+
+## K8 / Phase 8A-2 record — live Ring 3 sharing
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0023: Live Ring 3 MemoryObject sharing and fault containment](0023-live-userspace-memoryobject-sharing.md) | Accepted for bounded Phase 8A-2; stopped-CPU live execution and hardware fault evidence verified | NEU-005; NEU-017; NEU-018; NEU-021; NEU-023; NEU-024 |
+
+ADR 0023 builds directly on 0022: trusted setup attaches the same two-page object
+to two roots, real Ring 3 writes/reads cross the shared backing, a read-only store
+produces a genuine `#PF`, and both Node teardown orders preserve correct lifetime.
+It does not accept a public MemoryObject ABI, transfer, mmap or SMP. Architecture
+v0.2 and ABI 0.5 remain unchanged.

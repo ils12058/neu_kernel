@@ -48,7 +48,9 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
             "switch-stack-guard": "test-switch-stack-guard", "switch-invalid-context": "test-switch-invalid-context",
             "switch-rollback": "test-switch-rollback", "switch-stale": "test-switch-stale"}
 MEMORY_OBJECT_CASES = memory_object_qmp.CASES
+LIVE_CASES = memory_object_qmp.LIVE_CASES
 FEATURES.update({name: "test-" + name for name in MEMORY_OBJECT_CASES})
+FEATURES.update({name: "test-" + name for name in LIVE_CASES})
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
@@ -188,7 +190,7 @@ def elf_info(path):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
             if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
-                    "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE",
+                    "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
                 symbols[label] = value
     if symbols.get("__stack_top", 0) - symbols.get("__stack_bottom", 0) != 65536:
@@ -384,6 +386,10 @@ EXPECT["paging-bootstrap-failure"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Paging
 for name in MEMORY_OBJECT_CASES:
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Memory checkpoint: stage=1 ",
         "[NEU] MemoryObject lifecycle complete:", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+for name in LIVE_CASES:
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Live baseline:",
+        "[NEU] Live checkpoint: stage=7 ", "[NEU] MemoryObject live test passed:",
+        "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
 EXPECT['memory-object-fail-stop'] = (COMMON + PROTOCOL + OWNED + PAGING +
     ['[NEU] Memory checkpoint: stage=8 ', '[NEU] PANIC:', 'memory-object mapping rollback failed'],
     ['MemoryObject lifecycle complete:', '[NEU] Kernel bootstrap successful', '[NEU] BOOT FAILURE:'])
@@ -2678,6 +2684,69 @@ def check_nodes(case, text, symbols, observations):
     return {"case":number,"order":expected_order,"nodes":outcomes,"accounting":[int(v) for v in restored.groups()]}
 
 
+def check_live(case, text, symbols, observation):
+    if case not in LIVE_CASES:
+        return None
+    mode = LIVE_CASES.index(case)
+    stages = [(int(m[1]), int(m[2])) for m in re.finditer(r"\[NEU\] Live checkpoint: stage=(\d+) mode=(\d+)\n", text)]
+    if [stage for stage, _ in stages] != list(range(8)) or any(value != mode for _, value in stages):
+        raise Failure("Live checkpoints differ from the bounded eight-stage model.")
+    baseline = re.search(r"\[NEU\] Live baseline: allocated=(\d+) free=(\d+) tables=(\d+) root=(0x[0-9a-f]+) mode=(\d+) threads=2\n", text)
+    if not baseline or int(baseline[5]) != mode:
+        raise Failure("Live baseline profile/accounting is missing.")
+    ready = list(re.finditer(r"Multi Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+)", text))
+    if len(ready) != 2 or {int(m[1]) for m in ready} != {1, 3}:
+        raise Failure("Live fixture did not install exactly the two expected Threads.")
+    records = {}
+    for match in ready:
+        label = int(match[1])
+        records[label] = {'label': label, 'node': int(match[2]), 'thread': int(match[3]),
+                          'space': int(match[4]), 'root': int(match[5], 16)}
+    selected = list(re.finditer(r"Live selected: sequence=(\d+) label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) fresh=(true|false)\n", text))
+    terminal = set()
+    for match in selected:
+        label = int(match[2])
+        if label in terminal:
+            raise Failure("A terminal live Thread was selected again.")
+        if tuple(int(match[i], 0) for i in (3, 4, 5, 6)) != (records[label]['node'], records[label]['thread'],
+                                                             records[label]['space'], records[label]['root']):
+            raise Failure("Live selection named a foreign Node/Thread/root.")
+    outcomes = [(int(m[1]), int(m[2]), m[3]) for m in re.finditer(r"Live outcome: label=(\d+) thread=(\d+) reason=(\w+)\n", text)]
+    wanted = {1: 'normal', 3: 'fault' if mode == 1 else 'normal'}
+    if {label: reason for label, _, reason in outcomes} != wanted or any(thread != records[label]['thread'] for label, thread, _ in outcomes):
+        raise Failure("Live Thread outcomes differ from the fault/teardown model.")
+    if len(outcomes) != 2:
+        raise Failure("Live Threads did not both terminate exactly once.")
+    reclaimed = [int(m[1]) for m in re.finditer(r"Live Node reclaimed: node=(\d+) root_retired=true pins=0\n", text)]
+    order = [records[1]['node'], records[3]['node']] if mode == 2 else [records[3]['node'], records[1]['node']]
+    if reclaimed != order:
+        raise Failure("Live Node reclamation order differs from the requested teardown order.")
+    if mode == 1:
+        fault = re.search(r"Node user fault: node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) vector=(\d+) error=(0x[0-9a-f]+) RIP=(0x[0-9a-f]+) CR2=(0x[0-9a-f]+) CS=(0x[0-9a-f]+) SS=(0x[0-9a-f]+) RSP=(0x[0-9a-f]+) RFLAGS=(0x[0-9a-f]+) handler_rsp=(0x[0-9a-f]+)", text)
+        store = 0x400000 + symbols['neu_multi_live_b_store_site'] - symbols['neu_multi_payload']
+        if (not fault or (int(fault[1]), int(fault[2]), int(fault[3]), int(fault[4], 16)) !=
+                (records[3]['node'], records[3]['thread'], records[3]['space'], records[3]['root'])
+                or int(fault[5]) != 14 or int(fault[6], 16) != 0x7 or int(fault[7], 16) != store
+                or int(fault[8], 16) != 0x602000 or int(fault[9], 16) != 0x3b or int(fault[10], 16) != 0x33
+                or int(fault[11], 16) != 0x408fb8 or int(fault[12], 16) & 0x202 != 0x202
+                or not 0xffffc00000005000 <= int(fault[13], 16) < 0xffffc00000007000):
+            raise Failure("Live Node B did not report the exact Ring 3 write-protection fault.")
+        fault_summary = {'vector': 14, 'error': 0x7, 'rip': store, 'cr2': 0x602000}
+    else:
+        if "Node user fault:" in text:
+            raise Failure("A non-faulting live profile reported a user fault.")
+        fault_summary = None
+    passed = re.search(r"MemoryObject live test passed: mode=(\d+) dispatches=(\d+) captures=(\d+) allocations=restored\n", text)
+    if not passed or int(passed[1]) != mode or int(passed[2]) != len(selected):
+        raise Failure("Live completion line differs from observed dispatches.")
+    if observation is None:
+        raise Failure("Missing independent stopped-CPU live evidence.")
+    return {'mode': mode, 'name': LIVE_CASES[mode], 'stages': [stage for stage, _ in stages],
+            'dispatches': len(selected), 'captures': int(passed[3]), 'outcomes': wanted,
+            'reclaim_order': reclaimed, 'fault': fault_summary,
+            'shared_backing': observation['backing']['physical']}
+
+
 def check_fault(case, text, symbols):
     if case not in FAULTS:
         return None
@@ -2741,7 +2810,7 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
-        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic"):
+        if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic","memory-object-user-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
         print("+ " + shlex.join(arguments), flush=True)
@@ -2755,6 +2824,10 @@ def run_case(case, esp, timeout):
                 memory_snapshots = []
                 if case in MEMORY_OBJECT_CASES:
                     result["memory_object_checkpoints"] = memory_snapshots
+                live_observation = None
+                live_snapshots = []
+                if case in LIVE_CASES:
+                    result["memory_object_live_checkpoints"] = live_snapshots
                 user_observation = None
                 native_observation = None
                 node_observations = {}
@@ -2776,6 +2849,11 @@ def run_case(case, esp, timeout):
                         memory_observation = memory_object_qmp.observe(qmp, serial, symbols, started + timeout,
                             debug_words, native_register, Failure, memory_snapshots, MEMORY_OBJECT_CASES.index(case))
                         result["memory_object"] = memory_observation
+                    if case in LIVE_CASES and live_observation is None and "[NEU] Live checkpoint:" in transcript(serial):
+                        if qmp is None: qmp = QMP(endpoint, started + timeout)
+                        live_observation = memory_object_qmp.observe_live(qmp, serial, symbols, started + timeout,
+                            debug_words, native_register, Failure, live_snapshots, LIVE_CASES.index(case), esp / "boot/neu-kernel")
+                        result["memory_object_live"] = live_observation
                     if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
@@ -2865,7 +2943,10 @@ def run_case(case, esp, timeout):
                     raise Failure(f"Unexpected panic/failure/success marker in {case} transcript.")
                 if case in MEMORY_OBJECT_CASES and memory_observation is None:
                     raise Failure("Missing independent MemoryObject checkpoints.")
+                if case in LIVE_CASES and live_observation is None:
+                    raise Failure("Missing independent stopped-CPU live checkpoints.")
                 fault = check_fault(case, text, symbols)
+                live_evidence = check_live(case, text, symbols, live_observation) if case in LIVE_CASES else None
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
                 nodes = check_nodes(case,text,symbols,node_observations) if case in NODE_CASES else None
@@ -2907,7 +2988,7 @@ def run_case(case, esp, timeout):
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
                 ipc=check_ipc(case,text,symbols,members,cap_state) if case in MOVE_CASES else check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
