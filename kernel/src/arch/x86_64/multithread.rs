@@ -20,7 +20,7 @@ use neu_kernel::{
     scheduler::Queue,
     syscall::{self as abi, Frame, ReturnContract},
 };
-global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("moves.S"),include_str!("multithread.S"),live=const cfg!(feature="memory-object-live-test") as u8,capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_move=const cfg!(feature="cap-move-test") as u8,move_discard=const cfg!(feature="test-cap-moves-discard") as u8,move_mode=const if cfg!(feature="test-cap-moves-sender-fault-before") {7u8} else if cfg!(feature="test-cap-moves-sender-fault") {2u8} else if cfg!(feature="test-cap-moves-receiver-fault-after") {3} else if cfg!(feature="test-cap-moves-double") {4} else if cfg!(feature="test-cap-moves-backpressure-wait") {5} else if cfg!(feature="test-cap-moves-terminal-order") {6} else {0},ipc_wait=const cfg!(feature="channel-wait-test") as u8,ipc_legacy=const cfg!(feature="test-channels-legacy") as u8,wait_mode=const if cfg!(feature="test-channels-wait-send") {1} else if cfg!(feature="test-channels-wait-fifo") {2} else if cfg!(feature="test-channels-wait-close-receive") {3} else if cfg!(feature="test-channels-wait-close-send") {4} else if cfg!(feature="test-channels-wait-fault") {5} else if cfg!(feature="test-channels-wait-deadlock") {6} else {0},ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,move_disabled=const (cfg!(feature="test-address-space-move-disabled") || cfg!(feature="test-channels-move-disabled") || cfg!(feature="test-channels-wait-move-disabled")) as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="cap-move-test") {abi::v05::INFO}else if cfg!(feature="channel-wait-test") {abi::v04::INFO}else if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8);
+global_asm!(include_str!("capabilities.S"),include_str!("address_space.S"),include_str!("ipc.S"),include_str!("moves.S"),include_str!("multithread.S"),live=const cfg!(feature="memory-object-live-test") as u8,capabilities=const cfg!(feature="cap-test") as u8,abi02=const (cfg!(feature="abi-02") && !cfg!(feature="channel-test")) as u8,channels=const cfg!(feature="channel-test") as u8,ipc_stress=const cfg!(feature="test-channels-stress") as u8,ipc_move=const cfg!(feature="cap-move-test") as u8,move_discard=const cfg!(feature="test-cap-moves-discard") as u8,move_mode=const if cfg!(feature="test-cap-moves-sender-fault-before") {7u8} else if cfg!(feature="test-cap-moves-sender-fault") {2u8} else if cfg!(feature="test-cap-moves-receiver-fault-after") {3} else if cfg!(feature="test-cap-moves-double") {4} else if cfg!(feature="test-cap-moves-backpressure-wait") {5} else if cfg!(feature="test-cap-moves-terminal-order") {6} else {0},ipc_wait=const cfg!(feature="channel-wait-test") as u8,ipc_legacy=const cfg!(feature="test-channels-legacy") as u8,wait_mode=const if cfg!(feature="test-channels-wait-send") {1} else if cfg!(feature="test-channels-wait-fifo") {2} else if cfg!(feature="test-channels-wait-close-receive") {3} else if cfg!(feature="test-channels-wait-close-send") {4} else if cfg!(feature="test-channels-wait-fault") {5} else if cfg!(feature="test-channels-wait-deadlock") {6} else {0},ipc_fault_a=const cfg!(feature="test-channels-a-fault") as u8,ipc_fault_b=const cfg!(feature="test-channels-b-fault") as u8,move_disabled=const (cfg!(feature="test-address-space-move-disabled") || cfg!(feature="test-channels-move-disabled") || cfg!(feature="test-channels-wait-move-disabled")) as u8,channel_disabled=const cfg!(feature="test-address-space-channel-disabled") as u8,abi_info=const if cfg!(feature="cap-move-test") {abi::v05::INFO}else if cfg!(feature="channel-wait-test") {abi::v04::INFO}else if cfg!(feature="channel-test") {abi::v03::INFO}else if cfg!(feature="abi-02") {abi::v02::INFO} else {abi::ABI_INFO},cap_rollback=const cfg!(feature="test-capabilities-rollback") as u8,runtime=const cfg!(feature="memory-object-runtime-test") as u8);
 unsafe extern "C" {
     static neu_multi_payload: u8;
     static neu_multi_payload_end: u8;
@@ -33,9 +33,26 @@ unsafe extern "C" {
     static neu_ipc_syscall_resume: u8;
     static neu_multi_after_atomic: u8;
     static neu_multi_after_inc: u8;
+    #[cfg(feature = "memory-object-runtime-test")]
+    static neu_multi_runtime_b_fault_site: u8;
+    #[cfg(feature = "memory-object-runtime-test")]
+    static neu_multi_runtime_b2_fault_site: u8;
 }
+#[cfg(feature = "memory-object-runtime-test")]
+#[path = "runtime_map.rs"]
+mod runtime_map;
+
 pub fn site(symbol: *const u8) -> u64 {
     userspace::CODE + symbol as u64 - ptr::addr_of!(neu_multi_payload) as u64
+}
+/// Raw user addresses of the two runtime store instruction labels. The QMP
+/// oracle compares them with the recorded fault RIP; they carry no authority.
+#[cfg(feature = "memory-object-runtime-test")]
+pub(crate) fn runtime_fault_sites() -> [u64; 2] {
+    [
+        site(ptr::addr_of!(neu_multi_runtime_b_fault_site)),
+        site(ptr::addr_of!(neu_multi_runtime_b2_fault_site)),
+    ]
 }
 pub fn payload() -> &'static [u8] {
     let length =
@@ -1188,7 +1205,7 @@ fn cap_progress(
     ids: &super::memory_object_cap::CapIds,
 ) -> Result<()> {
     use super::memory_object_cap::{
-        CAP_BLOCK_A, CAP_BLOCK_B, CAP_GATE_FAILED, CAP_GATE_SENT, CAP_READY,
+        CAP_BLOCK_A, CAP_BLOCK_B, CAP_GATE_FAILED, CAP_GATE_SENT, CAP_READY, CAP_SPIN,
     };
     if a.space.is_some() && members[0].stack.is_some() && members[0].outcome.is_some() {
         retire(paging, nodes, a, &mut members[0])?;
@@ -1200,7 +1217,9 @@ fn cap_progress(
         let stage = state.stage;
         match stage {
             2 => {
-                if cap_word(paging, space(a)?, CAP_BLOCK_A, CAP_READY)? != 1 {
+                if cap_word(paging, space(a)?, CAP_BLOCK_A, CAP_READY)? != 1
+                    || cap_word(paging, space(b)?, CAP_BLOCK_B, CAP_SPIN)? == 0
+                {
                     break;
                 }
                 cap_checkpoint(
@@ -1532,7 +1551,14 @@ fn run_cap_live(paging: &mut Paging<'_, '_>) -> Result<()> {
 }
 
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
-    #[cfg(feature = "memory-object-cap-test")]
+    #[cfg(feature = "memory-object-runtime-test")]
+    {
+        runtime_map::run(paging)
+    }
+    #[cfg(all(
+        feature = "memory-object-cap-test",
+        not(feature = "memory-object-runtime-test")
+    ))]
     {
         run_cap_live(paging)
     }

@@ -265,3 +265,19 @@ an ABI change, keeps the fixed pools, and derives mapping rights from the actual
 entry. It does not accept public MemoryObject syscalls, runtime mapping from a
 received capability, derivation, revocation or SMP. ADRs 0022 and 0023 remain
 accepted for their scopes.
+
+## K8 / Phase 8C record — runtime mapping from a received capability
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0025: Runtime MemoryObject mapping from a received capability](0025-runtime-memoryobject-mapping.md) | Accepted for bounded Phase 8C; scheduler safe point, suspended-boundary mapping, terminal cancellation and stopped-CPU evidence verified | NEU-005; NEU-017; NEU-018; NEU-021; NEU-023; NEU-024 |
+
+ADR 0025 closes the staged-mapping limitation recorded in 0024: a running Node
+receives a MemoryObject capability over the existing Channel operations and
+causes a new mapping through a bounded `TEST_MAP` request at a scheduler safe
+point. It adds an explicit suspended ownership boundary instead of weakening the
+ordinary mapping API, re-derives authority from the received handle with a pin
+spanning authorization and commit, makes cancellation terminal and replay-safe,
+and keeps every fixed pool and ABI 0.5. It does not accept a public mapping ABI,
+mmap, derivation, revocation, SMP or TLB shootdown. ADRs 0022–0024 remain
+accepted for their scopes and are not rewritten.

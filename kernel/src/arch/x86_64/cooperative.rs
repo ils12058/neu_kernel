@@ -523,6 +523,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
             _ => return Err(Error::Corrupt),
         };
         match event {
+            #[cfg(feature = "memory-object-runtime-test")]
+            SliceEvent::Requested(_) => return Err(Error::Corrupt),
             SliceEvent::Preempted(_) | SliceEvent::Blocked(_) => return Err(Error::Corrupt),
             SliceEvent::Yield(frame) => {
                 frame_log("saved", domain.thread, frame)?;

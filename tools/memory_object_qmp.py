@@ -1651,3 +1651,919 @@ def observe_cap(qmp, path, symbols, deadline, words, register, failure, output,
                     'baseline': {k: v for k, v in baseline.items() if k not in ('bitmap', 'live_tables', 'kernel_tables')},
                     'backing': original, 'checkpoints': output}
     raise failure('MemoryObject capability QMP: missing bounded checkpoint(s)')
+
+
+# K8C runtime mapping profiles. The tuple order is the kernel `mode()` value:
+# 0 golden, 1 writable, 2 fault, 3 rights, 4 peer-exit, 5 cancel, 6 read-denied.
+RUNTIME_CASES = ('memory-object-runtime', 'memory-object-runtime-writable',
+                 'memory-object-runtime-fault', 'memory-object-runtime-rights',
+                 'memory-object-runtime-peer-exit', 'memory-object-runtime-cancel',
+                 'memory-object-runtime-read-denied')
+RUNTIME_MAGIC = 0x4e45554d4f000004
+RUNTIME_WORDS = 256
+RUNTIME_VALUE = 0x4e45554d4f52554e
+RUNTIME_SECOND = 0x5a5a52554e54494d
+RUNTIME_WRITE = 0x4231575249544501
+RUNTIME_RESULT = 0x4c49564552454144
+RUNTIME_VA_A = 0x600000
+RUNTIME_VA_B = 0x700000
+RUNTIME_VA_B_WRITE = 0x701000
+RUNTIME_VA_B2_FAULT = 0x407000
+RUNTIME_DATA = 0x402000
+RUNTIME_CODE = 0x400000
+RUNTIME_RODATA = 0x401000
+RUNTIME_STACKS = (0x404000, 0x408000, 0x40c000)
+RUNTIME_OBJECT = 0x100000001
+RUNTIME_MAP_WITNESS_MAGIC = 0x4e45554d4f4d4150
+RUNTIME_MAP_STATES = {'pending': 0, 'committed': 1, 'rejected': 2, 'cancelled': 3}
+
+
+def observe_runtime(qmp, path, symbols, deadline, words, register, failure, output,
+                    expected_mode, image):
+    """Prove K8C runtime mapping from a received capability on a stopped CPU.
+
+    Every object, capability object, handle, queue token, mapping record, page
+    table leaf, payload byte, allocator bit and fault record below is read from
+    production storage through the addresses the guest descriptor publishes.
+    The serial success scalar is never consulted.
+    """
+    context = {'stage': None}
+
+    def require(condition, message):
+        if not condition:
+            raise failure(f'MemoryObject runtime QMP: stage={context["stage"]}: ' + message)
+
+    def read(address, length, physical=False):
+        data = bytearray()
+        for offset in range(0, (length + 7) // 8, 256):
+            count = min(256, (length + 7) // 8 - offset)
+            data.extend(struct.pack('<' + 'Q' * count, *words(qmp, address + offset * 8, count, physical)))
+        return bytes(data[:length])
+
+    def u64(data, offset=0):
+        return struct.unpack_from('<Q', data, offset)[0]
+
+    def u32(data, offset=0):
+        return struct.unpack_from('<I', data, offset)[0]
+
+    def identity(data, offset=0):
+        return [u64(data, offset), u64(data, offset + 8)]
+
+    def u64s(data, count, offset=0):
+        return list(struct.unpack_from('<' + 'Q' * count, data, offset))
+
+    raw = image.read_bytes()
+    header = struct.unpack_from('<16sHHIQQQIHHHHHH', raw)
+
+    def image_bytes(address, length):
+        for index in range(header[10]):
+            segment = struct.unpack_from('<IIQQQQQQ', raw, header[5] + index * header[9])
+            if segment[0] == 1 and segment[3] <= address and address + length <= segment[3] + segment[5]:
+                start = segment[2] + address - segment[3]
+                return raw[start:start + length]
+        raise failure('MemoryObject runtime QMP: image range is not file-backed')
+
+    payload = image_bytes(symbols['neu_multi_payload'],
+                          symbols['neu_multi_payload_end'] - symbols['neu_multi_payload'])
+    require(0 < len(payload) <= 4096, 'invalid embedded payload bounds')
+    code_page = payload + bytes(4096 - len(payload))
+
+    def user_va(name):
+        return 0x400000 + symbols[name] - symbols['neu_multi_payload']
+
+    golden, writable, faulting, rights, peer_exit, cancel, read_denied = range(7)
+    modes = (golden, writable, faulting, rights, peer_exit, cancel, read_denied)
+    require(modes[expected_mode] == expected_mode, 'runtime case order must match kernel modes')
+
+    # Per-mode policy table: rights held by the received handle, teardown order
+    # (1 = Node A first, 2 = Node B first), mapping presence after the safe-point
+    # commit, and the capability-release stage.
+    policy = {
+        golden:     {'rights': 13, 'order': 1, 'b': (6, 7), 'bw': (),     'refs_end': 6},
+        writable:   {'rights': 15, 'order': 2, 'b': (6,),   'bw': (6,),   'refs_end': 7},
+        faulting:   {'rights': 13, 'order': 1, 'b': (6, 7), 'bw': (),     'refs_end': 8},
+        rights:     {'rights': 11, 'order': 2, 'b': (),     'bw': (),     'refs_end': 7},
+        peer_exit:  {'rights': 13, 'order': 1, 'b': (),     'bw': (),     'refs_end': 8},
+        cancel:     {'rights': 13, 'order': 1, 'b': (),     'bw': (),     'refs_end': 8},
+        read_denied: {'rights': 14, 'order': 2, 'b': (),    'bw': (),     'refs_end': 7},
+    }[expected_mode]
+    policy = dict(policy)
+    # Node A is destroyed first in the A-first order; Node B otherwise.
+    policy['a_alive'] = 7 if policy['order'] == 1 else 8
+    policy['b_alive'] = 8 if policy['order'] == 1 else 7
+
+    expected_mappings = {
+        golden:      {2: 2, 3: 2, 4: 2, 5: 2, 6: 3, 7: 1, 8: 0, 9: 0, 10: 0},
+        writable:    {2: 2, 3: 2, 4: 2, 5: 2, 6: 4, 7: 2, 8: 0, 9: 0, 10: 0},
+        faulting:    {2: 2, 3: 2, 4: 2, 5: 2, 6: 3, 7: 1, 8: 0, 9: 0, 10: 0},
+        rights:      {2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 0, 9: 0, 10: 0},
+        peer_exit:   {2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 0, 8: 0, 9: 0, 10: 0},
+        cancel:      {2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 0, 8: 0, 9: 0, 10: 0},
+        read_denied: {2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2, 8: 0, 9: 0, 10: 0},
+    }[expected_mode]
+    expected_cap_refs = {stage: (1 if 2 <= stage < policy['refs_end'] else 0) for stage in range(11)}
+    expected_requests = {
+        golden: {6: (3, False, None, 3, RUNTIME_MAP_STATES['rejected'], (1 << 64) - 17)},
+        writable: {6: (2, False, None, 2, RUNTIME_MAP_STATES['committed'], 0)},
+        faulting: {6: (1, False, None, 1, RUNTIME_MAP_STATES['committed'], 0)},
+        rights: {6: (0, False, None, None, None, None)},
+        peer_exit: {6: (1, True, 1, None, None, None), 7: (1, True, 1, None, None, None),
+                    8: (1, False, None, 1, RUNTIME_MAP_STATES['committed'], 0)},
+        cancel: {6: (1, True, 1, None, None, None), 7: (1, True, 1, None, None, None),
+                 8: (1, False, None, 1, RUNTIME_MAP_STATES['cancelled'], 0)},
+        read_denied: {6: (0, False, None, None, None, None)},
+    }[expected_mode]
+
+    def request_model(table, stage):
+        if stage < 6:
+            return (0, False, None, None, None, None)
+        keys = [key for key in table if key <= stage]
+        return table[max(keys)] if keys else (0, False, None, None, None, None)
+
+    # Checkpoints 0..5 carry no resolved ledger entry; 6+ are mode-specific and
+    # unchanged through teardown except where the table above overrides.
+    previous = {}
+    expected_stages = list(range(11))
+    baseline = None
+    original = None
+    space_tables = {}
+    space_frames = {}
+    space_stacks = {}
+    last_b_root = None
+
+    while time.monotonic() < deadline:
+        cpu_hint = qmp.call('human-monitor-command', {'command-line': 'info registers'})
+        rip = register(cpu_hint, 'RIP')
+        if not symbols['neu_memory_object_runtime_wait'] <= rip < symbols['neu_memory_object_runtime_wait_end']:
+            if len(previous) == len(expected_stages) and 'MemoryObject runtime test passed' in path.read_text(errors='replace'):
+                break
+            time.sleep(0.001)
+            continue
+        hint = words(qmp, symbols['neu_memory_object_runtime_witness'], 2)
+        if hint[1] in previous:
+            time.sleep(0.001)
+            continue
+        qmp.call('stop')
+        try:
+            cpu = qmp.call('human-monitor-command', {'command-line': 'info registers'})
+            if not symbols['neu_memory_object_runtime_wait'] <= register(cpu, 'RIP') < symbols['neu_memory_object_runtime_wait_end']:
+                continue
+            d = words(qmp, symbols['neu_memory_object_runtime_witness'], RUNTIME_WORDS)
+            magic, stage, mode, kernel = d[:4]
+            context['stage'] = stage
+            if stage in previous:
+                continue
+            require(magic == RUNTIME_MAGIC and mode == expected_mode, 'invalid runtime descriptor schema/profile')
+            require(stage == len(previous) and stage in expected_stages, 'missing or reordered runtime checkpoint')
+            require('CPL=0' in cpu and register(cpu, 'CR3') == kernel, 'runtime checkpoint not at the kernel root')
+            require(register(cpu, 'RFL') & 0x600 == 0, 'runtime checkpoint with interrupts enabled')
+            require(d[3] == kernel, 'descriptor kernel root differs from CR3')
+            require(d[203] == 0, 'kernel reports enabled interrupts at the runtime safe point')
+            require(d[162] == 0x240 and d[163] == 0x2c0 and d[164] == 0x340, 'block layout changed')
+            require(d[165] == 0 and d[166] == 8 and d[167] == 0x10 and d[168] == 0x18
+                    and d[169] == 0x20 and d[170] == 0x28 and d[171] == 0x30 and d[172] == 0x38
+                    and d[173] == 0x40 and d[174] == 0x48 and d[175] == 0x50 and d[176] == 0x58
+                    and d[177] == 0x60 and d[178] == 0x68, 'block field layout changed')
+            require(d[181] == RUNTIME_VA_B_WRITE and d[182] == RUNTIME_RODATA
+                    and d[183] == RUNTIME_RESULT and d[224] == policy['order'], 'runtime contract constants changed')
+            require(d[233] == 0x40 and d[234] == 0x500 and d[235] == 0xc00 and d[236] == 0x30,
+                    'script layout changed')
+            require(d[237] == RUNTIME_VA_B2_FAULT and d[240] == 0x3c0, 'probe layout changed')
+            p_offsets = d[206:224]
+            require(p_offsets == [0x3c0, 0, 8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48,
+                                  0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80],
+                    'probe field layout changed')
+
+            layout = d[16:55]
+            require(layout[0] == 1 and layout[3] == 16 and layout[11] == 64 and layout[20] == 4
+                    and layout[28] == 2, 'unexpected bounded registry layout')
+            require(layout[34:38] == [16, 16, 24, 24], 'identity/provenance layout mismatch')
+            frames = []
+            for slot in range(16):
+                row = read(layout[1] + slot * layout[2], layout[2])
+                owner = layout[8]
+                frames.append({'slot': slot, 'physical': u64(row, layout[4]),
+                               'generation': u64(row, layout[5]), 'live': row[layout[6]],
+                               'initialized': row[layout[7]],
+                               'owner': [u64(row, owner), *identity(row, owner + 8)]})
+            mappings = []
+            for slot in range(64):
+                row = read(layout[9] + slot * layout[10], layout[10])
+                provenance = layout[16]
+                mappings.append({'slot': slot, 'space': identity(row, layout[12]),
+                                 'address': u64(row, layout[13]), 'frame': identity(row, layout[14]),
+                                 'write': row[layout[15]], 'execute': row[layout[15] + 1],
+                                 'object': [u64(row, provenance), *identity(row, provenance + 8)],
+                                 'live': row[layout[17]]})
+            objects = []
+            for slot in range(4):
+                row = read(layout[18] + slot * layout[19], layout[19])
+                objects.append({'slot': slot, 'generation': u64(row, layout[21]),
+                                'live': row[layout[22]], 'creator': row[layout[23]],
+                                'frames': [identity(row, layout[24] + i * 16) for i in range(2)],
+                                'pages': u64(row, layout[25]), 'cap_refs': row[layout[38]]})
+            spaces = []
+            for slot in range(2):
+                row = read(layout[26] + slot * layout[27], layout[27])
+                spaces.append({'slot': slot, 'generation': u64(row, layout[29]),
+                               'live': row[layout[30]], 'root': u64(row, layout[31]),
+                               'pins': row[layout[32]], 'refs': row[layout[33]]})
+
+            cap_layout = d[95:113]
+            require(cap_layout[0] == 1 and cap_layout[3] == 6 and cap_layout[13] == 8
+                    and cap_layout[14] == 8 and cap_layout[15] == 1 and cap_layout[16] == 1,
+                    'invalid capability registry layout')
+            cap_objects = []
+            for slot in range(cap_layout[3]):
+                row = read(cap_layout[4] + slot * cap_layout[5], cap_layout[5])
+                cap_objects.append({'slot': slot, 'generation': u32(row, cap_layout[6]),
+                                    'references': u32(row, cap_layout[7]),
+                                    'pins': u32(row, cap_layout[8]),
+                                    'live': row[cap_layout[9]] != 0, 'kind': row[cap_layout[10]],
+                                    'target': u64(row, cap_layout[11])})
+
+            allocator = d[145:153]
+            total = u64(read(allocator[0], 8))
+            free = u64(read(allocator[1], 8))
+            bitmap = read(allocator[2], ((total + 63) // 64) * 8)
+            require(allocator[3] * 8 >= len(bitmap), 'allocator bitmap capacity is too small')
+            require(free <= total and sum(byte.bit_count() for byte in bitmap) == total - free,
+                    'allocator bitmap/counters disagree')
+            regions = read(allocator[4], allocator[5] * 24)
+            kernel_start, kernel_end = u64(read(allocator[6], 8)), u64(read(allocator[7], 8))
+            spans = []
+            for offset in range(0, len(regions), 24):
+                start, length, kind = struct.unpack_from('<QQQ', regions, offset)
+                if kind != 0:
+                    continue
+                end = start + length
+                start = max(start, 4096)
+                spans += [(a, b) for a, b in ((start, min(end, kernel_start)),
+                                               (max(start, kernel_end), end)) if a < b]
+            require(sum((end - start) // 4096 for start, end in spans) == total,
+                    'allocator total differs from raw memory-map spans')
+
+            def allocated(physical):
+                ordinal = 0
+                for start, end in spans:
+                    if start <= physical < end:
+                        ordinal += (physical - start) // 4096
+                        return bool(bitmap[ordinal // 8] & (1 << (ordinal % 8)))
+                    ordinal += (end - start) // 4096
+                raise failure('MemoryObject runtime QMP: physical owner outside allocatable spans')
+
+            tables_layout = d[153:159]
+            tables = []
+            for slot in range(tables_layout[2]):
+                row = read(tables_layout[0] + slot * tables_layout[1], tables_layout[1])
+                tables.append({'slot': slot, 'physical': u64(row, tables_layout[3]),
+                               'level': row[tables_layout[4]], 'pinned': row[tables_layout[5]]})
+            live_tables = {t['physical']: t for t in tables if t['physical']}
+            require(len(live_tables) == sum(bool(t['physical']) for t in tables), 'duplicate table ownership')
+            require(all(1 <= t['level'] <= 4 for t in live_tables.values()), 'invalid table level')
+
+            def parse_table(layout_words, label, node_raw):
+                if not any(layout_words):
+                    return None
+                require(layout_words[0] == 1 and layout_words[5] == 8 and layout_words[16] == 8
+                        and layout_words[19] == 1 and layout_words[17] == 8, 'invalid table layout')
+                require(layout_words[18] == node_raw, 'table identity mismatch')
+                slots = []
+                for index in range(8):
+                    row = read(layout_words[3] + index * layout_words[4], layout_words[4])
+                    slots.append({'slot': index, 'generation': u32(row, layout_words[6]),
+                                  'live': row[layout_words[7]] != 0, 'kind': row[layout_words[8]],
+                                  'target': u64(row, layout_words[9]), 'rights': row[layout_words[10]],
+                                  'transferable': row[layout_words[11]] != 0})
+                bootstrap = []
+                for index in range(8):
+                    row = read(layout_words[14] + index * 16, 16)
+                    tag = u64(row, 0)
+                    require(tag in (0, 1), 'invalid bootstrap Option tag')
+                    bootstrap.append(u64(row, 8) if tag else None)
+                require(all((handle is not None) == (index < layout_words[17])
+                            for index, handle in enumerate(bootstrap)), 'bootstrap limit/handle mismatch')
+                return {'label': label, 'base': layout_words[1], 'slots': slots,
+                        'bootstrap': bootstrap, 'sealed': layout_words[13] != 0,
+                        'live': layout_words[12] != 0, 'id': layout_words[18]}
+
+            table_a = parse_table(d[55:75], 0, d[9]) if any(d[55:75]) else None
+            table_b = parse_table(d[75:95], 1, d[10]) if any(d[75:95]) else None
+            require((table_a is not None) == (2 <= stage < policy['a_alive']),
+                    'Node A capability table presence mismatch')
+            require((table_b is not None) == (2 <= stage < policy['b_alive']),
+                    'Node B capability table presence mismatch')
+
+            channel = d[113:145]
+            require(channel[0] == 1 and channel[28] == 2 and channel[29] == 2, 'invalid channel layout')
+            channel_base = channel[1]
+            channel_live = read(channel_base + channel[4], 1)[0] != 0
+            counters = {name: u64s(read(channel_base + offset, 16), 2)
+                        for name, offset in (('sent', channel[9]), ('received', channel[10]),
+                                             ('discarded', channel[11]))}
+            queues = []
+            for side in range(2):
+                fifo = channel_base + channel[8] + side * channel[12]
+                head = u64(read(fifo + channel[13], 8))
+                tail = u64(read(fifo + channel[14], 8))
+                length = u64(read(fifo + channel[15], 8))
+                values = u64s(read(fifo + channel[16], 16), 2)
+                transfers = []
+                for slot in range(2):
+                    transfer = fifo + channel[17] + slot * channel[18]
+                    transfers.append({'live': read(transfer + channel[19], 1)[0] != 0,
+                                      'object': u64(read(transfer + channel[20], 8)),
+                                      'rights': read(transfer + channel[21], 1)[0]})
+                require(head < 2 and tail < 2 and length <= 2 and (head + length) % 2 == tail,
+                        'invalid FIFO indices')
+                require(all(value == 0 for value in values), 'unexpected scalar message in capability queue')
+                for slot, transfer in enumerate(transfers):
+                    occupied = (slot + 2 - head) % 2 < length
+                    if transfer['live']:
+                        require(occupied and transfer['object'] != 0,
+                                'live transfer outside FIFO occupancy')
+                    else:
+                        require(transfer['object'] == 0 and transfer['rights'] == 0,
+                                'stale transfer identity')
+                queues.append({'head': head, 'tail': tail, 'len': length, 'transfers': transfers})
+
+            live_caps = [o for o in cap_objects if o['live']]
+            handle_counts = {}
+            for table in (table_a, table_b):
+                if table is None:
+                    continue
+                for slot in table['slots']:
+                    if slot['live']:
+                        handle_counts[slot['target']] = handle_counts.get(slot['target'], 0) + 1
+            queue_counts = {}
+            for queue in queues:
+                for transfer in queue['transfers']:
+                    if transfer['live']:
+                        queue_counts[transfer['object']] = queue_counts.get(transfer['object'], 0) + 1
+            raw_caps = {(o['kind'] << 40) | (o['generation'] << 8) | (o['slot'] + 1): o for o in live_caps}
+            require(set(handle_counts) <= set(raw_caps) and set(queue_counts) <= set(raw_caps),
+                    'handle/queue names a dead capability object')
+            for o in live_caps:
+                expected = handle_counts.get((o['kind'] << 40) | (o['generation'] << 8) | (o['slot'] + 1), 0) \
+                    + queue_counts.get((o['kind'] << 40) | (o['generation'] << 8) | (o['slot'] + 1), 0)
+                require(o['references'] == expected, 'capability reference count differs from handles plus queue')
+            require(sum(o['pins'] for o in live_caps) == 0, 'unexpected capability pin at checkpoint')
+            require(d[184] == len(live_caps) and d[185] == sum(o['references'] for o in live_caps)
+                    and d[186] == 0 and d[187] == sum(queue_counts.values()) and d[188] == 0,
+                    'published capability accounting differs from raw registry')
+            mem_caps = [o for o in live_caps if o['kind'] == 5]
+            require(all(o['target'] == d[244] for o in mem_caps),
+                    'MemoryObject capability names a foreign generation')
+
+            object_live = [o for o in objects if o['live']]
+            object_mappings = [m for m in mappings if m['live'] and m['object'][0] == 1]
+            live_mappings = [m for m in mappings if m['live']]
+            live_frames = [f for f in frames if f['live']]
+            if stage == 0:
+                require(not object_live and not live_mappings and not live_frames, 'baseline already owns test resources')
+                require(d[189] == 0 and d[190] == 0 and d[191] == 0 and d[192] == 0,
+                        'baseline published ownership')
+            elif stage == 1:
+                require(len(object_live) == 1 and not live_mappings, 'object creation model mismatch')
+                obj = object_live[0]
+                require(obj['creator'] == 1 and obj['cap_refs'] == 0 and obj['pages'] == 2,
+                        'new object ownership/size mismatch')
+                require(len(live_frames) == 2, 'object creation did not allocate exactly two frames')
+                original = {'slot': obj['slot'], 'generation': obj['generation'],
+                            'id': [obj['slot'], obj['generation']], 'frames': obj['frames'],
+                            'physical': [frames[fid[0]]['physical'] for fid in obj['frames']]}
+                require(d[189] == 1 and d[190] == 0 and d[191] == 0 and d[192] == 2,
+                        'object creation projection mismatch')
+                require(d[242] == original['physical'][0] and d[243] == original['physical'][1],
+                        'published object physicals differ from frames')
+            else:
+                require(original is not None, 'missing object creation baseline')
+                obj = object_live[0] if object_live else None
+                if stage <= 8:
+                    require(obj is not None, 'object disappeared before collection')
+                    require([obj['slot'], obj['generation']] == original['id']
+                            and obj['frames'] == original['frames'], 'object identity/backing changed')
+                    require(obj['creator'] == 0 and obj['pages'] == 2, 'object ownership/size changed')
+                    require(obj['cap_refs'] == expected_cap_refs[stage],
+                            f'capability reference differs from the model: {obj["cap_refs"]} != {expected_cap_refs[stage]}')
+                    require(len(object_mappings) == expected_mappings[stage],
+                            f'object mapping count differs from the model at stage {stage}: '
+                            f'{len(object_mappings)} != {expected_mappings[stage]}')
+                    require(d[244] == (obj['generation'] << 8 | (obj['slot'] + 1)),
+                            'witness object id is not the production object')
+                    require(d[242] == original['physical'][0] and d[243] == original['physical'][1],
+                            'object physical pages changed')
+                else:
+                    require(obj is None and not object_mappings, 'collected object still live or mapped')
+                    require(d[189] == 0 and d[190] == 0 and d[191] == 0 and d[192] == 0,
+                            'collected object projection survived')
+                    slot = original['slot']
+                    require(not objects[slot]['live'] and objects[slot]['cap_refs'] == 0,
+                            'collected object slot/capability reference survived')
+                require(d[189] == 0 and d[190] == len(object_mappings) and
+                        d[191] == (objects[original['slot']]['cap_refs'] if stage <= 8 else 0) and
+                        d[192] == (2 if stage <= 8 else 0),
+                        'object counts projection differs from raw registry')
+
+            # Backing bytes are observed through the production data frames.
+            if 1 <= stage <= 8:
+                physical = original['physical']
+                page0 = read(physical[0], 4096, True)
+                page1 = read(physical[1], 4096, True)
+                if stage <= 2:
+                    require(page0 == bytes(4096) and page1 == bytes(4096),
+                            'object backing not zeroed before Ring 3 execution')
+                else:
+                    require(u64(page0, 0) == RUNTIME_VALUE and u64(page0, 8) == RUNTIME_SECOND,
+                            'Ring 3 payload absent from object backing')
+                    require(u64(page1, 0) == (RUNTIME_WRITE if (expected_mode == writable and stage >= 6)
+                                              else 1), 'object page 1 value differs from the model')
+                    require(page0[16:] == bytes(4096 - 16), 'unexpected object page 0 mutation')
+                    require(page1[8:] == bytes(4096 - 8), 'unexpected object page 1 mutation')
+
+            # Saved scheduler contexts are Ring 3 frames or absent.
+            def saved_frame(address):
+                row = read(address, 160)
+                registers = list(struct.unpack_from('<15Q', row, 0))
+                rip, cs, flags, rsp, ss = struct.unpack_from('<5Q', row, 120)
+                require(cs == 0x3b and ss == 0x33 and flags & 0x202 == 0x202,
+                        'saved frame is not a Ring 3 frame')
+                require(RUNTIME_CODE <= rip < RUNTIME_DATA, 'saved RIP outside the user image')
+                require(any(base <= rsp < base + 4096 for base in RUNTIME_STACKS),
+                        'saved RSP outside a private stack page')
+                return {'rip': rip, 'rsp': rsp, 'flags': flags, 'rbx': registers[13]}
+
+            saved = [saved_frame(d[159 + index]) if d[159 + index] else None for index in range(3)]
+            if stage == 2:
+                require(saved[0] and saved[1], 'missing installed Thread contexts')
+                require(saved[2] is None,
+                        'second Node B thread was installed before its deferred start')
+            if stage == 7:
+                require(bool(saved[2]) == (expected_mode == cancel),
+                        'second Node B thread presence differs from the cancellation model')
+            if stage >= 8:
+                require(saved == [None, None, None], 'terminal stage retained a saved context')
+
+            cache = {}
+
+            def page(physical):
+                if physical not in cache:
+                    cache[physical] = words(qmp, physical, 512, True)
+                return cache[physical]
+
+            def walk(root, address):
+                table, entries = root, []
+                for depth, shift in enumerate((39, 30, 21, 12)):
+                    require(table in live_tables and live_tables[table]['level'] == 4 - depth,
+                            'walk entered a foreign/unowned table')
+                    entry = page(table)[(address >> shift) & 511]
+                    entries.append(entry)
+                    if not entry & 1:
+                        return {'present': False, 'entries': entries}
+                    require(not depth < 3 or not entry & 128, 'unexpected large page')
+                    table = entry & 0x000ffffffffff000
+                return {'present': True, 'entries': entries, 'physical': table,
+                        'write': all(e & 2 for e in entries), 'user': all(e & 4 for e in entries),
+                        'execute': not any(e & (1 << 63) for e in entries)}
+
+            def reachable(root):
+                found = set()
+                users = {}
+
+                def visit(table, level, prefix=0, writable=True, user=True, executable=True):
+                    require(table in live_tables and live_tables[table]['level'] == level,
+                            f'tree has stale table reference: table={table:#x} level={level}')
+                    require(table not in found, 'duplicate or cyclic table parent')
+                    found.add(table)
+                    for index, entry in enumerate(page(table)):
+                        if not entry & 1:
+                            continue
+                        address = prefix | (index << (12 + (level - 1) * 9))
+                        w, u, x = writable and bool(entry & 2), user and bool(entry & 4), \
+                            executable and not bool(entry & (1 << 63))
+                        if level > 1:
+                            require(not entry & 128, 'unexpected large table leaf')
+                            visit(entry & 0x000ffffffffff000, level - 1, address, w, u, x)
+                        elif u:
+                            require(0x400000 <= address < 0x800000,
+                                    'user mapping outside the bounded user range')
+                            users[address] = {'physical': entry & 0x000ffffffffff000,
+                                              'write': w, 'execute': x}
+
+                visit(root, 4)
+                return found, users
+
+            context['tree'] = 'kernel'
+            common_tables, kernel_users = reachable(kernel)
+            if stage == 0:
+                baseline = {'total': total, 'free': free, 'bitmap': bitmap,
+                            'live_tables': set(live_tables), 'kernel_tables': set(common_tables)}
+            require(set(common_tables) == baseline['kernel_tables'], 'kernel root tables changed')
+            for slot in range(64):
+                alias = walk(kernel, (0xffff900000000000 + slot * 4096))
+                require(alias['present'] == bool(tables[slot]['physical']), 'stale common workspace alias')
+                if alias['present']:
+                    require(alias['physical'] == tables[slot]['physical'] and alias['write']
+                            and not alias['execute'] and not alias['user'],
+                            'common workspace alias ownership/permissions')
+            require(not kernel_users, 'kernel root exposes a user leaf')
+
+            spaces_alive = {0: 2 <= stage < policy['a_alive'], 1: 2 <= stage < policy['b_alive']}
+            if stage <= 1:
+                require(not spaces_alive[0] and not spaces_alive[1], 'space appeared before construction')
+            elif stage <= 6:
+                require(spaces_alive[0] and spaces_alive[1], 'space lifetime differs from the model')
+            elif stage == 7:
+                require(spaces_alive == ({0: False, 1: True} if policy['order'] == 1 else
+                                         {0: True, 1: False}), 'first teardown order differs from the model')
+            else:
+                require(not spaces_alive[0] and not spaces_alive[1],
+                        'space survived the second teardown')
+            if stage >= 2:
+                require(d[9] == 0x1_00000001 and d[10] == 0x1_00000002,
+                        'wrong Node identity')
+                require(d[11] == 0x101 and d[12] == 0x102, 'wrong Space identity')
+                require(d[13] == 0x1_00000001 and d[14] == 0x1_00000002 and d[15] == 0x1_00000003,
+                        'wrong Thread identity')
+
+            descriptors = []
+            for index in range(2):
+                fields = d[193 + index * 5:198 + index * 5]
+                if not any(fields):
+                    require(not spaces_alive[index], 'live space token missing')
+                    descriptors.append(None)
+                    continue
+                require(spaces_alive[index], 'token for a retired space')
+                fields = d[193 + index * 5:198 + index * 5]
+                root = u64(read(fields[0], 8))
+                sid = identity(read(fields[1], 16))
+                state = read(fields[3], 1)[0]
+                inventory = list(read(fields[2], 64))
+                stacks = list(read(fields[4], 64))
+                require(sid == [index, 1] and state == 0 and spaces[index]['generation'] == 1,
+                        'wrong Node-local SpaceId generation')
+                require(spaces[index]['root'] == root, 'descriptor root differs from production root')
+                descriptors.append({'root': root, 'id': sid, 'tables': inventory,
+                                    'stack_tables': stacks})
+            if descriptors[1] is not None:
+                last_b_root = descriptors[1]['root']
+
+            for index in range(2):
+                if not spaces_alive[index]:
+                    continue
+                record = descriptors[index]
+                owned = {tables[i]['physical'] for i, value in enumerate(record['tables']) if value}
+                require(0 not in owned and len(owned) == sum(record['tables']),
+                        'inventory contains retired tables')
+                require(not owned & set(baseline['kernel_tables']), 'foreign root table ownership')
+                context['tree'] = f'space{index}'
+                found, users = reachable(record['root'])
+                require(found == owned, 'reachable tables differ from token inventory')
+                ledger = [m for m in live_mappings
+                          if m['space'] == [index, 1] and 0x400000 <= m['address'] < 0x800000]
+                require({m['address'] for m in ledger} == set(users),
+                        'mapping ledger addresses differ from raw user leaves: '
+                        f'ledger-only={sorted({m["address"] for m in ledger} - set(users))} '
+                        f'leaf-only={sorted(set(users) - {m["address"] for m in ledger})}')
+                for m in ledger:
+                    f = frames[m['frame'][0]]
+                    require(f['live'] and f['generation'] == m['frame'][1], 'mapping names a stale frame')
+                    require(users[m['address']] == {'physical': f['physical'], 'write': bool(m['write']),
+                                                    'execute': bool(m['execute'])},
+                            'raw user leaf differs from mapping/frame record')
+                    if m['object'][0] == 1:
+                        require(obj is not None and m['object'] == [1, *original['id']],
+                                'wrong shared mapping provenance')
+                        page_index = (m['address'] - RUNTIME_VA_A) // 4096 if index == 0 else \
+                            (m['address'] - RUNTIME_VA_B) // 4096
+                        require(0 <= page_index < 2 and
+                                m['frame'] == obj['frames'][page_index],
+                                'shared leaf maps the wrong object page')
+                        require(f['physical'] == original['physical'][page_index],
+                                'shared leaf physical differs from object backing')
+                    else:
+                        require(f['owner'] == [0, index, 1], 'private frame ownership changed')
+                stacks_present = {address for address in users if address in RUNTIME_STACKS}
+                require(len(stacks_present) == spaces[index]['pins'],
+                        'space pins differ from the number of live stack leaves')
+                require(spaces[index]['refs'] == 1, 'AddressSpace paging reference differs from the model')
+                require(walk(record['root'], RUNTIME_CODE)['present'] and
+                        walk(record['root'], RUNTIME_CODE)['execute'] and
+                        not walk(record['root'], RUNTIME_CODE)['write'],
+                        'user code leaf permissions changed')
+                code = walk(record['root'], RUNTIME_CODE)
+                require(read(code['physical'], 4096, True) == code_page,
+                        'user code page differs from the ELF payload')
+                require(walk(record['root'], RUNTIME_RODATA)['present'],
+                        'private rodata leaf disappeared')
+                data = walk(record['root'], RUNTIME_DATA)
+                require(data['present'] and data['write'] and not data['execute'] and data['user'],
+                        'private data leaf permissions changed')
+
+            # Explicit shared-mapping expectations for the post-commit stages.
+            def shared(index, address, write, page_index):
+                record = descriptors[index]
+                require(record is not None, 'shared mapping expected in a retired space')
+                translation = walk(record['root'], address)
+                require(translation['present'], f'expected shared leaf {address:#x} is absent')
+                require(translation['physical'] == original['physical'][page_index]
+                        and translation['user'] and not translation['execute']
+                        and translation['write'] == write,
+                        f'shared leaf {address:#x} has wrong target/permissions')
+
+            if spaces_alive[0]:
+                shared(0, RUNTIME_VA_A, True, 0)
+                shared(0, RUNTIME_VA_A + 4096, True, 1)
+
+            def shared_map(index, address):
+                record = descriptors[index]
+                return record is not None and walk(record['root'], address)['present']
+
+            if stage >= 2:
+                for index in (0, 1):
+                    if not spaces_alive[index]:
+                        continue
+                    present_b = stage in policy['b'] and index == 1
+                    present_bw = stage in policy['bw'] and index == 1
+                    require(shared_map(index, RUNTIME_VA_B) == present_b,
+                            f'VA_B presence differs from the commit model at stage {stage}')
+                    require(shared_map(index, RUNTIME_VA_B_WRITE) == present_bw,
+                            f'VA_B_WRITE presence differs from the commit model at stage {stage}')
+                    if present_b:
+                        shared(index, RUNTIME_VA_B, False, 0)
+                    if present_bw:
+                        shared(index, RUNTIME_VA_B_WRITE, True, 1)
+
+            # Ledger and map-witness projections.
+            diagnostics = d[245:254]
+            requests, cancelled, pending_present, pending_seq, pending_state = diagnostics[:5]
+            last_present, last_seq, last_state, last_status = diagnostics[5:]
+            request_count, want_pending, want_pending_seq, want_last_seq, want_last_state, want_last_status = \
+                request_model(expected_requests, stage)
+            if stage < 6:
+                require(requests == 0 and not pending_present and not last_present,
+                        'ledger entry before the mapping request')
+            else:
+                require(requests == request_count, f'request counter differs from the model: {requests} != {request_count}')
+                require(bool(pending_present) == bool(want_pending), 'pending request presence mismatch')
+                if want_pending:
+                    require(pending_seq == want_pending_seq and pending_state == 0, 'pending request identity mismatch')
+                if want_last_seq is not None:
+                    require(last_present and last_seq == want_last_seq and last_state == want_last_state
+                            and last_status == want_last_status, 'resolved request verdict mismatch')
+                else:
+                    require(not last_present or stage >= 8, 'unexpected resolved request')
+            cancelled_from = 8 if expected_mode == cancel else 7
+            if stage >= cancelled_from:
+                require(cancelled == (1 if expected_mode == cancel else 0),
+                        'cancellation counter differs from the model')
+
+            witness = words(qmp, d[179], 24)
+            if stage >= 6 and request_count:
+                require(witness[0] == RUNTIME_MAP_WITNESS_MAGIC, 'map witness magic missing')
+                require(witness[21] == requests, 'map witness request counter mismatch')
+                require(witness[22] == cancelled, 'map witness cancellation counter mismatch')
+                entry = witness[1:21]
+                if want_pending:
+                    require(entry[0] == pending_seq and entry[15] == 0, 'witness does not name the pending request')
+                elif want_last_seq is not None:
+                    require(entry[0] == last_seq and entry[15] == want_last_state
+                            and entry[16] == (want_last_status if want_last_status is not None else 0),
+                            'witness does not name the resolved request')
+            elif stage < 6:
+                require(witness[0] in (0, RUNTIME_MAP_WITNESS_MAGIC), 'map witness written before any request')
+
+            # Ring 3 probe/verdict block, read through Node B's own root.
+            p_base = d[240]
+            sentinel = d[241]
+            p_values = None
+            if spaces_alive[1]:
+                data_leaf = walk(descriptors[1]['root'], RUNTIME_DATA)
+                b_data = read(data_leaf['physical'], 4096, True)
+                p_values = [u64(b_data, p_base + offset) for offset in range(0, 0x88, 8)]
+                if stage == 4:
+                    require(all(value == sentinel for value in p_values[:17]),
+                            'probe block changed before the receive stage')
+                if stage == 5:
+                    require(p_values[0] == (1 << 64) - 17 and p_values[1] == (1 << 64) - 16
+                            and p_values[2] == (1 << 64) - 19 and p_values[3] == (1 << 64) - 2
+                            and p_values[4] == (1 << 64) - 2 and p_values[5] == (1 << 64) - 2
+                            and p_values[6] == (1 << 64) - 17 and p_values[7] == (1 << 64) - 2,
+                            'negative probe verdicts differ from the fixed rejection model')
+                    require(all(value == sentinel for value in p_values[8:17]),
+                            'commit verdicts appeared before the safe point')
+                if stage == 6:
+                    denied = (1 << 64) - 18
+                    expected = {
+                        golden: [-(1 << 64) + 0, 0, 0, 0, 0, 0],
+                        writable: [0, 0, 0, 0, 0, 0],
+                        faulting: [0, 0, 0, 0, 0, 0],
+                        rights: [0, denied, 0, 0, 0, denied],
+                        peer_exit: [0, 0, 0, 0, 0, 0],
+                        cancel: [0, 0, 0, 0, 0, 0],
+                        read_denied: [0, denied, 0, 0, 0, denied],
+                    }[expected_mode]
+                    if expected_mode == golden:
+                        expected[0] = (1 << 64) - 24
+                        expected[1] = denied
+                        expected[2] = expected[3] = expected[4] = (1 << 64) - 17
+                    if expected_mode in (writable, faulting):
+                        expected[4] = (1 << 64) - 21
+                    require(p_values[8:14] == expected, 'commit verdict words differ from the model')
+                    if expected_mode == rights or expected_mode == read_denied:
+                        require(p_values[14] == denied and p_values[15] == denied,
+                                'denied read/write verdicts differ from the model')
+                    else:
+                        require(p_values[14] == sentinel and p_values[15] == sentinel,
+                                'unexpected denied read/write verdicts')
+                    if expected_mode in (peer_exit, cancel):
+                        require(p_values[16] == sentinel,
+                                'unexpected completion mark before the deferred wake')
+                    else:
+                        require(p_values[16] == 1, 'probe block did not mark completion')
+
+            # Hardware fault evidence for the genuine Ring 3 fault profiles.
+            fault_from = 8 if expected_mode == cancel else 6
+            if stage >= fault_from and expected_mode in (faulting, cancel):
+                record = words(qmp, d[180], 16)
+                node, thread, space, cr3, vector, error, rip, rsp, cr2, cs, ss, flags, _, done, _, _ = record
+                if expected_mode == faulting:
+                    require(node == d[10] and thread == d[14] and space == d[12],
+                            'fault record names a foreign Node/Thread/Space')
+                    require(cr3 == last_b_root, 'fault CR3 is not the Node B root')
+                    require(vector == 14 and error == 7 and cr2 == RUNTIME_VA_B
+                            and rip == d[238], 'hardware fault evidence differs from the read-only write model')
+                    require(0x408000 <= rsp < 0x409000, 'fault RSP outside the Node B private stack')
+                else:
+                    require(node == d[10] and thread == d[15] and space == d[12],
+                            'fault record names a foreign Node/Thread/Space')
+                    require(cr3 == last_b_root, 'fault CR3 is not the Node B root')
+                    require(vector == 14 and error == 6 and cr2 == RUNTIME_VA_B2_FAULT
+                            and rip == d[239], 'unmapped-gap fault evidence differs from the model')
+                    require(0x40c000 <= rsp < 0x40d000, 'fault RSP outside the second Node B stack')
+                require(cs == 0x3b and ss == 0x33 and flags & 0x202 == 0x202 and done == 1,
+                        'fault record is not a complete CPL3 hardware frame')
+
+            # Capability table authority model.
+            def table_expectations(table, side):
+                if table is None:
+                    return
+                expected = []
+                if side == 0:
+                    expected = [('as', 16, False), ('as', 16, False), ('as', 0, False),
+                                ('mem', policy['rights'], True), ('ep', 224, False),
+                                ('ep', 96, False), ('ep', 32, False), ('ep', 64, False)]
+                    if stage >= 4:
+                        expected[3] = None
+                else:
+                    expected = [('as', 16, False), ('as', 16, False), ('as', 0, False),
+                                ('flag', 1, True), ('ep', 224, False), ('ep', 96, False),
+                                None, ('ep', 64, False)]
+                    if stage >= 5:
+                        expected[6] = ('mem', policy['rights'], True)
+                    if stage >= 6 and expected_mode == golden:
+                        expected[6] = None
+                for index, want in enumerate(expected):
+                    slot = table['slots'][index]
+                    if want is None:
+                        require(not slot['live'] and slot['kind'] == 0 and slot['target'] == 0
+                                and slot['rights'] == 0 and not slot['transferable'],
+                                f'Node {side} free slot {index} is not empty')
+                        continue
+                    role, slot_rights, transferable = want
+                    require(slot['live'] and slot['rights'] == slot_rights
+                            and slot['transferable'] == transferable,
+                            f'Node {side} slot {index} authority/rights differ from the model')
+                    if role == 'mem':
+                        require(slot['kind'] == 5 and slot['target'] in raw_caps
+                                and raw_caps[slot['target']]['target'] == d[244],
+                                'received MemoryObject capability identity differs from the object')
+                if side == 0 and stage == 2:
+                    require(table['bootstrap'] == [((1 << 32) | (i + 1)) for i in range(8)],
+                            'Node A bootstrap handles are not the initial grants')
+                if side == 1 and stage == 2:
+                    require(table['bootstrap'] == [((1 << 32) | (i + 1)) for i in range(8)],
+                            'Node B bootstrap handles are not the initial grants')
+
+            table_expectations(table_a, 0)
+            table_expectations(table_b, 1)
+
+            # Channel state matches the exactly-once transfer.
+            expected_queue = 1 if stage == 4 else 0
+            require(sum(queue['len'] for queue in queues) == expected_queue,
+                    f'channel queue occupancy differs from the transfer model at stage {stage}')
+            if expected_queue:
+                queue = next(queue for queue in queues if queue['len'])
+                transfer = queue['transfers'][queue['head']]
+                require(transfer['live'] and transfer['object'] in raw_caps
+                        and transfer['rights'] == policy['rights'],
+                        'queued capability identity/rights were amplified or changed')
+            require(channel_live == (spaces_alive[0] or spaces_alive[1]),
+                    'channel liveness differs from endpoint ownership')
+            expected_counters = {0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1}
+            require(counters['sent'] == [expected_counters[stage], 0], 'send counter differs from the model')
+            require(counters['received'] == [0, 1 if stage >= 5 else 0], 'receive counter differs from the model')
+            require(counters['discarded'] == [0, 0], 'capability transfer discarded a token')
+
+            # Table/frame allocation accounting.
+            owned_all = set()
+            for index in range(2):
+                if spaces_alive[index]:
+                    owned_all |= {tables[i]['physical'] for i, value in enumerate(descriptors[index]['tables']) if value}
+            require(set(live_tables) == baseline['kernel_tables'] | owned_all,
+                    'table allocation absent from or foreign to all root inventories')
+            data_physicals = {f['physical'] for f in live_frames}
+            require(not set(live_tables) & data_physicals, 'table/data ownership overlap')
+            require(total - free == len(live_tables) + len(live_frames), 'orphan physical allocation')
+            for physical in list(live_tables) + [f['physical'] for f in live_frames]:
+                require(allocated(physical), 'live owner has a freed allocator bit')
+            if stage == 1:
+                require(free == baseline['free'] - 2, 'object creation did not allocate exactly two frames')
+            if stage == 8:
+                require(free == baseline['free'] - 2, 'only the object backing should remain allocated')
+            if stage >= 9:
+                require(total == baseline['total'] and free == baseline['free']
+                        and bitmap == baseline['bitmap'], 'final allocator differs from the exact baseline bitmap')
+
+            # Space inventory chronology.
+            if stage == 2:
+                for index in range(2):
+                    space_tables[index] = {tables[i]['physical'] for i, value
+                                           in enumerate(descriptors[index]['tables']) if value}
+                    space_stacks[index] = {tables[i]['physical'] for i, value
+                                           in enumerate(descriptors[index]['stack_tables']) if value}
+                    space_frames[index] = {frames[m['frame'][0]]['physical'] for m in live_mappings
+                                           if m['space'] == [index, 1] and m['object'][0] == 0}
+            if 3 <= stage <= 7:
+                current = {}
+                for index in range(2):
+                    if not spaces_alive[index]:
+                        continue
+                    record = descriptors[index]
+                    owned = {tables[i]['physical'] for i, value in enumerate(record['tables']) if value}
+                    stacks = {tables[i]['physical'] for i, value in enumerate(record['stack_tables']) if value}
+                    extra = owned - space_tables[index]
+                    if index == 0:
+                        require(not extra, 'Node A acquired a table after construction')
+                    elif extra:
+                        require(stage >= 6, f'Node B acquired a table before the runtime mapping: {sorted(extra)}')
+                        require(not extra & (set(baseline['kernel_tables']) | space_tables[0]
+                                             | space_tables[1]),
+                                f'Node B runtime mapping reused a foreign table: {sorted(extra)}')
+                        new_stacks = stacks - space_stacks[index]
+                        require(new_stacks <= extra,
+                                f'Node B acquired an untracked stack table: {sorted(new_stacks - extra)}')
+                        space_tables[1] |= extra
+                        space_stacks[1] |= new_stacks
+                    retired = space_tables[index] - owned
+                    require(retired <= space_stacks[index], f'space {index} retired a non-stack table')
+                    require(stacks == space_stacks[index] - retired,
+                            f'space {index} stack inventory inconsistent')
+                    current[index] = owned
+                require(set(live_tables) == baseline['kernel_tables'] | set().union(*current.values()),
+                        'live tables differ from the surviving root inventories')
+            if stage == 7 or stage == 8:
+                gone = [index for index in range(2) if not spaces_alive[index]]
+                live_private = {frames[m['frame'][0]]['physical'] for m in live_mappings
+                                if spaces_alive[m['space'][0]]}
+                for index in gone:
+                    require(descriptors[index] is None, f'retired space {index} kept a descriptor')
+                    require(not any(m['space'] == [index, 1] for m in live_mappings),
+                            f'retired space {index} kept a live mapping')
+                    for physical in space_tables.get(index, set()):
+                        require(not allocated(physical), f'space {index} table survived teardown')
+                    for physical in space_frames.get(index, set()):
+                        if allocated(physical):
+                            owner = physical in live_private or any(
+                                physical in space_tables.get(side, set())
+                                for side in range(2) if spaces_alive[side])
+                            require(owner,
+                                    f'space {index} private frame survived teardown: {physical:#x}')
+                        require(not any(slot['live'] and slot['owner'] == [0, index, 1]
+                                        for slot in frames),
+                                f'space {index} private frame identity survived: {physical:#x}')
+            if stage >= 9:
+                require(descriptors == [None, None] and not live_frames, 'terminal stage retained a root or frame')
+                require(set(live_tables) == baseline['kernel_tables'], 'terminal table inventory differs from baseline')
+
+            # Root identities must never repeat while both spaces are alive.
+            live_spaces = [spaces[index] for index in range(2) if spaces_alive[index]]
+            require(len({s['root'] for s in live_spaces}) == len(live_spaces), 'shared CR3 root identity')
+
+            snapshot = {'stage': stage, 'mode': expected_mode, 'cpu': cpu, 'descriptor': d,
+                        'frames': frames, 'objects': objects, 'spaces': spaces, 'mappings': mappings,
+                        'tables': tables, 'descriptors': descriptors, 'capability_objects': cap_objects,
+                        'queues': queues, 'counters': counters, 'saved': saved,
+                        'probes': p_values, 'backing': original,
+                        'allocator': {'total': total, 'free': free, 'allocated': total - free,
+                                      'bitmap_sha256': hashlib.sha256(bitmap).hexdigest()}}
+            previous[stage] = snapshot
+            output.append(snapshot)
+        finally:
+            qmp.call('cont')
+        if len(previous) == len(expected_stages):
+            return {'stages': expected_stages, 'mode': expected_mode,
+                    'name': RUNTIME_CASES[expected_mode],
+                    'baseline': {k: v for k, v in baseline.items() if k not in ('bitmap', 'live_tables', 'kernel_tables')},
+                    'backing': original, 'checkpoints': output}
+    raise failure('MemoryObject runtime QMP: missing bounded checkpoint(s)')

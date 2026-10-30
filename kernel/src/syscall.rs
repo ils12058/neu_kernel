@@ -75,6 +75,9 @@ pub mod v05 {
     pub const INFO: u64 = super::version(0, 5, 127 | FEATURE_CAP_MOVE);
     // Private fixture read, never advertised as a public Flag/object ABI.
     pub const TEST_READ: u64 = 0xffff_ffff_ffff_fc00;
+    // Private fixture mapping request: handle, base, pages, flags, offset.
+    // Never advertised in INFO and never reachable outside its test profile.
+    pub const TEST_MAP: u64 = 0xffff_ffff_ffff_fc01;
     pub fn owns(number: u64) -> bool {
         (CHANNEL_SEND_CAP..=CHANNEL_RECEIVE_CAP).contains(&number)
     }
@@ -91,8 +94,15 @@ pub const USER_FLAGS: u64 = 0x8d7; // arithmetic flags plus required bit 1
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Return { status: i64, scalar: u64 },
+    Return {
+        status: i64,
+        scalar: u64,
+    },
     Blocked,
+    /// The requesting Thread stopped itself at the scheduler safe point with a
+    /// pending, validated mapping request. Only the controller may commit it.
+    #[cfg(feature = "memory-object-runtime-test")]
+    Request,
     Exit(u8),
 }
 pub fn dispatch(number: u64, arguments: [u64; 6]) -> Outcome {

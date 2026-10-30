@@ -454,3 +454,17 @@ neu_ipc_syscall_site:
 neu_ipc_syscall_resume:
     ret
 .endm
+
+# K8C drives its own command stream, so only the trampoline and its published
+# SYSCALL site are needed; the full move script would overflow the single
+# shared RX page the multiple-Thread fixture owns.
+.macro neu_move_stub_body
+neu_ipc_user_steps:
+    ud2
+neu_ipc_invoke:
+.global neu_ipc_syscall_site,neu_ipc_syscall_resume
+neu_ipc_syscall_site:
+    syscall
+neu_ipc_syscall_resume:
+    ret
+.endm

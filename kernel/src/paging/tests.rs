@@ -2234,3 +2234,167 @@ fn memory_object_capability_authority_rejects_escalation_and_stale_references() 
     assert_eq!(returned.id(), object);
     assert_eq!(r.memory_object_capability_refs(next), Ok(0));
 }
+
+#[test]
+fn suspended_boundary_requires_exactly_one_pin_and_keeps_the_strict_api() {
+    let (mut r, mut m, a, _, sa, _, _, obj) = object_fixture();
+    let grant = r.authorize_memory_mapping(obj, sa, false).unwrap();
+    assert_eq!(r.pins(sa), Ok(0));
+    assert_eq!(r.can_map_suspended(sa), Err(Error::InUse));
+    assert_eq!(
+        map_memory_object_suspended(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::R),
+        Err(Error::InUse)
+    );
+    assert_eq!(
+        validate_memory_object_mapping_suspended(&a, &m, &r, sa, 0x410000),
+        Err(Error::InUse)
+    );
+    r.pin_space(sa).unwrap();
+    assert_eq!(r.pins(sa), Ok(1));
+    // The ordinary transaction stays exclusive: only the safe point may map.
+    assert_eq!(
+        map_memory_object(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::R),
+        Err(Error::InUse)
+    );
+    assert_eq!(
+        validate_memory_object_mapping(&a, &m, &r, sa, 0x410000),
+        Err(Error::InUse)
+    );
+    map_memory_object_suspended(&a, &mut m, &mut r, &grant, 0, 0x410000, 1, Permissions::R)
+        .unwrap();
+    let leaf = a.translate(&m, 0x410000).unwrap().unwrap();
+    assert_eq!(leaf.permissions, Permissions::R);
+    assert!(leaf.user && !leaf.permissions.execute);
+    // Existing leaves are re-validated by the safe-point variant only.
+    assert_eq!(
+        validate_memory_object_mapping(&a, &m, &r, sa, 0x410000),
+        Err(Error::InUse)
+    );
+    validate_memory_object_mapping_suspended(&a, &m, &r, sa, 0x410000).unwrap();
+    // A second pin is a peer Thread that still holds the destination root.
+    r.pin_space(sa).unwrap();
+    assert_eq!(r.can_map_suspended(sa), Err(Error::InUse));
+    assert_eq!(
+        map_memory_object_suspended(&a, &mut m, &mut r, &grant, 0, 0x411000, 1, Permissions::R),
+        Err(Error::InUse)
+    );
+    r.unpin_space(sa).unwrap();
+    r.unpin_space(sa).unwrap();
+    assert_eq!(
+        map_memory_object_suspended(&a, &mut m, &mut r, &grant, 0, 0x411000, 1, Permissions::R),
+        Err(Error::InUse)
+    );
+}
+
+#[test]
+fn suspended_mapping_rolls_back_and_reauthorizes_rights_without_amplification() {
+    let (mut r, mut m, a, _, sa, _, frames, obj) = object_fixture();
+    let reference = r.retain_memory_object(obj).unwrap();
+    r.release_memory_object(obj).unwrap();
+    let read_only = r
+        .authorize_capability_mapping(&reference, sa, false)
+        .unwrap();
+    r.pin_space(sa).unwrap();
+    assert_eq!(
+        map_memory_object_suspended(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            0,
+            0x410000,
+            1,
+            Permissions::RW
+        ),
+        Err(Error::Flags)
+    );
+    assert_eq!(
+        map_memory_object_suspended(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            0,
+            0x410000,
+            1,
+            Permissions::RX
+        ),
+        Err(Error::Flags)
+    );
+    assert_eq!(
+        map_memory_object_suspended(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            1,
+            0x410000,
+            2,
+            Permissions::R
+        ),
+        Err(Error::Address)
+    );
+    assert_eq!(
+        map_memory_object_suspended(
+            &a,
+            &mut m,
+            &mut r,
+            &read_only,
+            0,
+            0x410001,
+            1,
+            Permissions::R
+        ),
+        Err(Error::Alignment)
+    );
+    assert!(a.translate(&m, 0x410000).unwrap().is_none());
+    assert_eq!(r.memory_object_counts(obj), Ok((0, 0, 2)));
+    map_memory_object_suspended(
+        &a,
+        &mut m,
+        &mut r,
+        &read_only,
+        0,
+        0x410000,
+        1,
+        Permissions::R,
+    )
+    .unwrap();
+    assert_eq!(r.memory_object_counts(obj), Ok((0, 1, 2)));
+    let writable = r
+        .authorize_capability_mapping(&reference, sa, true)
+        .unwrap();
+    map_memory_object_suspended(
+        &a,
+        &mut m,
+        &mut r,
+        &writable,
+        1,
+        0x411000,
+        1,
+        Permissions::RW,
+    )
+    .unwrap();
+    assert_eq!(
+        a.translate(&m, 0x411000).unwrap().unwrap().permissions,
+        Permissions::RW
+    );
+    // Closing the received capability leaves the committed leaves in place.
+    r.release_memory_object_ref(reference).unwrap();
+    assert_eq!(r.memory_object_capability_refs(obj), Ok(0));
+    assert_eq!(r.memory_object_counts(obj), Ok((0, 2, 2)));
+    assert_eq!(r.collect_memory_object(obj), Err(Error::InUse));
+    // Teardown preflight stays exclusive: the safe-point pin must be gone.
+    assert_eq!(
+        unmap_memory_object(&a, &mut m, &mut r, sa, 0x410000),
+        Err(Error::InUse)
+    );
+    r.unpin_space(sa).unwrap();
+    for address in [0x410000, 0x411000] {
+        unmap_memory_object(&a, &mut m, &mut r, sa, address).unwrap();
+    }
+    assert_eq!(
+        r.collect_memory_object(obj),
+        Ok([Some(frames[0]), Some(frames[1])])
+    );
+}

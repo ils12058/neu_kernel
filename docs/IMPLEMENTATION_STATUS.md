@@ -1,5 +1,130 @@
 # Neu Kernel implementation status
 
+## K8 / Phase 8C — complete for bounded runtime mapping from a received capability (2026-10-30)
+
+Baseline was `4f2d463ec1f13415180acd0442d4f43a066c948d` on
+`experiment/qwen-k8a1`. Phase 8C closes the Phase 8B staged-mapping limitation: a
+running Node receives a MemoryObject capability through the existing Channel
+`CHANNEL_SEND_CAP` (0x17) / `CHANNEL_RECEIVE_CAP` (0x18) operations and then
+causes a **new** mapping of the same physical backing at a scheduler safe point,
+with the received handle as the only authority. [ADR 0025](adr/0025-runtime-memoryobject-mapping.md)
+accepts only this bounded trusted-test contract. Architecture v0.2, ABI 0.5 and
+all fixed pool limits are unchanged; there is no ABI 0.6 and no public mmap.
+
+### Bounded request and scheduler safe point
+
+`TEST_MAP` (`0xffff_ffff_ffff_fc01`) is a private exact-argument fixture
+operation `(handle, base, pages, writable, offset)`; it carries no physical
+address or raw object id. The syscall only validates arguments and records one
+bounded pending request (single-slot ledger). The scheduler suspends the issuing
+Thread through `Queue::request`/`Nodes::request`: the Thread becomes `Runnable`
+with a scheduler-owned saved continuation and is **not** on the runnable FIFO.
+The controller then owns the destination root, saved Ring 3 context and table
+lease, and the root has exactly the Thread's single execution pin. Commit
+(`address_space::commit_request`) runs in one IF=0 transaction, requires
+`paging::current_root() == paging.root()`, re-derives authority from the received
+handle with `Rights::MAP` (plus `WRITE` when requested), and holds the guard pin
+across authorization and the complete mapping. The mapping is committed before
+the Thread is re-enqueued (`Queue::resume`/`Nodes::resume_request`), and the
+saved RIP/RSP/RFLAGS/CS/SS are preserved.
+
+### Suspended ownership boundary
+
+`paging::Registry` now distinguishes `Boundary::Exclusive` (ordinary API:
+inactive space, `pins == 0`) from `Boundary::Suspended` (safe point: inactive
+space, live root, exactly one pin). The ordinary `map_memory_object`,
+`validate_memory_object_mapping` and `unmap_memory_object` entry points remain
+exclusive and still reject a live Thread's space. Only the safe-point variants
+accept the suspended boundary. No pin is removed and no check is skipped.
+
+### Authority, rights and mapping semantics
+
+Authority comes from the Node-B handle slot/generation; raw object ids are
+metadata. Missing `MAP`, missing `READ`, a writable request without `WRITE` and
+forged/stale/closed/wrong-kind handles fail without modification; `TRANSFER` is
+not required. Leaves are user-accessible, NX, read-only or read-write exactly as
+requested, at `0x700000` (and `0x701000` for the writable alias), inside the
+existing user range. New intermediate tables are recorded in the destination
+`UserSpace.tables`; failures roll back and are retryable; unexpected backend
+corruption is fail-stop. Committed mappings survive handle close and are torn
+down with the space; the object is collected only after all mapping and
+capability references disappear.
+
+### Cancellation and single-CPU ordering
+
+`Queue::cancel_request`/`Nodes::cancel_request` marks the suspended Thread
+`Exited` and drops its saved context, so `resume_request` fails with
+`Association` and the FIFO can never dispatch it. `address_space::cancel_request`
+turns the ledger entry `Cancelled`; later commit and replay attempts fail
+`Owner`. Commit and cancellation both run between dispatches with IF=0 on one
+CPU, so cancellation cannot interleave with a synchronous commit. The cancel
+profile proves this concretely: Node A exits and is destroyed first; a deferred
+second B Thread is installed and faults while B1's request is pending;
+`Nodes::complete` cancels B1; the controller proves commit refusal, then resume
+refusal, before retiring B1 and tearing down B. To stay inside ADR 0024's fixed
+16-frame pool, A's space is destroyed before the third Thread is installed
+(peak 14 → 8 → 11 frames); `DATA_FRAMES` is unchanged.
+
+### Profiles and independent evidence
+
+Seven stopped-CPU profiles share eleven checkpoints (stages 0–10):
+
+| Case | Proves |
+| --- | --- |
+| `memory-object-runtime` | Received handle causes a new read-only mapping at `0x700000`; B reads A's bytes in Ring 3; A's mapping survives; close leaves the mapping; replay and second-pending requests are refused |
+| `memory-object-runtime-writable` | `READ|WRITE|MAP|TRANSFER` permits a writable alias at `0x701000`; a real Ring 3 store reaches the shared backing |
+| `memory-object-runtime-fault` | A store through the read-only runtime mapping raises a genuine `#PF` (vector 14, error `0x7`, `CR2 = 0x700000`, real CPL 3 frame) |
+| `memory-object-runtime-rights` | `MAP|READ|TRANSFER` rejects a writable request (`-18`) and maps nothing |
+| `memory-object-runtime-read-denied` | `WRITE|MAP|TRANSFER` rejects read-only and writable requests; no mapping exists |
+| `memory-object-runtime-peer-exit` | A exits first; B's runtime request still commits and B reads the surviving backing |
+| `memory-object-runtime-cancel` | B2's genuine unmapped-gap `#PF` cancels B1's pending request; commit/resume refusals precede B1's retirement; exact allocator baseline restored |
+
+The QMP oracle stops the sole CPU inside the bounded wait, rechecks RIP/CPL/CR3/IF,
+and reads a 256-word witness descriptor containing addresses, strides, field
+offsets and constants only. It verifies raw capability tables, Channel transfers
+and counters, object/frame/space/mapping records, the request ledger/witness,
+physical page-table leaves and effective user rights, `UserSpace` table
+inventories, saved Ring 3 frames, the hardware fault record and the exact final
+allocator bitmap/frame/table baseline. Serial `verified=true` is never accepted.
+
+### Validation and explicit non-claims
+
+Validation passed: `make doctor`, `make check`, `make build`, and `make test`
+with **240 host tests** (236 Phase 8B baseline plus two suspended-boundary paging
+tests and two request/resume/cancel scheduler tests) and **150 unique QEMU
+scenarios** (the 143-scenario Phase 8B baseline plus seven
+`memory-object-runtime-*` profiles). Each runtime profile was also run
+individually, and the focused K7/K8A/K8B profiles passed again. The full-suite
+count treats repeated runs as the same unique scenario. Full-suite evidence is
+retained at `build/k8c-full-test.log` and `build/test-results-full.json`.
+
+Three full-suite attempts were rejected before the final pass and are retained at
+`build/k8c-full-test-first-attempt.log`,
+`build/k8c-full-test-second-attempt.log` and
+`build/k8c-full-test-third-attempt.log`; none is counted as a passing run. The
+first exposed a K8B fixture stage-ordering race; the second and third exposed the
+general legacy preempt timer race documented in
+[the testing notes](testing/memory-object-qmp.md#legacy-preempt-timer-ordering-correction).
+Both corrections are test-fixture only and changed no observer assertion,
+timeout, iteration count, kernel authority, pool or ABI: the K8B controller now
+publishes stage 3 only after Node B's receive-gate spin, and the legacy preempt
+fixture stops and boundedly drains the one-shot user timer at every
+`SliceEvent::Exited` instead of only before the stale audit.
+
+Two target states were exercised. The full suite above ran from the existing
+`target/`; after `cargo clean` (empty `target/`), the 240 host tests, the default
+image, the seven runtime profiles, `memory-object-cap` (K8B),
+`memory-object-lifetime` (K8A), `memory-object-user-share` (K8A-2), `cap-moves`
+(K7) and `preempt-xapic` were rebuilt and passed again. Repeats are not additional
+unique scenarios. Clean-build evidence is retained at
+`build/k8c-clean-host-tests.log`, `build/k8c-clean-build.log` and
+`build/k8c-clean-<case>.log`.
+
+Excluded: public `memory_create`/`mmap`/`munmap`, public MemoryObject factories,
+derivation, revocation, executable shared mappings, multi-CPU/SMP, IPI TLB
+shootdown, demand paging, COW, swap, file-backed memory, huge pages, DMA, ELF
+loading and Linux compatibility. No hardware or hosted-CI validation is claimed.
+
 ## K8 / Phase 8B — complete for bounded MemoryObject capability transfer (2026-10-29)
 
 Baseline was `d9fd56a60260549eef4a86444f12c3006541959b` on

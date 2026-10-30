@@ -126,6 +126,48 @@ impl Paging<'_, '_> {
             bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         })
     }
+    /// Bounded word access anywhere in the Node's owned DATA page. The runtime
+    /// fixture keeps its command stream and probe results there.
+    pub fn live_data_word(&mut self, space: &UserSpace, offset: usize) -> Result<u64> {
+        self.member_boundary(space)?;
+        if !offset.is_multiple_of(8) || offset + 8 > PAGE as usize {
+            return Err(Error::Address);
+        }
+        self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        })
+    }
+    /// Raw object-page access used only by the trusted controller to seed and
+    /// verify the shared payload while the owning Node is not executing.
+    pub fn live_object_write(
+        &mut self,
+        object: MemoryObjectId,
+        page: usize,
+        offset: usize,
+        value: u64,
+    ) -> Result<()> {
+        let frame = self.registry.memory_object_frame(object, page)?;
+        if !offset.is_multiple_of(8) || offset + 8 > PAGE as usize {
+            return Err(Error::Address);
+        }
+        self.with_frame_mut(frame, |bytes| {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes())
+        })
+    }
+    pub fn live_object_word(
+        &mut self,
+        object: MemoryObjectId,
+        page: usize,
+        offset: usize,
+    ) -> Result<u64> {
+        let frame = self.registry.memory_object_frame(object, page)?;
+        if !offset.is_multiple_of(8) || offset + 8 > PAGE as usize {
+            return Err(Error::Address);
+        }
+        self.with_frame(frame, |bytes| {
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        })
+    }
     pub fn live_block_word(&mut self, space: &UserSpace, label: u64, offset: usize) -> Result<u64> {
         if !(1..=3).contains(&label) || !offset.is_multiple_of(8) {
             return Err(Error::Address);

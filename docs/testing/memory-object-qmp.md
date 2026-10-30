@@ -1,4 +1,4 @@
-# MemoryObject QMP evidence (bounded Phase 8A-1, 8A-2 and 8B)
+# MemoryObject QMP evidence (bounded Phase 8A-1, 8A-2, 8B and 8C)
 
 The Phase 8A-1 `memory-object-*` images run trusted kernel code with one CPU,
 IF=0 and inactive user roots; they do not execute shared-memory accesses in
@@ -6,8 +6,10 @@ Ring 3. The Phase 8A-2 `memory-object-user-*` images then execute real Ring 3
 writes/reads through the installed shared leaves and, in the fault profile,
 produce a genuine hardware `#PF`. The Phase 8B `memory-object-cap` image moves a
 MemoryObject capability between two Nodes over the K7 Channel operations and
-inspects the transfer with production state. Architecture v0.2 and ABI 0.5
-remain the design and ABI baselines.
+inspects the transfer with production state. The Phase 8C
+`memory-object-runtime-*` images make a running Node map a received capability at
+a scheduler safe point. Architecture v0.2 and ABI 0.5 remain the design and ABI
+baselines.
 
 ## Profiles
 
@@ -171,6 +173,73 @@ and both Nodes' saved Ring 3 frames. Required raw relationships:
 Serial `verified=true` is never accepted. Missing or mismatched raw state fails
 the case.
 
+## Runtime mapping from a received capability (Phase 8C)
+
+| Case | Purpose |
+| --- | --- |
+| `memory-object-runtime` | A1 sends the MemoryObject capability; B1 receives it, requests a read-only mapping at `0x700000`, reads A's bytes in Ring 3, then reads back through the committed mapping after closing the handle |
+| `memory-object-runtime-writable` | Rights 15; B1 requests a writable alias at `0x701000` and its Ring 3 store reaches the shared backing |
+| `memory-object-runtime-fault` | Rights 13; a Ring 3 store through the read-only runtime mapping raises a real `#PF` (vector 14, error `0x7`, `CR2 = 0x700000`) while A's mapping survives |
+| `memory-object-runtime-rights` | Rights 11 (`MAP|READ|TRANSFER`): read-only and writable requests are rejected `-18`; nothing is mapped |
+| `memory-object-runtime-read-denied` | Rights 14 (`WRITE|MAP|TRANSFER`): both requests are rejected; nothing is mapped |
+| `memory-object-runtime-peer-exit` | A exits first; B's runtime request commits and B reads the surviving backing before teardown |
+| `memory-object-runtime-cancel` | A first; B2 faults on unmapped `0x407000`, cancels B1's pending request, and commit/resume refusals are proven before B1 is retired |
+
+### Fixed Phase 8C contract
+
+- One trusted RAM-backed two-page object at `0x600000` (A, RW/NX). Node B's
+  target VAs start unmapped: there is no staged B mapping.
+- The only runtime mapping path is the private `TEST_MAP`
+  (`0xffff_ffff_ffff_fc01`) convention with exact arguments
+  `(handle, base, pages, writable, offset)`. It contains no physical address or
+  object id; the kernel records one bounded pending request and suspends the
+  Thread. The controller commits from the received handle at the safe point and
+  resumes the Thread; the kernel never writes the tested payload.
+- Profiles `golden`/`fault`/`peer-exit`/`cancel` use rights 13
+  (`READ|MAP|TRANSFER`), `writable` uses 15, `rights` uses 11 and `read-denied`
+  uses 14. `golden`/`fault`/`peer-exit`/`cancel` tear Node A down first;
+  `writable`/`rights`/`read-denied` tear Node B down first.
+- Negative requests are issued from B's own Ring 3 script before and after
+  receipt: missing handle, sender handle after transfer, wrong kind, forged
+  handle, reserved range, unaligned base, zero/two pages, out-of-bounds offset,
+  overlap, second pending request and replay after completion. Recoverable
+  statuses leave handles, references, tables, mappings and allocator state
+  consistent.
+- In the cancel profile the third Thread is installed only after Node A's space
+  is destroyed, keeping the fixed 16-frame pool (peak 14 → 8 → 11 frames). B2's
+  genuine fault cancels the suspended B1 through `Nodes::complete`; the
+  controller proves `commit_request = Owner`, a second commit still `Owner`,
+  `resume = Association` and an empty FIFO before retiring B1. The request ledger
+  then shows the cancelled record, and the final bitmap/frame/table state equals
+  the stage-0 baseline.
+
+### Phase 8C checkpoints and oracle
+
+The descriptor is a 256-word witness (`neu_memory_runtime_witness`). QMP stops the
+sole CPU inside the bounded runtime wait, rechecks RIP/CPL/CR3/IF, and requires
+all eleven stages in order:
+
+| Stage | Observed state |
+| --- | --- |
+| 0 | Exact allocator/table baseline; no object, Node or mapping |
+| 1 | Two-page object live, creator reference, zeroed backing |
+| 2 | Both Nodes/spaces created; A maps the object, B's target VA is unmapped; both Threads installed |
+| 3 | A1 sent the capability; A's handle is stale and B's queue holds exactly one MemoryObject/rights transfer |
+| 4 | B1 received the capability in a fresh slot generation; queue empty; B's target VA still unmapped |
+| 5 | B1's `TEST_MAP` request is pending; probes and negative requests match the profile; no B mapping yet |
+| 6 | A exited and, in order-1 profiles, was destroyed; the request is still pending (cancel installs the deferred B2 Thread here) |
+| 7 | Commit installed B's mapping (order-2 profiles), or the cancel profile's pending request plus B2's hardware fault evidence |
+| 8 | B destroyed (or A for order-1); in the cancel profile the request is `Cancelled`, B1 was retired only after the commit/resume refusals, and capability references are gone |
+| 9 | Object collected; exact baseline bitmap/table/frame inventory |
+| 10 | Final completion state; CPU at the kernel halt loop |
+
+For every stage the observer reads raw capability slots and handle generations,
+Channel queues/counters, paging object/frame/space/mapping records, the request
+ledger and witness words, `UserSpace` inventory and stack-table inventories,
+physical page-table pages with effective U/S/R/W/NX, both saved Ring 3 frames,
+private gate blocks, the hardware fault record, and the allocator bitmap. A
+serial `verified=true` scalar is never accepted for these cases.
+
 ## Production integration
 
 `Paging::map_memory_backing` checks the exact registered root, inactive/unpinned
@@ -269,6 +338,11 @@ capability transfer, rights preservation, cross-registry lifetime and
 exactly-once discard described in
 [ADR 0024](../adr/0024-memoryobject-capability-authority-and-transfer.md); they
 do not claim runtime mapping from a received capability, public syscalls or SMP.
+The Phase 8C `memory-object-runtime-*` checkpoints claim the bounded scheduler
+safe point, suspended-boundary mapping, terminal cancellation and exact lifetime
+described in
+[ADR 0025](../adr/0025-runtime-memoryobject-mapping.md); they do not claim a
+public mapping ABI, multi-CPU correctness or SMP.
 
 ## Live observer corrections retained during finalization
 
@@ -306,3 +380,54 @@ No fixture iteration count or timeout was increased. The rejected runs remain in
 `k8-final-user-unmapped-rejected.json`. These observations do not establish the
 cause of the older historical `user-kernel` failure, nor attribute it to concurrent
 QEMU runs.
+
+## K8B checkpoint ordering correction during Phase 8C finalization
+
+The first Phase 8C full-suite attempt rejected `memory-object-cap` at stage 3 with
+`Node B receive gate did not spin`. The cause was a fixture ordering race, not a
+guest or production failure: the controller published stage 3 as soon as Node A
+reached its fail gate, without requiring Node B to have executed its receive-gate
+loop. Under suite load B's dispatch was preempted after closing its endpoint handle
+but before the wait loop's first increment, so the stopped-CPU snapshot showed a
+state the K8B contract does not describe. The K8B fixture now publishes stage 3
+only after B's bounded wait counter is nonzero; the observer keeps the original
+strict `> 0` assertions at stages 3 and 4. `memory-object-cap` then passed three
+consecutive individual runs and the full suite. The rejected attempt is retained at
+`build/k8c-full-test-first-attempt.log`; it is not counted as a passing run.
+
+## K8C runtime profile finalization
+
+No runtime checkpoint was accepted from serial output. The runtime oracle reads
+the 256-word witness descriptor and production state only after QMP stops the sole
+CPU, and every rejected snapshot was re-run rather than relaxed. The seven
+`memory-object-runtime-*` profiles passed individually, in the full suite, and
+again from a cleared `target/` directory.
+
+## Legacy preempt timer ordering correction
+
+The second Phase 8C full-suite attempt timed out in the unchanged legacy
+`preempt-stale` profile: the guest halted at `Interrupt failure: vector=48
+reason=pending user arm ticks=8 eois=8 IF=0`. The one-shot user timer was still
+counting while the fixture created and destroyed the replacement Node for the
+stale-identity audit; a tick that fired during that controller-only work was
+pending when the surviving Thread re-armed the timer. A stale-specific stop was
+placed before that audit and the case then passed five consecutive individual
+runs.
+
+The third full-suite attempt exposed the same race in `preempt-xapic`, which has
+no audit. Its guest also halted at `reason=pending user arm ticks=8 eois=8`
+after Node A exited through its normal exit syscall: the timer stayed armed while
+the controller reclaimed A's Nodes and ran the survivor path, fired there, and
+left IRR set for the survivor's re-arm. The race is therefore general to every
+`SliceEvent::Exited`, not specific to the audit. The legacy fixture now stops the
+one-shot timer at the start of every `Exited` event and drains at most one
+already-pending tick through the existing bounded kernel-context window
+(`settle_user_pending`, the same drain already used on the multi-test terminal
+path); the stale-specific stop was removed. The survivor's entry still re-arms
+with a fresh count, the drain is accounted by the existing `ticks == user + drain`
+and `drain <= 1` oracle checks, and no observer assertion, timeout, iteration
+count or guest check changed. All fifteen legacy preempt profiles and the
+adjacent `threads`, `threads-xapic`, `capabilities` and `capabilities-xapic`
+profiles passed individually; `preempt-xapic` also passed four consecutive
+individual runs and `preempt-stale` three. The timed-out attempts are retained at
+`build/k8c-full-test-second-attempt.log` and `k8c-full-test-third-attempt.log`.

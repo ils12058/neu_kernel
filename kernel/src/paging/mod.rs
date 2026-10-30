@@ -27,6 +27,15 @@ pub enum Error {
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Ownership state that permits a user-space mapping transaction. The ordinary
+/// entry point requires a quiescent space; the scheduler safe point accepts the
+/// single execution pin of the Thread whose saved context it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boundary {
+    Exclusive,
+    Suspended,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Permissions {
@@ -750,6 +759,25 @@ impl Registry {
             Err(Error::InUse)
         } else {
             Ok(())
+        }
+    }
+    /// A suspended root is not active and its one remaining pin is the
+    /// execution pin of the Thread the scheduler has stopped at a safe point.
+    /// A second pin (a peer Thread still holding the root) is rejected.
+    pub fn can_map_suspended(&self, id: SpaceId) -> Result<()> {
+        if id == SpaceId::KERNEL {
+            return Err(Error::NotOwned);
+        }
+        let space = self.space(id)?;
+        if self.active.is_some() || space.root == 0 || space.pins != 1 {
+            return Err(Error::InUse);
+        }
+        Ok(())
+    }
+    pub fn check_map_boundary(&self, id: SpaceId, boundary: Boundary) -> Result<()> {
+        match boundary {
+            Boundary::Exclusive => self.can_allocate(id),
+            Boundary::Suspended => self.can_map_suspended(id),
         }
     }
     pub fn retain_space(&mut self, id: SpaceId) -> Result<SpaceRef> {
@@ -1689,6 +1717,57 @@ pub fn map_memory_object(
     pages: usize,
     permissions: Permissions,
 ) -> Result<()> {
+    map_memory_object_at(
+        tree,
+        memory,
+        registry,
+        authority,
+        offset,
+        base,
+        pages,
+        permissions,
+        Boundary::Exclusive,
+    )
+}
+
+/// Runtime variant used at the scheduler safe point. Every check is identical
+/// to the trusted transaction; only the ownership precondition differs.
+#[allow(clippy::too_many_arguments)] // Explicit backend, authority and mapping bounds.
+pub fn map_memory_object_suspended(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    authority: &MemoryMapAuthority,
+    offset: usize,
+    base: u64,
+    pages: usize,
+    permissions: Permissions,
+) -> Result<()> {
+    map_memory_object_at(
+        tree,
+        memory,
+        registry,
+        authority,
+        offset,
+        base,
+        pages,
+        permissions,
+        Boundary::Suspended,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit backend, authority and mapping bounds.
+fn map_memory_object_at(
+    tree: &PageTree,
+    memory: &mut impl TableMemory,
+    registry: &mut Registry,
+    authority: &MemoryMapAuthority,
+    offset: usize,
+    base: u64,
+    pages: usize,
+    permissions: Permissions,
+    boundary: Boundary,
+) -> Result<()> {
     let object = *registry.object(authority.object)?;
     if authority.capability {
         if object.capability_refs == 0 {
@@ -1697,7 +1776,7 @@ pub fn map_memory_object(
     } else if !object.creator {
         return Err(Error::NotOwned);
     }
-    registry.can_allocate(authority.space)?;
+    registry.check_map_boundary(authority.space, boundary)?;
     if registry.root(authority.space)? != tree.root {
         return Err(Error::NotOwned);
     }
@@ -1789,7 +1868,28 @@ pub fn validate_memory_object_mapping(
     space: SpaceId,
     address: u64,
 ) -> Result<()> {
-    registry.can_allocate(space)?;
+    validate_memory_object_mapping_at(tree, memory, registry, space, address, Boundary::Exclusive)
+}
+
+pub fn validate_memory_object_mapping_suspended(
+    tree: &PageTree,
+    memory: &impl TableMemory,
+    registry: &Registry,
+    space: SpaceId,
+    address: u64,
+) -> Result<()> {
+    validate_memory_object_mapping_at(tree, memory, registry, space, address, Boundary::Suspended)
+}
+
+fn validate_memory_object_mapping_at(
+    tree: &PageTree,
+    memory: &impl TableMemory,
+    registry: &Registry,
+    space: SpaceId,
+    address: u64,
+    boundary: Boundary,
+) -> Result<()> {
+    registry.check_map_boundary(space, boundary)?;
     if registry.root(space)? != tree.root {
         return Err(Error::NotOwned);
     }

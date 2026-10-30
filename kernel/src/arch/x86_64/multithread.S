@@ -217,6 +217,14 @@ neu_multi_live_entry:
     je neu_multi_cap_a
     cmp rax, 15
     je neu_multi_cap_b
+    .if {runtime}
+    cmp rax, 16
+    je neu_multi_runtime_a
+    cmp rax, 17
+    je neu_multi_runtime_b
+    cmp rax, 22
+    je neu_multi_runtime_b2
+    .endif
     jmp neu_multi_failed
 
 neu_multi_live_a:
@@ -478,6 +486,182 @@ neu_multi_cap_b_send_gate_end:
     xor edi, edi
     jmp neu_multi_live_exit
 
+# K8C runtime mapping roles. A maps its own object payload with trusted creator
+# authority, transfers the MemoryObject capability, then waits. B follows a
+# controller-written command stream in its DATA page: receive, probe, request,
+# read, close, exit. The kernel never writes the tested payload.
+.if {runtime}
+neu_multi_runtime_a:
+    mov rbx, 0x402240
+    movabs rax, 0x4e45554d4f52554e
+    mov qword ptr [0x600000], rax
+    mov [rbx + 0x00], rax
+    movabs rax, 0x5a5a52554e54494d
+    mov qword ptr [0x600008], rax
+    mov [rbx + 0x08], rax
+    mov qword ptr [0x601000], 1
+    mov eax, 0x10
+    mov edi, 3
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov [rbx + 0x48], rdx
+    mov eax, 0x10
+    mov edi, 4
+    call neu_multi_invoke
+    test rax, rax
+    jne neu_multi_failed
+    mov r14, rdx
+    mov qword ptr [rbx + 0x10], 1
+neu_multi_runtime_a_gate1:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x20], 1
+    jne neu_multi_runtime_a_gate1
+    mov eax, 0x17
+    mov rdi, r14
+    mov rsi, [rbx + 0x48]
+    call neu_multi_invoke
+    mov [rbx + 0x40], rax
+    test rax, rax
+    jne neu_multi_failed
+    mov qword ptr [rbx + 0x10], 2
+neu_multi_runtime_a_gate2:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rbx + 0x58], 1
+    jne neu_multi_runtime_a_gate2
+    mov rax, qword ptr [0x600000]
+    mov [rbx + 0x30], rax
+    movabs rcx, 0x4e45554d4f52554e
+    cmp rax, rcx
+    jne neu_multi_failed
+    mov rax, qword ptr [0x600008]
+    movabs rcx, 0x5a5a52554e54494d
+    cmp rax, rcx
+    jne neu_multi_failed
+    movabs rax, 0x4c49564552454144
+    mov [rbx + 0x18], rax
+    xor edi, edi
+    jmp neu_multi_live_exit
+
+neu_multi_runtime_b:
+    mov rbx, 0x4022c0
+    mov r15, 0x402500
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_b2:
+    mov rbx, 0x402340
+    mov r15, 0x402c00
+
+neu_multi_runtime_script:
+    mov r14, qword ptr [r15]
+    cmp r14, 0xFFFE
+    je neu_multi_runtime_gate
+    cmp r14, 0xFFFD
+    je neu_multi_runtime_read
+    cmp r14, 0xFFFC
+    je neu_multi_runtime_write
+    cmp r14, 0xFFFB
+    je neu_multi_runtime_store
+    cmp r14, 0xFFF9
+    je neu_multi_runtime_get_a
+    cmp r14, 0xFFF8
+    je neu_multi_runtime_get_b
+    mov rax, r14
+    mov rdi, [r15 + 8]
+    cmp rdi, -1
+    jne neu_multi_runtime_arg2
+    mov rdi, [rbx + 0x50]
+    jmp neu_multi_runtime_args
+neu_multi_runtime_arg2:
+    cmp rdi, -2
+    jne neu_multi_runtime_arg3
+    mov rdi, [rbx + 0x50]
+    movabs rcx, 0x100000000
+    add rdi, rcx
+    jmp neu_multi_runtime_args
+neu_multi_runtime_arg3:
+    cmp rdi, -3
+    jne neu_multi_runtime_arg4
+    mov rdi, [rbx + 0x38]
+    jmp neu_multi_runtime_args
+neu_multi_runtime_arg4:
+    cmp rdi, -4
+    jne neu_multi_runtime_args
+    mov rdi, [rbx + 0x40]
+neu_multi_runtime_args:
+    mov rsi, [r15 + 16]
+    mov rdx, [r15 + 24]
+    mov r10, [r15 + 32]
+    mov r8, [r15 + 40]
+    call neu_multi_invoke
+    mov [r15 + 48], rax
+    cmp r14, 0x18
+    jne neu_multi_runtime_next
+    mov [rbx + 0x50], rdx
+neu_multi_runtime_next:
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_gate:
+    mov rax, [r15 + 8]
+    mov [rbx + 0x10], rax
+    mov rcx, [r15 + 16]
+    lea rdx, [rbx + rcx]
+neu_multi_runtime_gate_loop:
+    inc qword ptr [rbx + 0x28]
+    cmp qword ptr [rdx], 1
+    jne neu_multi_runtime_gate_loop
+    mov qword ptr [rdx], 0
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_read:
+    mov rax, [r15 + 8]
+    mov rax, [rax]
+    mov rcx, [r15 + 16]
+    mov [rbx + rcx], rax
+    mov [r15 + 48], rax
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_write:
+    mov rax, [r15 + 8]
+    mov rcx, [r15 + 16]
+.global neu_multi_runtime_b_fault_site,neu_multi_runtime_b2_fault_site
+neu_multi_runtime_b_fault_site:
+neu_multi_runtime_b2_fault_site:
+    mov [rax], rcx
+    mov qword ptr [r15 + 48], 0
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_store:
+    mov rax, [r15 + 16]
+    mov rcx, [r15 + 8]
+    mov [rbx + rcx], rax
+    mov [r15 + 48], rax
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_get_a:
+    mov eax, 0x10
+    mov rdi, [r15 + 8]
+    call neu_multi_invoke
+    mov [r15 + 48], rax
+    mov [rbx + 0x38], rdx
+    add r15, 64
+    jmp neu_multi_runtime_script
+
+neu_multi_runtime_get_b:
+    mov eax, 0x10
+    mov rdi, [r15 + 8]
+    call neu_multi_invoke
+    mov [r15 + 48], rax
+    mov [rbx + 0x40], rdx
+    add r15, 64
+    jmp neu_multi_runtime_script
+.endif
+
 neu_multi_live_exit:
     mov eax, 2
     call neu_multi_invoke
@@ -491,10 +675,14 @@ neu_multi_live_exit:
     neu_as_user_body
 .endif
 .if {channels}
-    .if {ipc_move}
-    neu_move_user_body
+    .if {runtime}
+    neu_move_stub_body
     .else
-    neu_ipc_user_body
+        .if {ipc_move}
+        neu_move_user_body
+        .else
+        neu_ipc_user_body
+        .endif
     .endif
 .endif
 neu_multi_payload_end:

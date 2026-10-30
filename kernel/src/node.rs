@@ -655,6 +655,73 @@ impl Nodes {
         self.active = None;
         Ok(())
     }
+    /// Suspends the issuing Thread at the scheduler safe point without placing
+    /// it on the runnable FIFO. The controller owns the destination root until
+    /// the request is resumed or canceled.
+    pub fn request(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
+        if !saved.continuation {
+            return Err(Error::Association);
+        }
+        self.suspend_context(active, saved)
+    }
+    /// Replaces the suspended continuation and makes the Thread admissible.
+    /// The caller admits it to the runnable FIFO after the mapping commits.
+    pub fn resume_request(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
+        if self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        let mut t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        let stack = t.stack.ok_or(Error::State)?;
+        if t.node != active.node
+            || t.state != ThreadState::Runnable
+            || t.queued
+            || t.saved.is_none()
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
+            || n.space != Some(t.context.space)
+            || !saved.continuation
+            || !saved.valid(active, stack)
+        {
+            return Err(Error::Association);
+        }
+        t.saved = Some(saved);
+        self.threads[t.id.slot] = Some(t);
+        Ok(())
+    }
+    /// Cancels a suspended request. The Thread is exited before its saved
+    /// context is dropped, so no later resume or dispatch can succeed.
+    pub fn cancel_request(&mut self, active: ActiveContext, outcome: ExitReason) -> Result<()> {
+        if self.active.is_some() {
+            return Err(Error::InUse);
+        }
+        let mut t = self.thread(active.thread)?;
+        let mut n = self.node(active.node)?;
+        if t.node != n.id
+            || t.state != ThreadState::Runnable
+            || t.queued
+            || t.saved.is_none()
+            || t.stack.is_none()
+        {
+            return Err(Error::State);
+        }
+        t.state = ThreadState::Exited;
+        t.outcome = Some(outcome);
+        t.saved = None;
+        self.threads[t.id.slot] = Some(t);
+        if !self.threads.iter().flatten().any(|other| {
+            other.node == n.id
+                && !matches!(other.state, ThreadState::Exited | ThreadState::Reclaimed)
+        }) {
+            n.state = NodeState::Exited;
+            n.outcome = Some(outcome);
+            self.tables[n.id.slot]
+                .as_mut()
+                .ok_or(Error::InUse)?
+                .terminate();
+            self.nodes[n.id.slot] = Some(n);
+        }
+        Ok(())
+    }
     pub fn block(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
         if self.active != Some(active) || self.tables[active.node.slot].is_none() {
             return Err(Error::Association);

@@ -41,6 +41,9 @@ pub(crate) const CAP_SECOND_WORD: usize = 0x08;
 pub(crate) const CAP_READY: usize = 0x10;
 pub(crate) const CAP_RESULT_WORD: usize = 0x18;
 pub(crate) const CAP_GATE_FAILED: usize = 0x20;
+/// Bounded wait-loop counter shared by both fixtures; the observer reads it as
+/// a liveness marker, so a checkpoint must not precede the first increment.
+pub(crate) const CAP_SPIN: usize = 0x28;
 pub(crate) const CAP_READBACK: usize = 0x30;
 pub(crate) const CAP_FAILED_STATUS: usize = 0x38;
 pub(crate) const CAP_SEND_STATUS: usize = 0x40;

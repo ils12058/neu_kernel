@@ -691,6 +691,17 @@ impl<'a, 'm> Paging<'a, 'm> {
     pub fn memory_object_capability_refs(&self, object: MemoryObjectId) -> Result<u8> {
         self.registry.memory_object_capability_refs(object)
     }
+    #[cfg(feature = "memory-object-runtime-test")]
+    #[allow(dead_code)]
+    pub fn authorize_memory_mapping(
+        &self,
+        object: MemoryObjectId,
+        space: SpaceId,
+        writable: bool,
+    ) -> Result<logic::MemoryMapAuthority> {
+        self.registry
+            .authorize_memory_mapping(object, space, writable)
+    }
     /// Mapping authority derived from the exact live capability reference.
     #[cfg(feature = "memory-object-live-test")]
     pub fn authorize_capability_mapping(
@@ -1039,10 +1050,70 @@ impl Paging<'_, '_> {
         pages: usize,
         permissions: Permissions,
     ) -> Result<()> {
+        self.map_memory_backing_at(
+            space,
+            grant,
+            offset,
+            base,
+            pages,
+            permissions,
+            logic::Boundary::Exclusive,
+        )
+    }
+
+    /// Runtime mapping at the scheduler safe point. `owner` is the Thread whose
+    /// saved Ring 3 context the controller holds; its execution pin must be the
+    /// only pin on the destination root for the whole transaction.
+    #[cfg(feature = "memory-object-runtime-test")]
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn map_memory_backing_suspended(
+        &mut self,
+        space: &mut UserSpace,
+        owner: neu_kernel::node::ThreadId,
+        grant: &logic::MemoryMapAuthority,
+        offset: usize,
+        base: u64,
+        pages: usize,
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.member_boundary(space)?;
+        let slot = owner.index();
+        if space.user_owners.get(slot) != Some(&Some(owner))
+            || space
+                .stacks
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_none_or(|s| !s.pinned || s.binding.thread != owner)
+            || self.registry.pins(space.id)? != 1
+        {
+            return Err(Error::NotOwned);
+        }
+        self.map_memory_backing_at(
+            space,
+            grant,
+            offset,
+            base,
+            pages,
+            permissions,
+            logic::Boundary::Suspended,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn map_memory_backing_at(
+        &mut self,
+        space: &mut UserSpace,
+        grant: &logic::MemoryMapAuthority,
+        offset: usize,
+        base: u64,
+        pages: usize,
+        permissions: Permissions,
+        boundary: logic::Boundary,
+    ) -> Result<()> {
         if space.teardown != UserTeardown::Live || !space.prepared {
             return Err(Error::NotOwned);
         }
-        self.registry.can_allocate(space.id)?;
+        self.registry.check_map_boundary(space.id, boundary)?;
         self.verify_user(space)?;
         // The low 64 KiB is reserved for the embedded image and Thread guards.
         logic::user_range(base, pages)?;
@@ -1071,16 +1142,28 @@ impl Paging<'_, '_> {
         for index in &logic::indices(WINDOW)?[..3] {
             control = self.memory.read(control, *index)? & ADDRESS_FIELD;
         }
-        if let Err(error) = logic::map_memory_object(
-            &tree,
-            &mut self.memory,
-            &mut self.registry,
-            grant,
-            offset,
-            base,
-            pages,
-            permissions,
-        ) {
+        if let Err(error) = match boundary {
+            logic::Boundary::Exclusive => logic::map_memory_object(
+                &tree,
+                &mut self.memory,
+                &mut self.registry,
+                grant,
+                offset,
+                base,
+                pages,
+                permissions,
+            ),
+            logic::Boundary::Suspended => logic::map_memory_object_suspended(
+                &tree,
+                &mut self.memory,
+                &mut self.registry,
+                grant,
+                offset,
+                base,
+                pages,
+                permissions,
+            ),
+        } {
             assert!(
                 self.memory.tables.map(|t| t.physical) == old && self.stats() == before,
                 "shared mapping rollback changed table ownership"
@@ -1107,13 +1190,22 @@ impl Paging<'_, '_> {
         self.verify_user(space)
             .expect("shared mapping inventory verification");
         for i in 0..pages {
-            logic::validate_memory_object_mapping(
-                &tree,
-                &self.memory,
-                &self.registry,
-                space.id,
-                base + i as u64 * PAGE,
-            )
+            match boundary {
+                logic::Boundary::Exclusive => logic::validate_memory_object_mapping(
+                    &tree,
+                    &self.memory,
+                    &self.registry,
+                    space.id,
+                    base + i as u64 * PAGE,
+                ),
+                logic::Boundary::Suspended => logic::validate_memory_object_mapping_suspended(
+                    &tree,
+                    &self.memory,
+                    &self.registry,
+                    space.id,
+                    base + i as u64 * PAGE,
+                ),
+            }
             .expect("committed shared leaf");
         }
         Ok(())
@@ -1519,6 +1611,17 @@ impl Paging<'_, '_> {
         }
         let mapping = self.registry.mapping_for(space.id, address)?;
         self.registry.physical(mapping.frame)
+    }
+    #[cfg(feature = "memory-object-runtime-test")]
+    pub fn user_translate(&self, space: &UserSpace, address: u64) -> Result<Option<Translation>> {
+        if self.registry.root(space.id)? != space.root {
+            return Err(Error::NotOwned);
+        }
+        PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        }
+        .translate(&self.memory, address)
     }
     /// Preflight failures retain the live token for retry. Once teardown
     /// begins, an unexpected error leaves it permanently non-retryable.

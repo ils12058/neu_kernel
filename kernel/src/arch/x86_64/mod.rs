@@ -10,6 +10,8 @@ pub mod exceptions;
 pub mod interrupts;
 #[cfg(feature = "memory-object-cap-test")]
 pub mod memory_object_cap;
+#[cfg(feature = "memory-object-runtime-test")]
+pub mod memory_object_runtime;
 #[cfg(feature = "multi-test")]
 pub mod multithread;
 #[cfg(feature = "native-test")]

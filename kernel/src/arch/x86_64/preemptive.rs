@@ -471,6 +471,13 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                 .map_err(|_| Error::Corrupt)?;
             }
             SliceEvent::Exited(reason) => {
+                // The one-shot user timer stays armed across the syscall or fault
+                // that ends this slice. Controller-only teardown can outlast it,
+                // leaving a tick pending in IRR before the peer re-arms, so stop
+                // it here and drain at most one already-pending tick through the
+                // bounded kernel-context window.
+                interrupts::stop_user();
+                settle()?;
                 let mut slot = mailbox();
                 if !slot.empty() {
                     slot.terminal(owner).map_err(|_| Error::Corrupt)?;
@@ -518,6 +525,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<()> {
                     bootstrap::survivor(paging, &nodes, &queue, &b)?;
                 }
             }
+            #[cfg(feature = "memory-object-runtime-test")]
+            SliceEvent::Requested(_) => return Err(Error::Corrupt),
             SliceEvent::Yield(_) | SliceEvent::Blocked(_) => return Err(Error::Corrupt),
         }
     }
@@ -601,7 +610,7 @@ pub(super) fn stop(paging: &mut Paging<'_, '_>) -> Result<u64> {
     interrupts::shutdown_user(paging).map_err(|_| Error::Corrupt)?;
     Ok(COUNT.load(Ordering::Acquire))
 }
-#[cfg(feature = "multi-test")]
+#[cfg(feature = "preempt-test")]
 pub(super) fn settle() -> Result<()> {
     // A terminal SYSCALL can leave a real timer pending while FMASK holds IF=0.
     // Route only this bounded common-stack window through the legacy non-

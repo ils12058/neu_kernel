@@ -191,3 +191,13 @@ test-memory-object-user-xapic = ["memory-object-live-test"]
 # K8B: MemoryObject capability authority, transfer and cross-registry lifetime.
 memory-object-cap-test = ["memory-object-live-test", "cap-move-test"]
 test-memory-object-cap = ["memory-object-cap-test"]
+
+# K8C: runtime mapping authorized by a capability received over a Channel.
+memory-object-runtime-test = ["memory-object-cap-test"]
+test-memory-object-runtime = ["memory-object-runtime-test"]
+test-memory-object-runtime-writable = ["memory-object-runtime-test"]
+test-memory-object-runtime-rights = ["memory-object-runtime-test"]
+test-memory-object-runtime-read-denied = ["memory-object-runtime-test"]
+test-memory-object-runtime-fault = ["memory-object-runtime-test"]
+test-memory-object-runtime-peer-exit = ["memory-object-runtime-test"]
+test-memory-object-runtime-cancel = ["memory-object-runtime-test"]

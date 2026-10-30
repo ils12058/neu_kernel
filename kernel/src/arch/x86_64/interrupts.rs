@@ -693,7 +693,7 @@ pub(super) fn user_in_service(vector: u8) -> bool {
     bitmap(0x100, vector)
 }
 
-#[cfg(feature = "multi-test")]
+#[cfg(feature = "preempt-test")]
 pub(super) fn settle_user_pending() -> Result<(), &'static str> {
     if flags() & 0x600 != 0
         || paging::current_root() != ROOT.load(Ordering::Acquire)

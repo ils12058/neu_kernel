@@ -168,6 +168,10 @@ pub enum SliceEvent {
     Yield(Frame),
     Preempted(Frame),
     Blocked(Frame),
+    /// A validated mapping request is pending; the controller owns the saving
+    /// Thread and its destination root until it resumes or cancels it.
+    #[cfg(feature = "memory-object-runtime-test")]
+    Requested(Frame),
     Exited(crate::node::ExitReason),
 }
 const _: () = assert!(core::mem::size_of::<Frame>() == 160);

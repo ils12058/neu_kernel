@@ -494,6 +494,7 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
             && (abi::v05::owns(before.rax)
                 || before.rax == abi::v05::TEST_READ
                 || before.rax == abi::ABI_QUERY)
+        || cfg!(feature = "memory-object-runtime-test") && before.rax == abi::v05::TEST_MAP
     {
         let active = s
             .binding
@@ -550,6 +551,31 @@ extern "C" fn neu_syscall(pointer: *mut Frame) {
         }
         #[cfg(not(feature = "channel-wait-test"))]
         Outcome::Blocked => fatal("blocked request without wait support"),
+        #[cfg(feature = "memory-object-runtime-test")]
+        Outcome::Request => {
+            let binding = s
+                .binding
+                .unwrap_or_else(|| fatal("mapping request without Thread publication"));
+            let _stack = s
+                .stack
+                .unwrap_or_else(|| fatal("mapping request without stack publication"));
+            if validate_native_return(frame.context, &contract, paging::current_root()).is_err() {
+                fatal("mapping request continuation contract");
+            }
+            s.event = Some(neu_kernel::context::SliceEvent::Requested(frame));
+            s.valid = true;
+            save(s);
+            serial::write(format_args!(
+                "[NEU] Switch request: node={} thread={} RIP={:#x} RSP={:#x} flags={:#x}\n",
+                binding.node.raw(),
+                binding.thread.raw(),
+                frame.context.rip,
+                frame.context.rsp,
+                frame.context.flags
+            ))
+            .unwrap_or_else(|_| super::halt());
+            terminal_exit(s, 103, 0);
+        }
         Outcome::Exit(status) => {
             serial::write(format_args!(
                 "[NEU] Native thread_exit: status={}\n",

@@ -50,9 +50,11 @@ FEATURES = {"boot": None, "panic": "test-panic", "missing-map": "test-missing-me
 MEMORY_OBJECT_CASES = memory_object_qmp.CASES
 LIVE_CASES = memory_object_qmp.LIVE_CASES
 MEMORY_CAP_CASES = memory_object_qmp.CAP_CASES
+RUNTIME_CASES = memory_object_qmp.RUNTIME_CASES
 FEATURES.update({name: "test-" + name for name in MEMORY_OBJECT_CASES})
 FEATURES.update({name: "test-" + name for name in LIVE_CASES})
 FEATURES.update({name: "test-" + name for name in MEMORY_CAP_CASES})
+FEATURES.update({name: "test-" + name for name in RUNTIME_CASES})
 USER_CASES = {name: index for index, name in enumerate(("user", "user-kernel", "user-readonly", "user-nx", "user-unmapped", "user-privileged", "user-gate", "user-guard"))}
 NATIVE_CASES = {name: index for index, name in enumerate(("native", "native-unknown", "native-exit-invalid", "native-return-rip", "native-return-rsp", "native-return-flags", "native-return-selectors", "native-disabled"))}
 NODE_CASES = {name:index for index,name in enumerate(("nodes","nodes-a-fault","nodes-b-fault","nodes-cross","nodes-reclaim","nodes-rollback"))}
@@ -395,6 +397,10 @@ for name in LIVE_CASES:
 for name in MEMORY_CAP_CASES:
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Cap baseline:",
         "[NEU] Cap checkpoint: stage=9\n", "[NEU] MemoryObject capability test passed:",
+        "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
+for name in RUNTIME_CASES:
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Runtime baseline:",
+        "[NEU] Runtime checkpoint: stage=1 ", "[NEU] MemoryObject runtime test passed:",
         "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
 EXPECT['memory-object-fail-stop'] = (COMMON + PROTOCOL + OWNED + PAGING +
     ['[NEU] Memory checkpoint: stage=8 ', '[NEU] PANIC:', 'memory-object mapping rollback failed'],
@@ -2822,6 +2828,93 @@ def check_cap(case, text, symbols, observation):
                 'allocated': int(baseline[1]), 'free': int(baseline[2]), 'tables': int(baseline[3])}}
 
 
+def check_runtime(case, text, symbols, observation):
+    if case not in RUNTIME_CASES:
+        return None
+    mode = RUNTIME_CASES.index(case)
+    checkpoints = [(int(m[1]), int(m[2])) for m in re.finditer(
+        r"\[NEU\] Runtime checkpoint: stage=(\d+) mode=(\d+)\n", text)]
+    if [stage for stage, _ in checkpoints] != list(range(11)) or any(
+            value != mode for _, value in checkpoints):
+        raise Failure("Runtime checkpoints differ from the bounded eleven-stage model.")
+    baseline = re.search(r"\[NEU\] Runtime baseline: mode=(\d+) order=(\d+) allocated=(\d+) "
+                         r"free=(\d+) tables=(\d+) root=(0x[0-9a-f]+)\n", text)
+    if not baseline or int(baseline[1]) != mode:
+        raise Failure("Runtime baseline profile/accounting is missing.")
+    order = int(baseline[2])
+    if order != (1 if mode in (0, 2, 4, 5) else 2):
+        raise Failure("Runtime teardown order differs from the profile model.")
+    if observation is None:
+        raise Failure("Missing independent stopped-CPU runtime evidence.")
+    stages = [snapshot['stage'] for snapshot in observation['checkpoints']]
+    if stages != list(range(11)) or observation['mode'] != mode or observation['name'] != case:
+        raise Failure("Independent runtime evidence is missing a checkpoint or names another profile.")
+    first = observation['checkpoints'][0]
+    first_tables = sum(bool(table['physical']) for table in first['tables'])
+    if (int(baseline[3]), int(baseline[4]), int(baseline[5]), int(baseline[6], 16)) != (
+            first['allocator']['allocated'], first['allocator']['free'], first_tables,
+            first['descriptor'][3]):
+        raise Failure("Runtime baseline serial line differs from stopped-CPU accounting.")
+    identity = observation['checkpoints'][2]['descriptor']
+    nodes = {1: identity[9], 3: identity[10], 4: identity[10]}
+    threads = {1: identity[13], 3: identity[14], 4: identity[15]}
+    spaces = {1: identity[11], 3: identity[12], 4: identity[12]}
+    roots = {1: observation['checkpoints'][2]['spaces'][0]['root'],
+             3: observation['checkpoints'][2]['spaces'][1]['root'],
+             4: observation['checkpoints'][2]['spaces'][1]['root']}
+    selected = list(re.finditer(r"\[NEU\] Runtime selected: sequence=(\d+) label=(\d+) "
+                                r"node=(\d+) thread=(\d+) root=(0x[0-9a-f]+) fresh=(true|false)\n", text))
+    if not selected:
+        raise Failure("Runtime fixture recorded no dispatches.")
+    allowed = {1, 3, 4} if mode == 5 else {1, 3}
+    seen = set()
+    last_selected = {}
+    for index, match in enumerate(selected, 1):
+        sequence, label = int(match[1]), int(match[2])
+        if sequence != index or label not in allowed:
+            raise Failure("Runtime dispatch sequence/label is not the expected runnable order.")
+        if (int(match[3]), int(match[4]), int(match[5], 16)) != (
+                nodes[label], threads[label], roots[label]):
+            raise Failure("Runtime dispatch named a foreign Node/Thread/root.")
+        if (match[6] == 'true') != (label not in seen):
+            raise Failure("Runtime dispatch freshness differs from the first-selection model.")
+        seen.add(label)
+        last_selected[label] = match.end()
+    outcomes = [(int(m[1]), int(m[2]), m[3]) for m in re.finditer(
+        r"\[NEU\] Runtime outcome: label=(\d+) thread=(\d+) reason=(\w+)\n", text)]
+    ended = {}
+    for match in re.finditer(r"\[NEU\] Runtime outcome: label=(\d+) thread=(\d+) reason=(\w+)\n", text):
+        if int(match[1]) in ended:
+            raise Failure("A runtime Thread reported more than one terminal outcome.")
+        ended[int(match[1])] = match.start()
+    if any(position > ended.get(label, len(text)) for label, position in last_selected.items()):
+        raise Failure("A terminated runtime Thread was dispatched again.")
+    wanted = {1: 'normal'}
+    if mode == 2:
+        wanted[3] = 'fault'
+    elif mode == 5:
+        wanted[4] = 'fault'
+    else:
+        wanted[3] = 'normal'
+    if len(outcomes) != len(wanted) or {label: reason for label, _, reason in outcomes} != wanted:
+        raise Failure("Runtime Thread outcomes differ from the fault/teardown model.")
+    if any(thread != threads[label] for label, thread, _ in outcomes):
+        raise Failure("Runtime outcome named a foreign Thread.")
+    if mode != 5 and any(label == 4 for label, _, _ in outcomes):
+        raise Failure("A construction-retired Thread reported a runtime outcome.")
+    passed = re.search(r"\[NEU\] MemoryObject runtime test passed: mode=(\d+) order=(\d+) "
+                       r"dispatches=(\d+) captures=(\d+) allocations=restored\n", text)
+    if (not passed or int(passed[1]) != mode or int(passed[2]) != order
+            or int(passed[3]) != len(selected)):
+        raise Failure("Runtime completion line differs from the observed dispatches.")
+    backing = observation['backing']
+    return {'mode': mode, 'name': case, 'order': order, 'stages': stages,
+            'dispatches': len(selected), 'captures': int(passed[4]),
+            'outcomes': {str(label): reason for label, reason in wanted.items()},
+            'backing': backing['physical'] if isinstance(backing, dict) else backing,
+            'allocator': first['allocator']}
+
+
 def check_fault(case, text, symbols):
     if case not in FAULTS:
         return None
@@ -2907,6 +3000,10 @@ def run_case(case, esp, timeout):
                 cap_snapshots = []
                 if case in MEMORY_CAP_CASES:
                     result["memory_object_cap_checkpoints"] = cap_snapshots
+                runtime_observation = None
+                runtime_snapshots = []
+                if case in RUNTIME_CASES:
+                    result["memory_object_runtime_checkpoints"] = runtime_snapshots
                 user_observation = None
                 native_observation = None
                 node_observations = {}
@@ -2938,6 +3035,11 @@ def run_case(case, esp, timeout):
                         cap_observation = memory_object_qmp.observe_cap(qmp, serial, symbols, started + timeout,
                             debug_words, native_register, Failure, cap_snapshots, MEMORY_CAP_CASES.index(case), esp / "boot/neu-kernel")
                         result["memory_object_cap"] = cap_observation
+                    if case in RUNTIME_CASES and runtime_observation is None and "[NEU] Runtime checkpoint:" in transcript(serial):
+                        if qmp is None: qmp = QMP(endpoint, started + timeout)
+                        runtime_observation = memory_object_qmp.observe_runtime(qmp, serial, symbols, started + timeout,
+                            debug_words, native_register, Failure, runtime_snapshots, RUNTIME_CASES.index(case), esp / "boot/neu-kernel")
+                        result["memory_object_runtime"] = runtime_observation
                     if case in USER_CASES and user_observation is None and "User space ready:" in transcript(serial):
                         qmp = QMP(endpoint, started + timeout)
                         user_observation = observe_user(qmp, serial, case, symbols, started + timeout)
@@ -2990,7 +3092,7 @@ def run_case(case, esp, timeout):
                             if sequence not in multi_observations and re.search(r"Switch native ready:.*fresh=(true|false)\n",episode):
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,{**records[label],'peer':selected[8]=='true'},started+timeout,cap_state)
-                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES else 0.05)
+                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES or case in RUNTIME_CASES else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -3031,9 +3133,12 @@ def run_case(case, esp, timeout):
                     raise Failure("Missing independent stopped-CPU live checkpoints.")
                 if case in MEMORY_CAP_CASES and cap_observation is None:
                     raise Failure("Missing independent stopped-CPU capability checkpoints.")
+                if case in RUNTIME_CASES and runtime_observation is None:
+                    raise Failure("Missing independent stopped-CPU runtime mapping checkpoints.")
                 fault = check_fault(case, text, symbols)
                 live_evidence = check_live(case, text, symbols, live_observation) if case in LIVE_CASES else None
                 cap_evidence = check_cap(case, text, symbols, cap_observation) if case in MEMORY_CAP_CASES else None
+                runtime_evidence = check_runtime(case, text, symbols, runtime_observation) if case in RUNTIME_CASES else None
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
                 nodes = check_nodes(case,text,symbols,node_observations) if case in NODE_CASES else None
@@ -3075,7 +3180,7 @@ def run_case(case, esp, timeout):
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
                 ipc=check_ipc(case,text,symbols,members,cap_state) if case in MOVE_CASES else check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence, memory_object_cap_evidence=cap_evidence)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence, memory_object_cap_evidence=cap_evidence, memory_object_runtime_evidence=runtime_evidence)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:

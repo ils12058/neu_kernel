@@ -119,6 +119,47 @@ impl Queue {
         }
         model.reblock(active, saved)
     }
+    /// Suspends a Thread that issued a validated request. It leaves the FIFO
+    /// and stays runnable without being queued, so the controller can hold the
+    /// destination root for the mapping transaction.
+    pub fn request(
+        &mut self,
+        model: &mut Nodes,
+        active: ActiveContext,
+        saved: crate::context::SavedContext,
+    ) -> node::Result<()> {
+        if self.contains(active.thread) {
+            return Err(node::Error::InUse);
+        }
+        model.request(active, saved)
+    }
+    /// Publishes the committed continuation and re-admits the Thread through
+    /// the ordinary enqueue transaction.
+    pub fn resume(
+        &mut self,
+        model: &mut Nodes,
+        active: ActiveContext,
+        saved: crate::context::SavedContext,
+    ) -> node::Result<()> {
+        if self.contains(active.thread) {
+            return Err(node::Error::InUse);
+        }
+        model.resume_request(active, saved)?;
+        self.enqueue(model, active.thread)
+    }
+    /// Terminal cancellation of a suspended request. The Thread never becomes
+    /// admissible again.
+    pub fn cancel_request(
+        &mut self,
+        model: &mut Nodes,
+        active: ActiveContext,
+        outcome: ExitReason,
+    ) -> node::Result<()> {
+        if self.contains(active.thread) {
+            return Err(node::Error::InUse);
+        }
+        model.cancel_request(active, outcome)
+    }
     /// Admission of a woken blocked Thread. No duplicate enqueue and no stale
     /// generation can pass because the model validates identity and state.
     pub fn wake(&mut self, model: &mut Nodes, id: ThreadId) -> node::Result<()> {
@@ -504,5 +545,73 @@ mod tests {
         assert_eq!(m.thread(a).unwrap().state, ThreadState::Blocked);
         assert_eq!(m.thread(b).unwrap().state, ThreadState::Blocked);
         assert_eq!(q.len(), 0);
+    }
+    #[test]
+    fn requested_safe_point_keeps_the_fifo_empty_for_that_thread_until_resume() {
+        let (mut m, _, mut q, a, b) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        assert_eq!(d.active.thread, a);
+        let saved = blocked(&d);
+        q.request(&mut m, d.active, saved).unwrap();
+        let t = m.thread(a).unwrap();
+        assert_eq!(t.state, ThreadState::Runnable);
+        assert_eq!(t.saved, Some(saved));
+        assert!(t.stack.is_some());
+        assert!(!t.queued && !q.contains(a));
+        assert_eq!(q.len(), 1);
+        assert!(m.active().is_none());
+        // Only the owning controller may take the safe point, exactly once.
+        assert_eq!(
+            q.request(&mut m, d.active, saved),
+            Err(node::Error::Association)
+        );
+        q.resume(&mut m, d.active, saved).unwrap();
+        assert!(q.contains(a));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.resume(&mut m, d.active, saved), Err(node::Error::InUse));
+        let mut admissions = 0;
+        for _ in 0..2 {
+            let next = q.next(&mut m).unwrap().unwrap();
+            if next.active.thread == a {
+                admissions += 1;
+                assert_eq!(next.saved, saved);
+            } else {
+                assert_eq!(next.active.thread, b);
+            }
+            q.yielded(&mut m, next.active, yielded(&next)).unwrap();
+        }
+        assert_eq!(admissions, 1);
+    }
+    #[test]
+    fn canceled_request_is_terminal_and_never_resumes_or_dispatches() {
+        let (mut m, _, mut q, a, b) = pair();
+        let d = q.next(&mut m).unwrap().unwrap();
+        let saved = blocked(&d);
+        q.request(&mut m, d.active, saved).unwrap();
+        let outcome = node::ExitReason::Cancelled { by: b };
+        q.cancel_request(&mut m, d.active, outcome).unwrap();
+        let t = m.thread(a).unwrap();
+        assert_eq!(t.state, ThreadState::Exited);
+        assert_eq!(t.outcome, Some(outcome));
+        assert!(t.saved.is_none());
+        assert!(t.stack.is_some());
+        assert!(!t.queued && !q.contains(a));
+        assert_eq!(
+            q.resume(&mut m, d.active, saved),
+            Err(node::Error::Association)
+        );
+        assert_eq!(
+            q.cancel_request(&mut m, d.active, outcome),
+            Err(node::Error::State)
+        );
+        // The canceled Node is terminal; its sibling Node keeps running.
+        assert_eq!(m.node(t.node).unwrap().state, NodeState::Exited);
+        assert_eq!(m.node(t.node).unwrap().outcome, Some(outcome));
+        for _ in 0..3 {
+            let next = q.next(&mut m).unwrap().unwrap();
+            assert_eq!(next.active.thread, b);
+            q.yielded(&mut m, next.active, yielded(&next)).unwrap();
+        }
+        assert!(!q.contains(a));
     }
 }

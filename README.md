@@ -5,37 +5,41 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K8 / Phase 8B makes the MemoryObject a real capability-governed resource.
-Trusted setup retains one paging reference, installs a generation-checked
-Node-local MemoryObject capability, and maps the object through that capability
-before execution. Node A moves the capability over the existing Channel
-`SEND_CAP`/`RECEIVE_CAP` operations and exits; Node B receives the exact object
-identity and rights. Teardown drains the single reference exactly once, and the
-stopped-CPU oracle verifies handles, queue state, rights, mappings, Ring 3
-frames and the final allocator/table inventory.
+K8 / Phase 8C lets a running Node map a received MemoryObject capability at a
+scheduler safe point. Trusted setup creates one two-page object; Node A sends the
+capability over the existing Channel `SEND_CAP`/`RECEIVE_CAP` operations; Node B
+receives the exact object identity and rights, issues a bounded `TEST_MAP`
+request, is suspended with its Ring 3 context owned by the scheduler, and the
+kernel installs a new mapping from the received handle before resuming it. The
+stopped-CPU oracle verifies the pending/committed request ledger, raw capability
+slots, physical backing bytes, user PTE rights, the saved Ring 3 frame, genuine
+read-only-fault evidence and the exact final allocator/table inventory.
 
-**Nodes execute. Capabilities authorize. MemoryObjects share real backing.**
+**Nodes execute. Capabilities authorize. MemoryObjects share real backing —
+including mappings created at runtime from a received capability.**
 
-Current validation is **236 host tests and 143 unique QEMU scenarios**, including
-138 earlier regressions, four live Ring 3 profiles, the new
-`memory-object-cap` transfer profile and five focused host tests. The live and
-transfer cases require stopped-CPU QMP evidence: raw capability slots, Channel
-FIFO transfers, physical backing bytes, user PTE rights, saved Ring 3 frames and
-exact final allocator restoration (serial output alone is insufficient).
-[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
-observer corrections. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
+Current validation is **240 host tests and 150 unique QEMU scenarios**, including
+236 earlier host regressions, 143 earlier QEMU scenarios, four new suspended-
+boundary/request-lifecycle host tests and seven `memory-object-runtime-*`
+profiles. The live, transfer and runtime cases require stopped-CPU QMP evidence:
+raw capability slots, Channel FIFO transfers, physical backing bytes, user PTE
+rights, saved Ring 3 frames and exact final allocator restoration (serial output
+alone is insufficient). [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+records the evidence and observer corrections. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
 covers the backing/lifetime foundation; [ADR 0023](docs/adr/0023-live-userspace-memoryobject-sharing.md)
 covers live sharing and fault containment; [ADR 0024](docs/adr/0024-memoryobject-capability-authority-and-transfer.md)
-covers capability authority, transfer and cross-registry lifetime; [the QMP
-protocol](docs/testing/memory-object-qmp.md) explains the raw production-state
+covers capability authority, transfer and cross-registry lifetime;
+[ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md) covers the scheduler
+safe point, suspended-boundary runtime mapping and terminal cancellation; [the
+QMP protocol](docs/testing/memory-object-qmp.md) explains the raw production-state
 checks.
 
 Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
 the baselines. K7 capability movement and Channel behavior retain their earlier
 contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
 [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
-MemoryObject syscalls, runtime mapping from a received capability, derivation,
-revocation, mmap, SMP, TLB shootdown, COW and demand paging remain future work.
+MemoryObject syscalls, a public mmap/munmap API, derivation, revocation, SMP, TLB
+shootdown, COW and demand paging remain future work.
 
 The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
 transactions, integer-only execution, fixed metadata pools and guarded private

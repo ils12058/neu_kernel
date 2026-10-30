@@ -128,7 +128,14 @@ const _: () = assert!(
         + cfg!(feature = "test-channels-wait-close-send") as u8
         + cfg!(feature = "test-channels-wait-fault") as u8
         + cfg!(feature = "test-channels-wait-deadlock") as u8
-        + cfg!(feature = "test-channels-wait-xapic") as u8)
+        + cfg!(feature = "test-channels-wait-xapic") as u8
+        + cfg!(feature = "test-memory-object-runtime") as u8
+        + cfg!(feature = "test-memory-object-runtime-writable") as u8
+        + cfg!(feature = "test-memory-object-runtime-rights") as u8
+        + cfg!(feature = "test-memory-object-runtime-read-denied") as u8
+        + cfg!(feature = "test-memory-object-runtime-fault") as u8
+        + cfg!(feature = "test-memory-object-runtime-peer-exit") as u8
+        + cfg!(feature = "test-memory-object-runtime-cancel") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
