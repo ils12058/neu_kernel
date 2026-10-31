@@ -86,6 +86,12 @@ impl fmt::Write for Writer {
 }
 
 pub fn write(arguments: fmt::Arguments<'_>) -> fmt::Result {
+    // COM1 is BSP-owned. An application processor that reached this point made
+    // a programming error; parking is the only safe, non-sharing response.
+    #[cfg(feature = "smp-test")]
+    if !super::smp::is_bsp() {
+        super::smp::silent_park();
+    }
     use fmt::Write;
     Writer { remaining: 1024 }.write_fmt(arguments)
 }
@@ -93,6 +99,10 @@ pub fn write(arguments: fmt::Arguments<'_>) -> fmt::Result {
 /// Best effort even if initialization or normal formatting failed. At most
 /// 512 bytes, 4096 status polls per byte, no heap, locks, or scheduler operations.
 pub fn emergency(arguments: fmt::Arguments<'_>) {
+    #[cfg(feature = "smp-test")]
+    if !super::smp::is_bsp() {
+        super::smp::silent_park();
+    }
     use fmt::Write;
     let _ = Writer { remaining: 512 }.write_fmt(arguments);
 }

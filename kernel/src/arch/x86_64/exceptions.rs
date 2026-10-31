@@ -118,20 +118,14 @@ pub fn initialize() -> Result<(), &'static str> {
     // BSP/IF=0 grants exclusive initialization. Packed TSS fields use unaligned
     // writes; descriptors remain live after GDTR/IDTR/TR retain their addresses.
     unsafe {
-        ptr::write_unaligned(
-            ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(),
+        build_kernel_tss(
+            TSS.0.get().cast::<u8>(),
             ptr::addr_of!(__stack_top) as u64,
+            df_top,
         );
-        ptr::write_unaligned(ptr::addr_of_mut!((*TSS.0.get()).ist).cast::<u64>(), df_top);
         let base = TSS.0.get() as u64;
         let gdt = GDT.0.get().cast::<u64>();
-        ptr::write(gdt.add(1), 0x00af_9a00_0000_ffff); // 64-bit kernel code.
-        ptr::write(gdt.add(2), 0x00cf_9200_0000_ffff); // Kernel data.
-        ptr::write(
-            gdt.add(3),
-            103 | ((base & 0xff_ffff) << 16) | (0x89 << 40) | (((base >> 24) & 0xff) << 56),
-        );
-        ptr::write(gdt.add(4), base >> 32);
+        build_kernel_gdt(gdt, base);
         #[cfg(feature = "user-test")]
         {
             // Preserve selector 0x28 as an invalid descriptor for the old #GP
@@ -158,6 +152,161 @@ pub fn initialize() -> Result<(), &'static str> {
             base: idt as u64,
         };
         asm!("lidt [{}]", in(reg) &descriptor, options(readonly, nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "smp-test")]
+pub(super) struct Tables {
+    pub(super) gdt_base: u64,
+    pub(super) gdt_limit: u64,
+    pub(super) tss_base: u64,
+    pub(super) tss_limit: u64,
+    pub(super) idt_base: u64,
+    pub(super) idt_limit: u64,
+}
+
+/// Copies the initialized BSP descriptor-table addresses into the SMP backend.
+#[cfg(feature = "smp-test")]
+pub(super) fn tables() -> Tables {
+    Tables {
+        gdt_base: GDT.0.get() as u64,
+        gdt_limit: (mem::size_of::<[u64; GDT_ENTRIES]>() - 1) as u64,
+        tss_base: TSS.0.get() as u64,
+        tss_limit: (mem::size_of::<Tss>() - 1) as u64,
+        idt_base: IDT.0.get() as u64,
+        idt_limit: (mem::size_of::<[Gate; 256]>() - 1) as u64,
+    }
+}
+
+/// Writes the kernel selectors and the TSS descriptor. Code and data entries
+/// deliberately match the BSP so every CPU executes the same flat segments.
+///
+/// # Safety
+/// `destination` must name at least five writable, mapped `u64` slots.
+pub(super) unsafe fn build_kernel_gdt(destination: *mut u64, tss_base: u64) {
+    unsafe {
+        ptr::write(destination.add(1), 0x00af_9a00_0000_ffff); // 64-bit kernel code.
+        ptr::write(destination.add(2), 0x00cf_9200_0000_ffff); // Kernel data.
+        ptr::write(
+            destination.add(3),
+            103 | ((tss_base & 0xff_ffff) << 16) | (0x89 << 40) | (((tss_base >> 24) & 0xff) << 56),
+        );
+        ptr::write(destination.add(4), tss_base >> 32);
+    }
+}
+
+/// Initializes a 104-byte ring-0 TSS with the given RSP0 and IST1.
+///
+/// # Safety
+/// `destination` must name 104 writable, mapped bytes that are not in use.
+pub(super) unsafe fn build_kernel_tss(destination: *mut u8, rsp0: u64, ist1: u64) {
+    unsafe {
+        ptr::write_bytes(destination, 0, mem::size_of::<Tss>());
+        ptr::write_unaligned(
+            destination.add(mem::offset_of!(Tss, rsp)).cast::<u64>(),
+            rsp0,
+        );
+        ptr::write_unaligned(
+            destination.add(mem::offset_of!(Tss, ist)).cast::<u64>(),
+            ist1,
+        );
+        // An I/O bitmap base beyond the limit denies every CPL3 port access.
+        ptr::write_unaligned(
+            destination.add(mem::offset_of!(Tss, iomap)).cast::<u16>(),
+            mem::size_of::<Tss>() as u16,
+        );
+    }
+}
+
+/// Copies the complete exception-IDT image for a CPU-private table.
+///
+/// # Safety
+/// `destination` must name 4096 writable, mapped bytes.
+#[cfg(feature = "smp-test")]
+pub(super) unsafe fn copy_kernel_idt(destination: *mut u8) {
+    unsafe {
+        ptr::copy_nonoverlapping(
+            IDT.0.get().cast::<u8>(),
+            destination,
+            mem::size_of::<[Gate; 256]>(),
+        );
+    }
+}
+
+/// Loads AP-private GDTR/IDTR/TR and verifies the CPU readback. The GDT is
+/// initialized by the BSP before release and never shared with another CPU.
+#[cfg(feature = "smp-test")]
+pub(super) fn load_ap_tables(gdt_base: u64, idt_base: u64) -> Result<(), &'static str> {
+    let expected_gdt_limit = (mem::size_of::<[u64; GDT_ENTRIES]>() - 1) as u16;
+    let expected_idt_limit = (mem::size_of::<[Gate; 256]>() - 1) as u16;
+    if gdt_base & 15 != 0 || idt_base & 15 != 0 {
+        return Err("SMP descriptor table alignment");
+    }
+    let gdt = Descriptor {
+        limit: expected_gdt_limit,
+        base: gdt_base,
+    };
+    let idt = Descriptor {
+        limit: expected_idt_limit,
+        base: idt_base,
+    };
+    let mut gdtr = Descriptor { limit: 0, base: 0 };
+    let mut idtr = Descriptor { limit: 0, base: 0 };
+    let tr: u16;
+    // SAFETY: AP execution, IF=0, private prepared tables. `neu_load_gdt`
+    // performs the far return into selector 0x08 and loads TR 0x18; the
+    // descriptor operands are live AP-stack locals.
+    unsafe {
+        neu_load_gdt(&gdt);
+        asm!("lidt [{}]", in(reg) &idt, options(readonly, nostack, preserves_flags));
+        asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack, preserves_flags));
+        asm!("sidt [{}]", in(reg) &mut idtr, options(nostack, preserves_flags));
+        asm!("str {0:x}", out(reg) tr, options(nomem, nostack, preserves_flags));
+    }
+    if gdtr.limit != expected_gdt_limit
+        || gdtr.base != gdt_base
+        || idtr.limit != expected_idt_limit
+        || idtr.base != idt_base
+        || tr != 0x18
+    {
+        return Err("SMP descriptor table readback");
+    }
+    Ok(())
+}
+
+/// Verifies an application processor's private TSS descriptor and fields from
+/// the AP endpoint that will use them. The BSP wrote these tables first.
+#[cfg(feature = "smp-test")]
+pub(super) fn verify_ap_tables(
+    gdt_base: u64,
+    tss_base: u64,
+    rsp0: u64,
+    ist1: u64,
+) -> Result<(), &'static str> {
+    // SAFETY: The BSP prepared these AP-private tables, both are mapped in the
+    // active root, and this CPU is at Ring 0; the reads have no side effects.
+    let (low, high, actual_rsp, actual_ist, iomap) = unsafe {
+        let gdt = gdt_base as *const u64;
+        (
+            ptr::read(gdt.add(3)),
+            ptr::read(gdt.add(4)),
+            ptr::read_unaligned((tss_base + mem::offset_of!(Tss, rsp) as u64) as *const u64),
+            ptr::read_unaligned((tss_base + mem::offset_of!(Tss, ist) as u64) as *const u64),
+            ptr::read_unaligned((tss_base + mem::offset_of!(Tss, iomap) as u64) as *const u16),
+        )
+    };
+    let decoded = ((low >> 16) & 0xff_ffff) | (((low >> 56) & 0xff) << 24) | (high << 32);
+    // LTR marks the type field busy (0x9 -> 0xB) in the in-memory descriptor.
+    let access = (low >> 40) as u8;
+    if low as u16 != mem::size_of::<Tss>() as u16 - 1
+        || decoded != tss_base
+        || (access != 0x89 && access != 0x8b)
+        || actual_rsp != rsp0
+        || actual_ist != ist1
+        || usize::from(iomap) != mem::size_of::<Tss>()
+    {
+        return Err("SMP AP TSS descriptor or fields are invalid");
     }
     Ok(())
 }
@@ -217,6 +366,12 @@ extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
         asm!("mov {}, rsp", out(reg) handler_rsp, options(nomem, nostack, preserves_flags));
         ptr::read(frame)
     };
+    #[cfg(feature = "smp-test")]
+    if !super::smp::is_bsp() {
+        // The AP records its own raw frame in its per-CPU block and parks
+        // silently; it never reaches the BSP's fatal serial/global path.
+        super::smp::ap_fault(&frame, cr2, handler_rsp);
+    }
     #[cfg(feature = "user-test")]
     if (frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18)) || frame.vector == 128 {
         // The complete trusted frame is copied. User termination is a separate

@@ -201,3 +201,18 @@ test-memory-object-runtime-read-denied = ["memory-object-runtime-test"]
 test-memory-object-runtime-fault = ["memory-object-runtime-test"]
 test-memory-object-runtime-peer-exit = ["memory-object-runtime-test"]
 test-memory-object-runtime-cancel = ["memory-object-runtime-test"]
+
+# K9A Phase 9A: genuine SMP bootstrap images. Each profile fixes the expected
+# processor count at build time and parks every released AP before the BSP
+# continues; the single-CPU test subsystems are excluded by design.
+smp-test = []
+smp-one = ["smp-test"]
+smp-two = ["smp-test"]
+smp-four = ["smp-test"]
+
+test-smp-bootstrap-1 = ["smp-one"]
+test-smp-bootstrap-2 = ["smp-two"]
+test-smp-bootstrap-4 = ["smp-four"]
+test-smp-cpu-identity = ["smp-four"]
+test-smp-ap-isolation = ["smp-four"]
+test-smp-bootstrap-reject = ["smp-two"]

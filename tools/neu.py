@@ -19,6 +19,7 @@ import tempfile
 import time
 
 import memory_object_qmp
+import smp_qmp
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -94,6 +95,9 @@ FEATURES['native-abi03-disabled']='test-native-abi03-disabled';NATIVE_CASES['nat
 FEATURES['native-abi04-disabled']='test-native-abi04-disabled';NATIVE_CASES['native-abi04-disabled']=1
 AS_CASES+=('address-space-channel-disabled',)
 FEATURES['address-space-channel-disabled']='test-address-space-channel-disabled'
+SMP_CASES = smp_qmp.CASES
+SMP_REJECT = smp_qmp.REJECT
+FEATURES.update({name: "test-" + name for name in (*SMP_CASES, *SMP_REJECT)})
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -193,9 +197,10 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
-                    "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high"):
+                    "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high",
+                    "__text_start", "__text_end", "__data_start", "__rodata_start"):
                 symbols[label] = value
     if symbols.get("__stack_top", 0) - symbols.get("__stack_bottom", 0) != 65536:
         raise Failure("Kernel ELF is missing its 64 KiB stack.")
@@ -255,6 +260,63 @@ def elf_info(path):
     if "neu_cap_syscall_site" in symbols:
         address=symbols["neu_cap_syscall_site"];segment=next((item for item in loads if item[3]<=address<item[3]+item[5]),None)
         if segment is None or data[segment[2]+address-segment[3]:segment[2]+address-segment[3]+2]!=b"\x0f\x05":raise Failure("Capability requests must use an actual SYSCALL instruction.")
+    if "neu_smp_cpus" in symbols:
+        for name in ("neu_smp_layout", "neu_smp_released", "neu_smp_park_begin", "neu_smp_park_end",
+                     "neu_smp_ap_entry1", "neu_smp_ap_entry2", "neu_smp_ap_entry3",
+                     "__text_start", "__text_end"):
+            if name not in symbols:
+                raise Failure("SMP image is missing its published symbol " + name)
+        if symbols["neu_smp_cpus"] & 63:
+            raise Failure("SMP per-CPU array is not 64-byte aligned.")
+        text = symbols["__text_start"], symbols["__text_end"]
+        inside = lambda value: text[0] <= value < text[1]
+        for name in ("neu_halt_begin", "neu_halt_end", "neu_smp_park_begin", "neu_smp_park_end",
+                     "neu_smp_ap_entry1", "neu_smp_ap_entry2", "neu_smp_ap_entry3"):
+            if not inside(symbols[name]):
+                raise Failure("SMP entry or halt/park loop is outside the executable text.")
+        if not symbols["neu_halt_begin"] < symbols["neu_halt_end"] or not symbols["neu_smp_park_begin"] < symbols["neu_smp_park_end"]:
+            raise Failure("SMP halt or park loop symbols are invalid.")
+        layout_address = symbols["neu_smp_layout"]
+        layout_segment = next((item for item in loads if item[3] <= layout_address < item[3] + item[5]), None)
+        if layout_segment is None:
+            raise Failure("SMP per-CPU layout witness is not inside a LOAD segment.")
+        layout_offset = layout_segment[2] + layout_address - layout_segment[3]
+        if struct.unpack_from("<4Q", data, layout_offset) != (0x4e45555f43505531, 4, 48, 384):
+            raise Failure("SMP per-CPU publication layout is not the documented one.")
+        start, end = symbols["__kernel_start"], symbols["__kernel_end"]
+        arenas = []
+        entries = []
+        for index in (1, 2, 3):
+            prefix = f"neu_smp_ap{index}_"
+            bottom, top = symbols[prefix + "stack_bottom"], symbols[prefix + "stack_top"]
+            ist_bottom, ist_top = symbols[prefix + "ist_bottom"], symbols[prefix + "ist_top"]
+            guard_low, guard_mid, guard_ist = (symbols[prefix + "guard_low"], symbols[prefix + "guard_mid"],
+                                               symbols[prefix + "guard_ist"])
+            gdt, tss, idt = symbols[prefix + "gdt"], symbols[prefix + "tss"], symbols[prefix + "idt"]
+            if top - bottom != 16384 or ist_top - ist_bottom != 8192:
+                raise Failure("SMP AP arena size changed.")
+            if guard_low + 4096 != bottom or guard_mid != top or ist_bottom != guard_mid + 4096 or guard_ist != ist_top:
+                raise Failure("SMP AP arenas are not bounded by adjacent guard pages.")
+            if any(value & 4095 for value in (bottom, ist_bottom, guard_low, guard_mid, guard_ist, idt)):
+                raise Failure("SMP AP stack, guard, or IDT is not page-aligned.")
+            if gdt & 15 or tss & 7 or idt & 15:
+                raise Failure("SMP AP descriptor table alignment is invalid.")
+            if min(bottom, ist_bottom, gdt, tss, idt) < start or max(top, ist_top, idt + 4096, tss + 104, gdt + 64) > end:
+                raise Failure("SMP AP resources are outside the kernel image.")
+            entry = symbols[f"neu_smp_ap_entry{index}"]
+            if not inside(entry):
+                raise Failure("SMP AP entry is outside the executable text.")
+            entries.append(entry)
+            arenas += [(guard_low, guard_low + 4096, "guard"), (bottom, top, "stack"),
+                       (guard_mid, guard_mid + 4096, "guard"), (ist_bottom, ist_top, "ist"),
+                       (guard_ist, guard_ist + 4096, "guard"), (gdt, gdt + 64, "gdt"),
+                       (tss, tss + 104, "tss"), (idt, idt + 4096, "idt")]
+        for index, (low, high, name) in enumerate(arenas):
+            for other_low, other_high, other in arenas[:index]:
+                if low < other_high and other_low < high:
+                    raise Failure(f"SMP AP {name} overlaps AP {other}.")
+        if entries != sorted(entries) or len(set(entries)) != 3:
+            raise Failure("SMP AP entry order changed.")
     return {"entry": header[4], "symbols": symbols, "load_segments": len(loads)}
 
 
@@ -306,14 +368,14 @@ def firmware():
     raise Failure("No x86-64 OVMF pair found. Set OVMF_CODE and OVMF_VARS; see implementation documentation.")
 
 
-def qemu_command(esp, temporary, serial, qmp=None):
+def qemu_command(esp, temporary, serial, qmp=None, cpus=1):
     code, template = firmware()
     variables = temporary / "vars.fd"
     shutil.copyfile(template, variables)  # Each boot gets disposable NVRAM.
     runtime_esp = temporary / "esp"
     shutil.copytree(esp, runtime_esp)  # Freeze files while vvfat is serving them.
     arguments = [str(require("qemu-system-x86_64")), "-machine", "q35", "-accel", "tcg",
-                 "-cpu", "max", "-smp", "1", "-m", "512M", "-display", "none",
+                 "-cpu", "max", "-smp", str(cpus), "-m", "512M", "-display", "none",
                  "-monitor", "none", "-serial", serial, "-nic", "none", "-boot", "strict=on",
                  "-no-reboot", "-no-shutdown",
                  "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={code}",
@@ -438,6 +500,21 @@ for name, kind in NATIVE_CASES.items():
         "[NEU] Native teardown verified:", f"[NEU] Native ABI test passed: kind={kind}",
         "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
         EXPECT["boot"][1] + ["verified=false", "User execution test passed:"])
+
+
+for name, count in SMP_CASES.items():
+    parked = [f"[NEU] SMP AP parked: logical={logical} " for logical in range(1, count)]
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
+        f"[NEU] SMP topology: cpus={count} aps={count - 1} bsp_apic=",
+        f"[NEU] SMP bootstrap armed: expected={count} released={count - 1}"] + PAGING + parked + [
+        f"[NEU] SMP bootstrap complete: cpus={count} aps={count - 1} released={count - 1} parked={count - 1}",
+        "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
+        EXPECT["boot"][1])
+for name in SMP_REJECT:
+    EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
+        "[NEU] BOOT FAILURE: SMP processor count does not match the configured 2-CPU profile"],
+        PAGING + ["[NEU] SMP topology:", "[NEU] SMP bootstrap armed:", "[NEU] SMP AP parked:",
+                  "[NEU] Kernel bootstrap successful", "[NEU] PANIC:", "[NEU] EXCEPTION:"])
 
 
 def user_ready(text, case):
@@ -2977,7 +3054,7 @@ def run_case(case, esp, timeout):
     with tempfile.TemporaryDirectory(prefix="neu-", dir="/tmp") as directory:
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
-        arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint)
+        arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint, smp_qmp.CPUS.get(case, 1))
         if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic","memory-object-user-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
@@ -3101,7 +3178,7 @@ def run_case(case, esp, timeout):
                     if not match:
                         raise Failure("Missing loader-root rollback proof.")
                     paging = {"root": int(match[1], 16), "mode": "loader root retained after rollback"}
-                elif case != "missing-map":
+                elif case != "missing-map" and case not in SMP_REJECT:
                     match = re.search(r"Kernel paging activated: CR3=(0x[0-9a-f]+) old=(0x[0-9a-f]+) tables=(\d+)", transcript(serial))
                     if not match or int(match[1], 16) == int(match[2], 16) or int(match[3]) < 4:
                         raise Failure("Missing a distinct, owned CR3 transition.")
@@ -3173,6 +3250,8 @@ def run_case(case, esp, timeout):
                     cap_state['final_move_accounting']=final
                 if case == 'memory-object-fail-stop':
                     result['expected_fail_stop'] = memory_object_qmp.verify_fail_stop(qmp, memory_snapshots[-1], debug_words, Failure)
+                if case in SMP_CASES or case in SMP_REJECT:
+                    result["smp"] = smp_qmp.observe(qmp, case, symbols, paging["root"] if paging else None, Failure)
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")

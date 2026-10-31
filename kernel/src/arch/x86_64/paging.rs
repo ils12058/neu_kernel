@@ -41,6 +41,10 @@ pub fn guards() -> [u64; 4] {
     ]
 }
 fn image_guard(address: u64) -> bool {
+    #[cfg(feature = "smp-test")]
+    if super::smp::is_guard(address) {
+        return true;
+    }
     #[cfg(feature = "native-test")]
     if super::native::guards().contains(&address) {
         return true;

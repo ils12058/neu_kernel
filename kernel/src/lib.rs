@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod cpu;
 pub mod memory;
 pub mod node;
 pub mod paging;

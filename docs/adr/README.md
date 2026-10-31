@@ -281,3 +281,19 @@ spanning authorization and commit, makes cancellation terminal and replay-safe,
 and keeps every fixed pool and ABI 0.5. It does not accept a public mapping ABI,
 mmap, derivation, revocation, SMP or TLB shootdown. ADRs 0022–0024 remain
 accepted for their scopes and are not rewritten.
+
+## K9 / Phase 9A record — SMP bootstrap and per-CPU foundations
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0026: SMP bootstrap and per-CPU foundations](0026-smp-bootstrap-and-percpu-foundations.md) | Accepted for bounded Phase 9A; genuine 2-/4-vCPU AP entry, private per-CPU state and stopped-CPU evidence verified | NEU-003; NEU-004; NEU-005; NEU-011; NEU-018; NEU-020; NEU-021; NEU-023; NEU-024 |
+
+ADR 0026 starts real application processors into kernel entry code with
+dense logical identities, CPU-local GS-base blocks, unique stacks, private
+GDT/TSS/IDT tables, a documented five-state publication and a bounded park,
+while every existing single-CPU subsystem stays BSP-owned. It does not accept
+concurrent Ring 3 scheduling, migration, per-CPU run queues, AP preemption, IPI
+or TLB shootdown, concurrent allocation or capability mutation. Architecture
+v0.2, ABI 0.5 and ADRs 0005–0025 remain in force; K9B/K9C own the concurrent
+kernel work.
+

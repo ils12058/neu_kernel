@@ -26,6 +26,8 @@ pub mod paging;
 #[cfg(feature = "preempt-test")]
 pub mod preemptive;
 pub mod serial;
+#[cfg(feature = "smp-test")]
+pub mod smp;
 #[cfg(feature = "user-test")]
 #[cfg_attr(
     any(feature = "memory-object-test", feature = "memory-object-live-test"),
@@ -42,6 +44,12 @@ unsafe extern "C" {
 }
 
 pub fn halt() -> ! {
+    // Application processors never share the BSP's halt contract or serial
+    // state; they park on the CPU-local halt loop instead.
+    #[cfg(feature = "smp-test")]
+    if !smp::is_bsp() {
+        smp::silent_park();
+    }
     // SAFETY: Ring 0 entry is guaranteed by the loader. This assembly routine
     // disables interrupts and repeatedly halts; it cannot return to its caller.
     unsafe { neu_halt_begin() }

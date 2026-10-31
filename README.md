@@ -5,46 +5,59 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K8 / Phase 8C lets a running Node map a received MemoryObject capability at a
-scheduler safe point. Trusted setup creates one two-page object; Node A sends the
-capability over the existing Channel `SEND_CAP`/`RECEIVE_CAP` operations; Node B
-receives the exact object identity and rights, issues a bounded `TEST_MAP`
-request, is suspended with its Ring 3 context owned by the scheduler, and the
-kernel installs a new mapping from the received handle before resuming it. The
-stopped-CPU oracle verifies the pending/committed request ledger, raw capability
-slots, physical backing bytes, user PTE rights, the saved Ring 3 frame, genuine
-read-only-fault evidence and the exact final allocator/table inventory.
+K9 / Phase 9A adds a bounded SMP bootstrap foundation. The pinned Limine 12.9.4
+SMP request discovers the configured 1-, 2- or 4-vCPU topology; the BSP
+publishes a fixed per-CPU array, releases each application processor into a real
+kernel entry stub with its own stack and private GDT/TSS/IDT, and each AP
+validates its CPUID identity, privileged state, tables, GS-base block and
+canaries before switching to the verified owned root and parking with
+interrupts disabled. The BSP independently verifies every AP's publication and
+the whole-VM QMP oracle reads production blocks, live vCPU registers,
+descriptor tables, local-APIC state and address translations while the VM is
+stopped. **Multiple CPUs enter the kernel; one CPU still owns kernel state.**
+Every existing scheduler, capability, paging, Channel, frame-allocator,
+preemption, timer and serial subsystem remains BSP-only.
 
-**Nodes execute. Capabilities authorize. MemoryObjects share real backing —
-including mappings created at runtime from a received capability.**
+K8 / Phase 8C remains the latest Node/capability milestone: a running Node maps
+a received MemoryObject capability at a scheduler safe point. Trusted setup
+creates one two-page object; Node A sends the capability over the existing
+Channel `SEND_CAP`/`RECEIVE_CAP` operations; Node B receives the exact identity
+and rights, issues a bounded `TEST_MAP` request, is suspended with its Ring 3
+context owned by the scheduler, and the kernel installs a new mapping from the
+received handle before resuming it.
 
-Current validation is **240 host tests and 150 unique QEMU scenarios**, including
-236 earlier host regressions, 143 earlier QEMU scenarios, four new suspended-
-boundary/request-lifecycle host tests and seven `memory-object-runtime-*`
-profiles. The live, transfer and runtime cases require stopped-CPU QMP evidence:
-raw capability slots, Channel FIFO transfers, physical backing bytes, user PTE
-rights, saved Ring 3 frames and exact final allocator restoration (serial output
-alone is insufficient). [Implementation status](docs/IMPLEMENTATION_STATUS.md)
-records the evidence and observer corrections. [ADR 0022](docs/adr/0022-memoryobject-backing-and-lifetime.md)
-covers the backing/lifetime foundation; [ADR 0023](docs/adr/0023-live-userspace-memoryobject-sharing.md)
-covers live sharing and fault containment; [ADR 0024](docs/adr/0024-memoryobject-capability-authority-and-transfer.md)
-covers capability authority, transfer and cross-registry lifetime;
-[ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md) covers the scheduler
-safe point, suspended-boundary runtime mapping and terminal cancellation; [the
-QMP protocol](docs/testing/memory-object-qmp.md) explains the raw production-state
-checks.
+**Nodes execute. Capabilities authorize. MemoryObjects share real backing. APs
+enter, prove themselves and park.**
+
+Current validation is **253 host tests and 156 QEMU scenario executions** (154
+unique: the 150-scenario Phase 8C baseline plus `smp-bootstrap-1`,
+`smp-bootstrap-2`, `smp-bootstrap-4` and `smp-bootstrap-reject`;
+`smp-cpu-identity` and `smp-ap-isolation` re-execute the 4-CPU path for their
+named observer checks). The live, transfer and runtime cases and every SMP
+profile require stopped-CPU QMP evidence; serial output alone is insufficient.
+[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
+observer corrections. [ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md)
+covers the SMP bootstrap and per-CPU foundations; [ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md)
+covers the scheduler safe point, suspended-boundary runtime mapping and
+terminal cancellation; [the SMP QMP protocol](docs/testing/smp-qmp.md) and
+[the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) explain the
+raw production-state checks.
 
 Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
 the baselines. K7 capability movement and Channel behavior retain their earlier
 contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
 [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
-MemoryObject syscalls, a public mmap/munmap API, derivation, revocation, SMP, TLB
-shootdown, COW and demand paging remain future work.
+MemoryObject syscalls, a public mmap/munmap API, derivation, revocation,
+concurrent Ring 3 scheduling, per-CPU run queues, migration, AP preemption, IPI
+and TLB shootdown, concurrent allocation or capability mutation, COW and demand
+paging remain future work.
 
-The supported model remains one CPU, user-only LAPIC preemption, IF=0 kernel
-transactions, integer-only execution, fixed metadata pools and guarded private
-Thread stacks. The platform remains QEMU 11.0.0 TCG/q35, one CPU/512 MiB,
-UEFI/OVMF, Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon.
+The supported execution model is one CPU owning kernel state, user-only LAPIC
+preemption, IF=0 kernel transactions, integer-only execution, fixed metadata
+pools and guarded private Thread stacks. Legacy images boot one vCPU; the SMP
+profiles boot the configured 1, 2 or 4 vCPUs. The platform remains QEMU 11.0.0
+TCG/q35, 512 MiB, UEFI/OVMF, Rust 1.95.0 and Limine 12.9.4/base 6 on Apple
+Silicon.
 
 ## Build and run
 
@@ -117,6 +130,15 @@ for Node A's exit while B still reads, or `--case memory-object-user-xapic` for
 the live contract on the legacy controller fallback. These four cases fail unless
 their stopped-CPU QMP evidence matches the raw production state.
 
+Run `python3 tools/neu.py test --case smp-bootstrap-1`, `--case smp-bootstrap-2`
+or `--case smp-bootstrap-4` to boot the genuine 1-, 2- or 4-vCPU SMP profiles;
+the tool selects the matching `-smp` count. `--case smp-bootstrap-reject` boots
+four vCPUs against the 2-CPU image and must fail the count check before any AP
+is released. `--case smp-cpu-identity` and `--case smp-ap-isolation` re-run the
+4-CPU path for their named observer checks. Every SMP case fails unless the
+stopped-CPU QMP evidence matches the published per-CPU blocks, live registers,
+descriptor tables, local-APIC state and translations.
+
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
@@ -125,6 +147,8 @@ their stopped-CPU QMP evidence matches the raw production state.
 - [Experimental scalar Channel ABI 0.3](docs/abi/experimental-v0.3.md)
 - [Experimental native ABI 0.2](docs/abi/experimental-v0.2.md)
 - [Architecture Decision Records](docs/adr/README.md)
+- [SMP bootstrap QMP evidence](docs/testing/smp-qmp.md)
+- [MemoryObject QMP evidence](docs/testing/memory-object-qmp.md)
 - [Implementation status, commands, and verification](docs/IMPLEMENTATION_STATUS.md)
 
 ADRs explain why architectural choices exist. Implementation documentation

@@ -241,6 +241,12 @@ extern "C" fn neu_main() -> ! {
         );
     }
     let hhdm = info.hhdm_offset;
+    // Release the application processors onto the loader root before the owned
+    // tables exist; they wait there until `finish` publishes a verified root.
+    #[cfg(feature = "smp-test")]
+    if let Err(reason) = arch::smp::prepare() {
+        fail(reason);
+    }
     if cfg!(feature = "test-paging-bootstrap-failure") {
         let before = allocator.stats();
         let old_root = arch::paging::current_root();
@@ -276,6 +282,12 @@ extern "C" fn neu_main() -> ! {
         paging.table_count()
     );
     log!("[NEU] Kernel mappings verified: RX text, R rodata, RW/NX data, 4 guards\n");
+    // Publish the owned root only after the BSP proves every per-CPU arena is
+    // mapped, then wait for each AP to report a complete parked transition.
+    #[cfg(feature = "smp-test")]
+    if let Err(reason) = arch::smp::finish(&paging) {
+        fail(reason);
+    }
     if cfg!(feature = "test-paging") {
         if let Err(error) = paging.self_test() {
             arch::serial::emergency(format_args!(
@@ -403,6 +415,10 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    #[cfg(feature = "smp-test")]
+    if !arch::smp::is_bsp() {
+        arch::smp::silent_park();
+    }
     if PANICKING.swap(true, Ordering::Relaxed) {
         arch::serial::emergency(format_args!("[NEU] PANIC: recursive panic; halting\n"));
         arch::halt();

@@ -1,5 +1,171 @@
 # Neu Kernel implementation status
 
+## K9 / Phase 9A — complete for bounded SMP bootstrap and per-CPU foundations (2026-10-31)
+
+Baseline was `6cdb6ef0207473e7173e883bb50e6fcf79b95d38` on `main`. Phase 9A
+starts genuine application processors into real Neu kernel entry code on
+`-smp 2` and `-smp 4`, gives each CPU a trustworthy identity and private
+privileged state, proves that state from both the BSP and stopped-CPU QMP
+observation, and parks every AP without exposing any existing single-CPU kernel
+subsystem to concurrent execution. [ADR 0026](adr/0026-smp-bootstrap-and-percpu-foundations.md)
+accepts only this bounded bootstrap foundation. Architecture v0.2, ABI 0.5 and
+all fixed pools are unchanged; there is no ABI 0.6.
+
+### Limine SMP handoff and topology
+
+The project keeps the pinned Limine 12.9.4 binary, base revision 6 and protocol
+reference `3a0526b7…`, and adds the standard SMP request with xAPIC (not
+x2APIC). The response must have revision 0, no unknown flags and no x2APIC
+flag. `smp-one`, `smp-two` and `smp-four` fix the expected processor count at
+1, 2 and 4; the discovered count must match exactly. The CPU pointer array and
+every `mp_info` descriptor are validated as higher-half, aligned handoff memory.
+APIC IDs must be below 256, the BSP descriptor must agree with CPUID, and APIC
+and processor identities must be unique; zero, duplicate, out-of-range,
+already-released or inconsistent descriptions fail before any per-CPU
+publication.
+
+Logical indices are dense and independent of hardware identities: the BSP is
+logical 0 and APs are assigned 1.. in ascending APIC ID order. `MAX_CPUS` is a
+fixed 4. No code derives an array index from an APIC ID.
+
+### Per-CPU publication and identity
+
+`neu_smp_cpus` is a fixed four-entry array of 64-byte-aligned, 384-byte blocks
+(48 documented `u64` fields each) with magic `0x4e45_555f_4350_5531`;
+`neu_smp_layout` publishes `[magic, 4, 48, 384]`. Each block records the
+logical index, BSP flag, APIC/processor/CPUID identities, bootstrap state and
+history, stack/IST and GDT/TSS/IDT addresses and limits, CR0/CR3/CR4/EFER/
+RFLAGS/APIC base/GS base, entry/ready/park stack pointers, park count,
+canaries, self-test bitmap, fault record, loader handshake values and the
+isolation bitmap. The scheduler-local word is a reserved placeholder and stays
+zero; Phase 9A has no per-CPU run queue.
+
+CPU identity is a CPU-local GS base pointing at the block, validated by magic
+and offset. Before an AP publishes GS (including early faults), identity falls
+back to CPUID APIC matching. There is no global mutable `current_cpu`. The GS
+base survives interrupts on the same CPU and is never migrated because no AP
+runs a Thread; any future migration boundary must reload or re-derive it.
+
+### State machine and ordering
+
+Every CPU publishes `Uninitialized → Prepared → Entered → Ready → Parked` with a
+Release state store, Relaxed documented fields and a history bitmask; `Failed`
+is terminal. `cpu::ap_wait` accepts only `Parked` with history bits 1–4 or a
+failed CPU. The BSP completes every block's static fields and validates all
+arenas before writing any loader `goto_address`; APs therefore never see a
+partially initialized block. The owned root is published separately through
+`OWNED_ROOT` only after the BSP has translated every AP stack, IST, GDT, TSS
+and IDT in the new root and proved every guard page is absent. APs wait on an
+Acquire load with a bounded counter, record a timeout as `Failed`, then switch
+roots and verify CR3 before publishing `Ready`. No AP release uses a shared
+lock or an IPI.
+
+### Independent AP entry and private state
+
+Each AP has its own assembly stub: `cli`/`cld`, save the loader RSP, load its
+own 16 KiB stack, then call Rust with its logical index and loader stack. The
+Rust entry validates its block, records loader RSP/CR3 and the MP descriptor,
+matches CPUID/descriptor identities and the release RIP, validates CR0/CR4/
+EFER/RFLAGS (paging, long mode, write-protect, no x2APIC, no task switch,
+IF=0), proves RSP is inside its own stack, loads and reads back a private GDT,
+IDT and TSS (`TR=0x18`, RSP0 and IST1 in its arena, I/O bitmap denying user
+ports), establishes the GS-base block identity, validates the non-BSP xAPIC
+base, advances to `Entered`, waits for the owned root, switches and verifies
+CR3, checks both canaries, and publishes `Ready` then `Parked` before halting
+with IF=0.
+
+Each failure records a distinct code and parks silently. An AP exception stores
+vector, error, RIP and handler RSP in its own block and parks; it never touches
+the BSP fatal record, panic path or COM1. The AP stanza reserves page-aligned
+4 KiB guard, 16 KiB stack, 4 KiB guard, 8 KiB IST, 4 KiB guard, 64-byte GDT,
+104-byte TSS and 4 KiB IDT per possible AP; guard pages are skipped by the
+owned-root image mapping. The BSP keeps its 64 KiB stack and 32 KiB IST.
+
+### Isolation, APIC and interrupt boundaries
+
+All SMP images are compile-time isolated from every single-CPU test subsystem.
+APs execute only the entry, local self-tests, root switch and park loop; they do
+not enter the scheduler, syscall path, paging construction, preemption,
+Channel, capability, Node or frame-allocation code and do not write serial.
+`is_bsp()` gates COM1, panic, fatal faults and the halt contract, and APs park
+instead. The AP fault path is separate. Local-APIC timer policy remains
+BSP-only: the BSP's Limine-programmed timer stays masked, AP LVTT entries stay
+masked, AP timer counters stay zero, and no AP timer tick or IPI exists. No TLB
+shootdown is implemented or claimed.
+
+The audited BSP-only blockers for K9B are unchanged: the frame bitmap
+allocator, paging registry/current root, scheduler FIFO and Thread contexts,
+Node/capability registries, Channel state, preemption mailbox, local-APIC timer
+policy and the serial/panic/fault path. No global was made `Sync` and no
+existing subsystem gained an AP caller.
+
+### Profiles and independent evidence
+
+Six stopped-CPU profiles are registered:
+
+| Case | vCPUs | Proves |
+| --- | --- | --- |
+| `smp-bootstrap-1` | 1 | SMP foundation on the legacy single-CPU path; no AP, no release |
+| `smp-bootstrap-2` | 2 | One real AP enters, self-tests, switches root and parks |
+| `smp-bootstrap-4` | 4 | Three real APs with unique identities, stacks and tables |
+| `smp-bootstrap-reject` | 4 | 4 vCPUs against the 2-CPU profile fail the count check before publication |
+| `smp-cpu-identity` | 4 | Re-runs the 4-CPU path for the identity assertions |
+| `smp-ap-isolation` | 4 | Re-runs the 4-CPU path for the isolation assertions |
+
+`smp-cpu-identity` and `smp-ap-isolation` execute the same guest path as
+`smp-bootstrap-4`; they are not additional unique scenarios.
+
+The QMP oracle (`tools/smp_qmp.py`) stops the whole VM, requires `paused`, and
+reads the layout witness, all four blocks and the release counter from
+production memory. It resolves QMP's own `apic-id` per vCPU through QOM and
+matches the published identities; reads live RIP/RSP/CR0/CR3/CR4/EFER/RFLAGS/
+GS/GDTR/IDTR/TR/CS; requires the BSP in Neu's halt loop and each AP in the park
+loop with HLT=1, CPL=0 and IF=0; verifies CR3 is the observed owned root and
+CR0/CR4/EFER equal the publication; checks the local-APIC SPIV enable bit,
+masked LVTT on every CPU and zero AP timer counters; requires every BSP and AP
+guard page to be unmapped and every stack/IST bottom to map to a distinct
+frame; and proves all per-CPU arenas and descriptor tables disjoint. The reject
+profile additionally proves that no block or release was published, exactly one
+BSP is halted in Neu on the loader root, and every other vCPU is outside kernel
+text with no per-CPU identity. Guest serial lines are never accepted.
+
+### Validation and explicit non-claims
+
+`make doctor`, `make check` and `make build` passed. The host suite passed
+**253 tests** (240 Phase 8C baseline plus 13 new `cpu` topology, state-machine,
+history and per-CPU region tests). The full QEMU suite passed **156 scenario
+executions (154 unique)**: the 150 Phase 8C scenarios plus `smp-bootstrap-1`,
+`smp-bootstrap-2`, `smp-bootstrap-4` and `smp-bootstrap-reject`; the two named
+4-CPU repetitions are not counted as unique. All six SMP profiles also passed
+individually in 1/2/4-vCPU VMs. Representative legacy profiles passed again
+individually: `preempt`, `nodes-b-fault`, `cap-moves`, `memory-object-cap` and
+`memory-object-runtime`. Repeats are not additional unique scenarios.
+
+Earlier full-suite attempts stopped on legacy timing-sensitive checks:
+`timer` calibration, a `channels-stress` QMP deadline, a `preempt` IRQ-frame
+observation and the legacy multi-Thread 64-dispatch bound in
+`capabilities-rollback`/`capabilities`. Each affected case passed individually
+with the unchanged 30-second timeout, and `capabilities-rollback` reproduced the
+same dispatch-bound failure on unmodified HEAD, so none is an SMP regression.
+macOS scheduled the TCG vCPU on efficiency cores under host load; the final
+clean full-suite run therefore used `/usr/sbin/taskpolicy -t 4 make test`, which
+changes host scheduling only. The harness, 30-second timeout, guest images and
+QMP assertions were unchanged, and the run passed 156/156.
+
+Full-suite and per-case evidence is retained under `build/k9a-*`:
+`k9a-full-test.log`, `k9a-full-test-results.json`, the individual
+`k9a-<case>.log` files, the rejected `k9a-*attempt*.log` files, the baseline
+reproduction `k9a-baseline-flake-capabilities-rollback.log` and
+`k9a-clean-build.log`. The retained `build/test-logs/<case>.serial.log` files
+and `build/test-results.json` are the ordinary per-run artifacts.
+
+Excluded: concurrent Ring 3 scheduling, shared or per-CPU run queues, Thread
+migration, load balancing, AP kernel preemption, remote TLB shootdown,
+concurrent frame allocation, concurrent capability mutation, general kernel
+preemption, IPIs, per-CPU timers, public MemoryObject syscalls, mmap/munmap,
+derivation, revocation, COW, demand paging, swap, huge pages and Linux
+compatibility. No hardware or hosted-CI validation is claimed.
+
 ## K8 / Phase 8C — complete for bounded runtime mapping from a received capability (2026-10-30)
 
 Baseline was `4f2d463ec1f13415180acd0442d4f43a066c948d` on
