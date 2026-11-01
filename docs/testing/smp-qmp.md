@@ -1,4 +1,4 @@
-# SMP bootstrap QMP evidence (bounded Phase 9A)
+# SMP QMP evidence (bounded Phase 9A and 9B)
 
 The `smp-*` images boot real application processors into Neu kernel entry code.
 The guest prints topology and park lines, but those lines are **not** evidence.
@@ -106,5 +106,95 @@ itself; the isolation claims are supported by the compile-time feature
 isolation, the explicit BSP gates on shared paths, the per-AP self-tests and
 the negative register/translation checks above. Host tests cover the
 host-testable topology and state-machine rules but do not execute SMP code.
-No IPI, TLB shootdown, per-CPU scheduler or concurrent allocator behavior is
-tested or claimed.
+The Phase 9A profiles do not test or claim IPI delivery, TLB shootdown, a
+per-CPU scheduler or concurrent allocation; the Phase 9B profiles below add
+work-mailbox and work-IPI evidence.
+
+# Cross-CPU work evidence (bounded Phase 9B)
+
+## Profiles
+
+| Case | vCPUs | Purpose |
+| --- | --- | --- |
+| `smp-work-2` | 2 | One AP accepts, executes and stops two different commands |
+| `smp-work-4` | 4 | Three APs concurrently execute different commands |
+| `smp-work-overlap` | 2 | BSP and AP run identical work across the two-phase gate |
+| `smp-work-repeat` | 2 | Three sequential commands with independent ordering |
+| `smp-work-invalid` | 2 | Six distinct negative rejections |
+| `smp-ipi-2` | 2 | Stage B xAPIC wakeup for every command |
+| `smp-ipi-4` | 4 | Stage B xAPIC wakeup for three APs |
+
+## Final stopped-CPU procedure
+
+After the guest reaches its idle marker, the existing Phase 9A observation runs
+first, then the work oracle reads:
+
+1. `neu_smp_work_layout`, required to equal `[1, 0x4e45_555f_574b_4531, 4, 32,
+   256, 24, 192, 4, 10]`.
+2. All four 32-word mailboxes at `neu_smp_work_mailboxes + logical * 256`.
+   Slots for the BSP and beyond the profile must be entirely zero.
+3. All sixteen journal slots at `neu_smp_work_journal` (four slots of ten words
+   per CPU, stride 80 bytes). Slots beyond each AP's plan must be zero.
+4. The nineteen evidence words at `neu_smp_work_evidence`.
+5. The 24-word gate at `neu_smp_work_gate`.
+
+Every running AP's mailbox must publish the matching magic, logical index and
+APIC ID from its Phase 9A block; final phase `Stopped`, state `Idle`, and exact
+`SEQUENCE = ACKED = EXECUTIONS = PUBLISH_ORDER = ACCEPT_SEQUENCE =
+ACCEPT_ORDER = COMPLETE_SEQUENCE = COMPLETE_ORDER = plan + 1`; execution mask
+`(1 << expected) - 1`; no failure or rejection; start RSP inside the AP's
+private stack; a reproducible stop command in the final command fields; and,
+for IPI profiles, `IPI_RECEIVED = IPI_EOIS = expected` with zero spurious. Poll
+profiles require all IPI counters zero.
+
+Every journal slot must match the profile plan exactly: sequence, kind, input,
+rounds, the Python-recomputed result and auxiliary word, the recomputed start
+and completion markers, and independent accept/complete order equal to the
+sequence. This proves the result values came from AP execution rather than a
+BSP publication.
+
+The evidence words must publish magic and ABI, mode (poll = 1, IPI = 2), the
+CPU count, total commands and per-AP commands, the stopped AP count, zero
+failure, six negative checks for `smp-work-invalid`, balanced IPI
+sent/received/EOI counts and zero spurious for IPI profiles, and, for the
+overlap profile, the recomputed BSP result/auxiliary, epoch 1, overlap mask
+`0b11` and release epoch 1.
+
+## Deterministic checkpoint
+
+For `smp-work-4`, `smp-ipi-4` and `smp-work-overlap` the runner stops the whole
+VM when the guest logs `[NEU] Work checkpoint:`. It requires:
+
+- the profile's exact vCPU count and distinct APIC identities;
+- the BSP inside `neu_smp_work_bsp_dwell_begin..end`;
+- every AP inside `neu_smp_work_ap_dwell_begin..end` (parallel) or
+  `neu_smp_work_gate_wait_begin..end` (overlap);
+- `CPL=0`, IF=0, CR3 equal to the owned root and a GS base that decodes to the
+  expected per-CPU block, covering every logical index 1..count-1 distinctly;
+- mailbox state `Executing`, sequence 1, accept order 1 and the correct start
+  marker, with no completion fields;
+- for overlap: gate phase `Checkpoint`, `RELEASE = 0`, `OVERLAP = 0b11`,
+  `ENTERED = READY = 1`, `DONE = 0`, and the BSP result not yet executed;
+- for parallel: an all-zero gate.
+
+The VM is resumed after the checkpoint. A printed `parallel=true` or a
+serial-only scalar is never accepted.
+
+## IPI-specific checks
+
+For `smp-ipi-*` the runner requires the `SMP work IPI armed` marker, the
+per-mailbox `IPI_RECEIVED`/`IPI_EOIS` counts above and the evidence totals.
+The QMP live-register checks additionally require the local APIC to be
+software-enabled with every LVT masked; the handler's in-service verification
+and one-EOI-per-IPI accounting are production code, and the oracle cross-checks
+their published counters rather than any serial claim.
+
+## Limits
+
+As in Phase 9A, only published production memory and architectural state are
+read. Mailbox and gate failures are distinguished by published error codes and
+the evidence words. Host tests cover the mailbox and barrier state machines but
+do not execute x86 SMP code; the multi-vCPU profiles are the execution
+evidence. Thread migration, per-CPU run queues, AP scheduling, remote TLB
+shootdown and concurrent allocator/capability mutation remain untested and
+unclaimed.

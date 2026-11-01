@@ -5,18 +5,28 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K9 / Phase 9A adds a bounded SMP bootstrap foundation. The pinned Limine 12.9.4
+K9 / Phase 9B adds bounded cross-CPU work with verified coordination. The BSP
+publishes generation-checked commands into fixed per-CPU mailboxes; each AP
+accepts, executes and completes exactly one command with its own logical index,
+APIC ID, sequence, markers and result, while the BSP validates and never writes
+completion state. Wakeup has two verified stages: bounded atomic polling with
+`pause`, and a dedicated xAPIC IPI vector whose handler runs only inside an
+explicit `sti; hlt; cli` idle window after the AP's private IDT, stack and GS
+identity are ready. A two-CPU profile proves true overlap at a synchronized
+two-phase gate, and the four-CPU profile dispatches distinct work to three APs
+without mailbox aliasing. Commands are never overwritten before
+acknowledgement, stale or replayed acknowledgements are rejected, and sequence
+exhaustion and invalid command types fail stop.
+
+K9 / Phase 9A remains the SMP bootstrap foundation: the pinned Limine 12.9.4
 SMP request discovers the configured 1-, 2- or 4-vCPU topology; the BSP
 publishes a fixed per-CPU array, releases each application processor into a real
 kernel entry stub with its own stack and private GDT/TSS/IDT, and each AP
 validates its CPUID identity, privileged state, tables, GS-base block and
 canaries before switching to the verified owned root and parking with
-interrupts disabled. The BSP independently verifies every AP's publication and
-the whole-VM QMP oracle reads production blocks, live vCPU registers,
-descriptor tables, local-APIC state and address translations while the VM is
-stopped. **Multiple CPUs enter the kernel; one CPU still owns kernel state.**
-Every existing scheduler, capability, paging, Channel, frame-allocator,
-preemption, timer and serial subsystem remains BSP-only.
+interrupts disabled. **Multiple CPUs execute bounded kernel work; the BSP still
+owns kernel state.** Every existing scheduler, capability, paging, Channel,
+frame-allocator, preemption, timer and serial subsystem remains BSP-only.
 
 K8 / Phase 8C remains the latest Node/capability milestone: a running Node maps
 a received MemoryObject capability at a scheduler safe point. Trusted setup
@@ -27,17 +37,20 @@ context owned by the scheduler, and the kernel installs a new mapping from the
 received handle before resuming it.
 
 **Nodes execute. Capabilities authorize. MemoryObjects share real backing. APs
-enter, prove themselves and park.**
+bootstrap, execute bounded work and coordinate with verified IPIs.**
 
-Current validation is **253 host tests and 156 QEMU scenario executions** (154
-unique: the 150-scenario Phase 8C baseline plus `smp-bootstrap-1`,
-`smp-bootstrap-2`, `smp-bootstrap-4` and `smp-bootstrap-reject`;
-`smp-cpu-identity` and `smp-ap-isolation` re-execute the 4-CPU path for their
-named observer checks). The live, transfer and runtime cases and every SMP
-profile require stopped-CPU QMP evidence; serial output alone is insufficient.
-[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the evidence and
-observer corrections. [ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md)
-covers the SMP bootstrap and per-CPU foundations; [ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md)
+Current validation is **275 host tests and 163 QEMU scenario executions** (161
+unique: the 154-scenario Phase 9A baseline plus `smp-work-2`, `smp-work-4`,
+`smp-work-overlap`, `smp-work-repeat`, `smp-work-invalid`, `smp-ipi-2` and
+`smp-ipi-4`; `smp-cpu-identity` and `smp-ap-isolation` re-execute the 4-CPU
+path for their named observer checks). The live, transfer and runtime cases and
+every SMP profile require stopped-CPU QMP evidence; serial output alone is
+insufficient. [Implementation status](docs/IMPLEMENTATION_STATUS.md) records
+the evidence and observer corrections.
+[ADR 0027](docs/adr/0027-smp-crosscpu-work-and-coordination.md) covers the
+cross-CPU work protocol, synchronization and IPI coordination;
+[ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md) covers the SMP
+bootstrap and per-CPU foundations; [ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md)
 covers the scheduler safe point, suspended-boundary runtime mapping and
 terminal cancellation; [the SMP QMP protocol](docs/testing/smp-qmp.md) and
 [the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) explain the
@@ -48,14 +61,17 @@ the baselines. K7 capability movement and Channel behavior retain their earlier
 contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
 [ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
 MemoryObject syscalls, a public mmap/munmap API, derivation, revocation,
-concurrent Ring 3 scheduling, per-CPU run queues, migration, AP preemption, IPI
-and TLB shootdown, concurrent allocation or capability mutation, COW and demand
-paging remain future work.
+concurrent Ring 3 scheduling, per-CPU run queues, Thread migration, load
+balancing, AP kernel preemption, remote TLB shootdown, concurrent allocation or
+capability mutation, general kernel preemption, COW and demand paging remain
+future work.
 
 The supported execution model is one CPU owning kernel state, user-only LAPIC
 preemption, IF=0 kernel transactions, integer-only execution, fixed metadata
 pools and guarded private Thread stacks. Legacy images boot one vCPU; the SMP
-profiles boot the configured 1, 2 or 4 vCPUs. The platform remains QEMU 11.0.0
+profiles boot the configured 1, 2 or 4 vCPUs. Phase 9B APs run only the
+isolated work loop and its IPI idle window; they never enter scheduler,
+capability, paging, Channel or serial code. The platform remains QEMU 11.0.0
 TCG/q35, 512 MiB, UEFI/OVMF, Rust 1.95.0 and Limine 12.9.4/base 6 on Apple
 Silicon.
 
@@ -139,6 +155,16 @@ is released. `--case smp-cpu-identity` and `--case smp-ap-isolation` re-run the
 stopped-CPU QMP evidence matches the published per-CPU blocks, live registers,
 descriptor tables, local-APIC state and translations.
 
+Run `python3 tools/neu.py test --case smp-work-2` for sequential work on one
+AP, `--case smp-work-4` for distinct parallel commands on three APs,
+`--case smp-work-overlap` for the two-CPU synchronized-gate overlap proof,
+`--case smp-work-repeat` for repeated commands on one AP, or
+`--case smp-work-invalid` for the six negative protocol checks. Run
+`--case smp-ipi-2` or `--case smp-ipi-4` for IPI-driven wakeup with per-AP
+vector 0xF0 accounting, exactly one EOI per IPI and zero spurious samples.
+Each case fails unless the stopped-VM QMP oracle matches the raw mailbox,
+journal, gate, evidence and live-register state.
+
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
@@ -147,7 +173,7 @@ descriptor tables, local-APIC state and translations.
 - [Experimental scalar Channel ABI 0.3](docs/abi/experimental-v0.3.md)
 - [Experimental native ABI 0.2](docs/abi/experimental-v0.2.md)
 - [Architecture Decision Records](docs/adr/README.md)
-- [SMP bootstrap QMP evidence](docs/testing/smp-qmp.md)
+- [SMP bootstrap and cross-CPU work QMP evidence](docs/testing/smp-qmp.md)
 - [MemoryObject QMP evidence](docs/testing/memory-object-qmp.md)
 - [Implementation status, commands, and verification](docs/IMPLEMENTATION_STATUS.md)
 

@@ -297,3 +297,19 @@ or TLB shootdown, concurrent allocation or capability mutation. Architecture
 v0.2, ABI 0.5 and ADRs 0005–0025 remain in force; K9B/K9C own the concurrent
 kernel work.
 
+## K9 / Phase 9B record — cross-CPU work, mailboxes and IPI coordination
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0027: Cross-CPU work, mailboxes and verified IPI coordination](0027-smp-crosscpu-work-and-coordination.md) | Accepted for bounded Phase 9B; genuine 2-/4-vCPU AP execution, exactly-once mailbox protocol, two-phase overlap barrier and xAPIC IPI wakeup verified from stopped-CPU state | NEU-003; NEU-004; NEU-005; NEU-011; NEU-018; NEU-020; NEU-021; NEU-023; NEU-024 |
+
+ADR 0027 keeps the BSP as the only publisher and each AP as the only executor
+of a fixed-capacity, sequence-checked mailbox, adds an AP-written journal, a
+two-phase barrier with an overlap witness and a documented `sti; hlt` idle
+window woken by xAPIC vector `0xF0` with a per-AP IST1 gate and one EOI. Every
+existing single-CPU registry stays BSP-owned; it does not accept Thread
+migration, per-CPU run queues, load balancing, AP execution of Node Threads,
+remote TLB shootdown, general kernel preemption or concurrent capability,
+frame or page-table mutation. Architecture v0.2, ABI 0.5 and ADRs 0005–0026
+remain in force.
+

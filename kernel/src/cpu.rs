@@ -355,6 +355,23 @@ pub fn ap_wait(state: Bootstrap, history: u64) -> Wait {
     }
 }
 
+/// Phase 9B readiness: the AP must have proven the complete bootstrap prefix
+/// but remains live for published work instead of parking.
+pub fn work_ready(state: Bootstrap, history: u64) -> Wait {
+    if state == Bootstrap::Failed {
+        return Wait::Failed;
+    }
+    if state != Bootstrap::Ready {
+        return Wait::Pending;
+    }
+    let required = Bootstrap::Prepared.bit() | Bootstrap::Entered.bit() | Bootstrap::Ready.bit();
+    if history & required == required {
+        Wait::Complete
+    } else {
+        Wait::Failed
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
     pub bottom: u64,
@@ -720,5 +737,25 @@ mod tests {
         assert_eq!(progress.state(), Bootstrap::Parked);
         assert!(Progress::from_parts(Bootstrap::Ready, Bootstrap::Ready.bit()).is_some());
         assert!(Progress::from_parts(Bootstrap::Ready, Bootstrap::Prepared.bit()).is_none());
+    }
+
+    #[test]
+    fn work_readiness_requires_the_full_bootstrap_prefix_and_no_park() {
+        let prefix = Bootstrap::Uninitialized.bit()
+            | Bootstrap::Prepared.bit()
+            | Bootstrap::Entered.bit()
+            | Bootstrap::Ready.bit();
+        assert_eq!(work_ready(Bootstrap::Ready, prefix), Wait::Complete);
+        assert_eq!(work_ready(Bootstrap::Prepared, prefix), Wait::Pending);
+        assert_eq!(work_ready(Bootstrap::Parked, prefix), Wait::Pending);
+        assert_eq!(work_ready(Bootstrap::Failed, prefix), Wait::Failed);
+        assert_eq!(
+            work_ready(Bootstrap::Ready, Bootstrap::Ready.bit()),
+            Wait::Failed
+        );
+        assert_eq!(
+            work_ready(Bootstrap::Ready, prefix | Bootstrap::Parked.bit()),
+            Wait::Complete
+        );
     }
 }

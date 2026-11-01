@@ -216,3 +216,15 @@ test-smp-bootstrap-4 = ["smp-four"]
 test-smp-cpu-identity = ["smp-four"]
 test-smp-ap-isolation = ["smp-four"]
 test-smp-bootstrap-reject = ["smp-two"]
+
+# K9B Phase 9B: real cross-CPU work. Stage A polls bounded mailboxes; the
+# Stage B images additionally use a dedicated xAPIC IPI vector.
+smp-work-test = []
+smp-ipi-test = []
+test-smp-work-2 = ["smp-two", "smp-work-test"]
+test-smp-work-4 = ["smp-four", "smp-work-test"]
+test-smp-work-overlap = ["smp-two", "smp-work-test"]
+test-smp-work-repeat = ["smp-two", "smp-work-test"]
+test-smp-work-invalid = ["smp-two", "smp-work-test"]
+test-smp-ipi-2 = ["smp-two", "smp-work-test", "smp-ipi-test"]
+test-smp-ipi-4 = ["smp-four", "smp-work-test", "smp-ipi-test"]

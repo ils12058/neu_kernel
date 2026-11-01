@@ -28,6 +28,8 @@ pub mod preemptive;
 pub mod serial;
 #[cfg(feature = "smp-test")]
 pub mod smp;
+#[cfg(feature = "smp-work-test")]
+pub mod smp_work;
 #[cfg(feature = "user-test")]
 #[cfg_attr(
     any(feature = "memory-object-test", feature = "memory-object-live-test"),

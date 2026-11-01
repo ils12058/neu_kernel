@@ -96,6 +96,7 @@ FEATURES['native-abi04-disabled']='test-native-abi04-disabled';NATIVE_CASES['nat
 AS_CASES+=('address-space-channel-disabled',)
 FEATURES['address-space-channel-disabled']='test-address-space-channel-disabled'
 SMP_CASES = smp_qmp.CASES
+SMP_WORK = smp_qmp.WORK_CASES
 SMP_REJECT = smp_qmp.REJECT
 FEATURES.update({name: "test-" + name for name in (*SMP_CASES, *SMP_REJECT)})
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
@@ -503,6 +504,8 @@ for name, kind in NATIVE_CASES.items():
 
 
 for name, count in SMP_CASES.items():
+    if name in SMP_WORK:
+        continue
     parked = [f"[NEU] SMP AP parked: logical={logical} " for logical in range(1, count)]
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
         f"[NEU] SMP topology: cpus={count} aps={count - 1} bsp_apic=",
@@ -510,6 +513,51 @@ for name, count in SMP_CASES.items():
         f"[NEU] SMP bootstrap complete: cpus={count} aps={count - 1} released={count - 1} parked={count - 1}",
         "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
         EXPECT["boot"][1])
+for name, count in SMP_WORK.items():
+    ipi = name.startswith("smp-ipi")
+    markers = COMMON + PROTOCOL + OWNED + [
+        f"[NEU] SMP topology: cpus={count} aps={count - 1} bsp_apic=",
+        f"[NEU] SMP bootstrap armed: expected={count} released={count - 1}"] + PAGING
+    if ipi:
+        markers.append("[NEU] SMP work IPI armed: vector=0xf0 ")
+    markers += [f"[NEU] SMP AP work-ready: logical={logical} " for logical in range(1, count)]
+    markers += [f"[NEU] SMP work-ready: cpus={count} aps={count - 1} released={count - 1} ready={count - 1} ",
+                f"[NEU] SMP work armed: mode={'ipi' if ipi else 'poll'} "]
+    if name in smp_qmp.PARALLEL_WORK:
+        markers += [f"[NEU] Work command: logical={logical} " for logical in range(1, count)]
+        markers.append("[NEU] Work checkpoint: phase=parallel ")
+        markers += [f"[NEU] Work result: logical={logical} " for logical in range(1, count)]
+        for logical in range(1, count):
+            markers += [f"[NEU] Work command: logical={logical} ",
+                        f"[NEU] Work result: logical={logical} ",
+                        f"[NEU] Work AP parked: logical={logical} "]
+    elif name == "smp-work-overlap":
+        markers += ["[NEU] Work command: logical=1 ",
+                    "[NEU] Work checkpoint: phase=gate ",
+                    "[NEU] Work result: logical=1 ",
+                    "[NEU] Work command: logical=1 ",
+                    "[NEU] Work result: logical=1 ",
+                    "[NEU] Work AP parked: logical=1 "]
+    elif name == "smp-work-invalid":
+        markers += ["[NEU] Work command: logical=1 ",
+                    "[NEU] Work negative check: name=duplicate-publish ",
+                    "[NEU] Work negative check: name=invalid-rounds ",
+                    "[NEU] Work negative check: name=identity-mismatch ",
+                    "[NEU] Work result: logical=1 ",
+                    "[NEU] Work negative check: name=stale-sequence ",
+                    "[NEU] Work negative check: name=stale-ack ",
+                    "[NEU] Work negative check: name=replayed-poll ",
+                    "[NEU] Work negative checks: consecutive=6 passed=6 ",
+                    "[NEU] Work command: logical=1 ",
+                    "[NEU] Work result: logical=1 ",
+                    "[NEU] Work AP parked: logical=1 "]
+    else:
+        for _ in range(len(smp_qmp.WORK_PLANS[name]) + 1):
+            markers += ["[NEU] Work command: logical=1 ", "[NEU] Work result: logical=1 "]
+        markers.append("[NEU] Work AP parked: logical=1 ")
+    markers += ["[NEU] SMP work complete: mode=",
+                "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
+    EXPECT[name] = (markers, EXPECT["boot"][1])
 for name in SMP_REJECT:
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
         "[NEU] BOOT FAILURE: SMP processor count does not match the configured 2-CPU profile"],
@@ -3073,6 +3121,9 @@ def run_case(case, esp, timeout):
                 live_snapshots = []
                 if case in LIVE_CASES:
                     result["memory_object_live_checkpoints"] = live_snapshots
+                work_checkpoint = None
+                if case in SMP_WORK:
+                    result["smp_work_checkpoint"] = None
                 cap_observation = None
                 cap_snapshots = []
                 if case in MEMORY_CAP_CASES:
@@ -3169,7 +3220,15 @@ def run_case(case, esp, timeout):
                             if sequence not in multi_observations and re.search(r"Switch native ready:.*fresh=(true|false)\n",episode):
                                 if qmp is None:qmp=QMP(endpoint,started+timeout)
                                 multi_observations[sequence]=observe_multi(qmp,serial,symbols,selected.start(),sequence,{**records[label],'peer':selected[8]=='true'},started+timeout,cap_state)
-                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES or case in RUNTIME_CASES else 0.05)
+                    if case in SMP_WORK and work_checkpoint is None and "[NEU] Work checkpoint:" in transcript(serial):
+                        if qmp is None:
+                            qmp = QMP(endpoint, started + timeout)
+                        root_match = re.search(r"Kernel paging activated: CR3=(0x[0-9a-f]+)", transcript(serial))
+                        if not root_match:
+                            raise Failure("SMP work checkpoint appeared before the owned root.")
+                        work_checkpoint = smp_qmp.observe_work_checkpoint(qmp, case, symbols, int(root_match[1], 16), Failure)
+                        result["smp_work_checkpoint"] = work_checkpoint
+                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES or case in RUNTIME_CASES or case in SMP_WORK else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None

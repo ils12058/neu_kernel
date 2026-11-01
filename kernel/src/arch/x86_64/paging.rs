@@ -1738,12 +1738,40 @@ impl Paging<'_, '_> {
     }
 }
 
-#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
+#[cfg(any(
+    feature = "timer-test",
+    feature = "preempt-test",
+    feature = "smp-ipi-test"
+))]
 pub const LAPIC_VIEW: u64 = 0xffff_b000_0000_0000;
-#[cfg(any(feature = "timer-test", feature = "preempt-test"))]
+#[cfg(any(
+    feature = "timer-test",
+    feature = "preempt-test",
+    feature = "smp-ipi-test"
+))]
+fn interrupts_enabled() -> bool {
+    #[cfg(feature = "smp-ipi-test")]
+    {
+        let flags: u64;
+        // SAFETY: Read-only flag inspection at Ring 0.
+        unsafe {
+            asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        }
+        flags & 0x200 != 0
+    }
+    #[cfg(not(feature = "smp-ipi-test"))]
+    {
+        super::interrupts::flags() & 0x200 != 0
+    }
+}
+#[cfg(any(
+    feature = "timer-test",
+    feature = "preempt-test",
+    feature = "smp-ipi-test"
+))]
 impl Paging<'_, '_> {
     pub fn map_lapic_uc(&mut self, physical: u64, pat: u64) -> Result<u64> {
-        if current_root() != self.tree.root || super::interrupts::flags() & 0x200 != 0 {
+        if current_root() != self.tree.root || interrupts_enabled() {
             return Err(Error::InUse);
         }
         logic::physical(physical, self.tree.bits)?;
@@ -1780,8 +1808,9 @@ impl Paging<'_, '_> {
         }
         Ok(leaf)
     }
+    #[cfg_attr(feature = "smp-ipi-test", allow(dead_code))]
     pub fn unmap_lapic(&mut self) -> Result<()> {
-        if current_root() != self.tree.root || super::interrupts::flags() & 0x200 != 0 {
+        if current_root() != self.tree.root || interrupts_enabled() {
             return Err(Error::InUse);
         }
         self.tree.unmap(&mut self.memory, LAPIC_VIEW)?;

@@ -54,8 +54,123 @@ CASES = {
     "smp-cpu-identity": 4,
     "smp-ap-isolation": 4,
 }
+WORK_CASES = {
+    "smp-work-2": 2,
+    "smp-work-4": 4,
+    "smp-work-overlap": 2,
+    "smp-work-repeat": 2,
+    "smp-work-invalid": 2,
+    "smp-ipi-2": 2,
+    "smp-ipi-4": 4,
+}
+CASES.update(WORK_CASES)
 REJECT = ("smp-bootstrap-reject",)
 CPUS = {**CASES, "smp-bootstrap-reject": 4}
+
+WORK_MAGIC = 0x4E45_555F_4D42_5831
+WORK_ABI = 1
+WORK_LAYOUT = [WORK_ABI, WORK_MAGIC, MAX_CPUS, 32, 256, 24, 192, 4, 10]
+WORK_IPI_VECTOR = 0xF0
+GATE_MAGIC = 0x4E45_555F_4741_5431
+EVIDENCE_MAGIC = 0x4E45_555F_574B_4531
+
+MAILBOX = {
+    "MAGIC": 0, "LOGICAL": 1, "APIC_ID": 2, "PHASE": 3, "STATE": 4,
+    "SEQUENCE": 5, "ACKED": 6, "KIND": 7, "INPUT": 8, "ROUNDS": 9,
+    "PUBLISH_ORDER": 10, "ACCEPT_SEQUENCE": 11, "ACCEPT_ORDER": 12,
+    "ACCEPT_LOGICAL": 13, "ACCEPT_APIC": 14, "START_MARKER": 15,
+    "START_RSP": 16, "COMPLETE_SEQUENCE": 17, "COMPLETE_LOGICAL": 18,
+    "COMPLETE_APIC": 19, "COMPLETE_MARKER": 20, "RESULT": 21,
+    "RESULT_AUX": 22, "EXECUTIONS": 23, "EXEC_MASK": 24, "COMPLETE_ORDER": 25,
+    "FAILURE": 26, "REJECTIONS": 27, "LAST_REJECT": 28, "IPI_RECEIVED": 29,
+    "IPI_EOIS": 30, "SPURIOUS": 31,
+}
+GATE = {
+    "MAGIC": 0, "EPOCH": 1, "PARTICIPANTS": 2, "PHASE": 3, "RELEASE": 4,
+    "OVERLAP": 5, "STOP": 6, "FAILURE": 7,
+}
+GATE_ENTRY = {"ENTERED": 0, "READY": 1, "DONE": 2, "RESERVED": 3}
+GATE_HEADER_FIELDS = 8
+GATE_CPU_FIELDS = 4
+GATE_WORDS = GATE_HEADER_FIELDS + GATE_CPU_FIELDS * MAX_CPUS
+GATE_PHASE = {"Closed": 0, "Open": 1, "Checkpoint": 2, "Released": 3, "Complete": 4}
+JOURNAL = {
+    "SEQUENCE": 0, "KIND": 1, "INPUT": 2, "ROUNDS": 3, "RESULT": 4,
+    "AUX": 5, "START": 6, "MARKER": 7, "ACCEPT_ORDER": 8, "COMPLETE_ORDER": 9,
+}
+JOURNAL_FIELDS = 10
+JOURNAL_SLOTS = 4
+PHASE_READY = 1
+PHASE_STOPPED = 3
+PHASE_FAILED = 4
+PHASE_IPI_IDLE = 2
+PHASE_IPI_BUSY = 5
+STATE_IDLE = 0
+STATE_PUBLISHED = 1
+STATE_EXECUTING = 2
+STATE_COMPLETED = 3
+KIND_TRANSFORM = 1
+KIND_CHECKSUM = 2
+KIND_STOP = 3
+MASK64 = (1 << 64) - 1
+
+# Independent copies of the guest's documented command plans. Every AP runs
+# either the whole sequential plan or the single command at its logical index.
+WORK_PLANS = {
+    "smp-work-2": [(KIND_TRANSFORM, 0x9E37_0001, 512), (KIND_CHECKSUM, 0x51ED_0002, 384)],
+    "smp-work-4": [(KIND_TRANSFORM, 0x9101, 320), (KIND_CHECKSUM, 0x9202, 288),
+                   (KIND_TRANSFORM, 0x9303, 256)],
+    "smp-work-overlap": [(KIND_TRANSFORM, 0x0BAD_C0DE, 448)],
+    "smp-work-repeat": [(KIND_TRANSFORM, 0x31, 96), (KIND_CHECKSUM, 0x32, 160),
+                        (KIND_TRANSFORM, 0x33, 224)],
+    "smp-work-invalid": [(KIND_CHECKSUM, 0x44, 192)],
+    "smp-ipi-2": [(KIND_CHECKSUM, 0x5151, 512), (KIND_TRANSFORM, 0x5252, 384)],
+    "smp-ipi-4": [(KIND_CHECKSUM, 0x6161, 320), (KIND_TRANSFORM, 0x6262, 288),
+                  (KIND_CHECKSUM, 0x6363, 256)],
+}
+PARALLEL_WORK = ("smp-work-4", "smp-ipi-4")
+
+
+def work_plan(case, logical):
+    if case in PARALLEL_WORK:
+        return [WORK_PLANS[case][logical - 1]]
+    return list(WORK_PLANS[case])
+
+
+def mix(value):
+    value = (value + 0x9E37_79B9_7F4A_7C15) & MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58_476D_1CE4_E5B9) & MASK64
+    value = ((value ^ (value >> 27)) * 0x94D0_49BB_1331_11EB) & MASK64
+    return value ^ (value >> 31)
+
+
+def start_marker(sequence, logical, apic):
+    return mix(sequence ^ (logical << 32) ^ apic)
+
+
+def complete_marker(start, result, aux):
+    rotated = ((aux << 17) | (aux >> 47)) & MASK64
+    return mix(start ^ result ^ rotated)
+
+
+def execute(kind, command_input, rounds):
+    if kind == KIND_TRANSFORM:
+        state = command_input ^ 0x243F_6A88_85A3_08D3
+        aux = 0
+        for index in range(rounds):
+            state = (state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407) & MASK64
+            state ^= state >> 29
+            aux = (aux + (state ^ index)) & MASK64
+        return state, aux
+    if kind == KIND_CHECKSUM:
+        state = 0xCBF2_9CE4_8422_2325
+        for index in range(rounds):
+            state ^= (command_input + index) & MASK64
+            state = (state * 0x0000_0100_0000_01B3) & MASK64
+        return state, rounds
+    if kind == KIND_STOP:
+        return 0, 0
+    raise ValueError("undocumented work command kind")
 
 
 def _machine(qmp, cpu, command):
@@ -163,6 +278,11 @@ def observe(qmp, case, symbols, expected_root, failure):
     if case in REJECT:
         _reject(qmp, symbols, failure, require, count, fast, cpu_of_apic,
                 blocks, released, observation)
+    elif case in WORK_CASES:
+        _positive(qmp, case, symbols, failure, require, expected_root, count,
+                  cpu_of_apic, first_cpu, blocks, released, observation)
+        _work_state(qmp, case, symbols, failure, require, count, first_cpu,
+                    blocks, observation)
     else:
         _positive(qmp, case, symbols, failure, require, expected_root, count,
                   cpu_of_apic, first_cpu, blocks, released, observation)
@@ -486,3 +606,311 @@ def _reject(qmp, symbols, failure, require, count, fast, cpu_of_apic,
     observation["loader_root"] = loader_root
     observation["cpus_qmp"] = observed
     return observation
+
+
+def _work_state(qmp, case, symbols, failure, require, count, first_cpu,
+                blocks, observation):
+    """Rechecks every production mailbox, journal slot and evidence word."""
+    for name in ("neu_smp_work_layout", "neu_smp_work_mailboxes", "neu_smp_work_gate",
+                 "neu_smp_work_journal", "neu_smp_work_evidence"):
+        if name not in symbols:
+            raise failure(f"SMP work image is missing its published symbol {name}.")
+    layout = _words(qmp, first_cpu, symbols["neu_smp_work_layout"], 9, failure)
+    require(layout == WORK_LAYOUT, "SMP work layout is not the documented one.")
+    ipi = case.startswith("smp-ipi")
+    base = symbols["neu_smp_work_mailboxes"]
+    mailboxes = [_words(qmp, first_cpu, base + logical * 256, 32, failure)
+                 for logical in range(MAX_CPUS)]
+    total_work = sum(len(work_plan(case, logical)) for logical in range(1, count))
+
+    def slot(logical):
+        return mailboxes[logical]
+
+    for logical in range(MAX_CPUS):
+        table = slot(logical)
+        if logical == 0 or logical >= count:
+            require(all(word == 0 for word in table),
+                    f"SMP work mailbox slot {logical} is published beyond the profile.")
+            continue
+        block = blocks[logical]
+        apic = block[BLOCK["APIC_ID"]]
+        plan = work_plan(case, logical)
+        expected = len(plan) + 1
+        require(table[MAILBOX["MAGIC"]] == WORK_MAGIC,
+                f"SMP work mailbox {logical} magic is missing.")
+        require(table[MAILBOX["LOGICAL"]] == logical and table[MAILBOX["APIC_ID"]] == apic,
+                f"SMP work mailbox {logical} identity is wrong.")
+        require(table[MAILBOX["PHASE"]] == PHASE_STOPPED,
+                f"SMP work mailbox {logical} did not stop.")
+        require(table[MAILBOX["STATE"]] == STATE_IDLE,
+                f"SMP work mailbox {logical} is not idle after the final ack.")
+        for field in ("SEQUENCE", "ACKED", "EXECUTIONS"):
+            require(table[MAILBOX[field]] == expected,
+                    f"SMP work mailbox {logical} {field} is not the exact-once count.")
+        require(table[MAILBOX["PUBLISH_ORDER"]] == expected
+                and table[MAILBOX["ACCEPT_SEQUENCE"]] == expected
+                and table[MAILBOX["ACCEPT_ORDER"]] == expected
+                and table[MAILBOX["COMPLETE_SEQUENCE"]] == expected
+                and table[MAILBOX["COMPLETE_ORDER"]] == expected,
+                f"SMP work mailbox {logical} ordering fields disagree with its sequence.")
+        require(table[MAILBOX["EXEC_MASK"]] == ((1 << expected) - 1) & MASK64,
+                f"SMP work mailbox {logical} execution mask shows a hole or replay.")
+        require(table[MAILBOX["ACCEPT_LOGICAL"]] == logical
+                and table[MAILBOX["COMPLETE_LOGICAL"]] == logical
+                and table[MAILBOX["ACCEPT_APIC"]] == apic
+                and table[MAILBOX["COMPLETE_APIC"]] == apic,
+                f"SMP work mailbox {logical} accepted/completed for another CPU.")
+        start = start_marker(expected, logical, apic)
+        require(table[MAILBOX["START_MARKER"]] == start
+                and table[MAILBOX["COMPLETE_MARKER"]] == complete_marker(start, 0, 0),
+                f"SMP work mailbox {logical} final markers are inconsistent.")
+        require(table[MAILBOX["KIND"]] == KIND_STOP and table[MAILBOX["INPUT"]] == 0
+                and table[MAILBOX["ROUNDS"]] == 0 and table[MAILBOX["RESULT"]] == 0
+                and table[MAILBOX["RESULT_AUX"]] == 0,
+                f"SMP work mailbox {logical} final command is not the published stop.")
+        stack = (block[BLOCK["STACK_BOTTOM"]], block[BLOCK["STACK_TOP"]])
+        require(stack[0] <= table[MAILBOX["START_RSP"]] < stack[1],
+                f"SMP work mailbox {logical} start RSP is outside its private stack.")
+        require(table[MAILBOX["FAILURE"]] == 0 and table[MAILBOX["REJECTIONS"]] == 0
+                and table[MAILBOX["LAST_REJECT"]] == 0,
+                f"SMP work mailbox {logical} recorded a rejected or failed command.")
+        if ipi:
+            require(table[MAILBOX["IPI_RECEIVED"]] == expected
+                    and table[MAILBOX["IPI_EOIS"]] == expected
+                    and table[MAILBOX["SPURIOUS"]] == 0,
+                    f"SMP work mailbox {logical} IPI accounting is inconsistent.")
+        else:
+            require(table[MAILBOX["IPI_RECEIVED"]] == 0
+                    and table[MAILBOX["IPI_EOIS"]] == 0
+                    and table[MAILBOX["SPURIOUS"]] == 0,
+                    f"SMP work polling mailbox {logical} recorded an interrupt.")
+
+    journal_base = symbols["neu_smp_work_journal"]
+    for logical in range(MAX_CPUS):
+        apic = blocks[logical][BLOCK["APIC_ID"]] if logical < count else 0
+        plan = work_plan(case, logical) if 0 < logical < count else []
+        entries = plan + [(KIND_STOP, 0, 0)] if plan else []
+        for index in range(JOURNAL_SLOTS):
+            address = journal_base + ((logical * JOURNAL_SLOTS + index)
+                                      * JOURNAL_FIELDS * 8)
+            row = _words(qmp, first_cpu, address, JOURNAL_FIELDS, failure)
+            if index >= len(entries):
+                require(all(word == 0 for word in row),
+                        f"SMP work journal slot {logical}:{index} was written beyond the plan.")
+                continue
+            sequence = index + 1
+            kind, command_input, rounds = entries[index]
+            require(row[JOURNAL["SEQUENCE"]] == sequence,
+                    f"SMP work journal slot {logical}:{index} has the wrong sequence.")
+            require(row[JOURNAL["KIND"]] == kind and row[JOURNAL["INPUT"]] == command_input
+                    and row[JOURNAL["ROUNDS"]] == rounds,
+                    f"SMP work journal slot {logical}:{index} does not match the plan.")
+            result, aux = execute(kind, command_input, rounds)
+            require(row[JOURNAL["RESULT"]] == result and row[JOURNAL["AUX"]] == aux,
+                    f"SMP work journal slot {logical}:{index} result is not reproducible.")
+            start = start_marker(sequence, logical, apic)
+            require(row[JOURNAL["START"]] == start
+                    and row[JOURNAL["MARKER"]] == complete_marker(start, result, aux),
+                    f"SMP work journal slot {logical}:{index} markers are inconsistent.")
+            require(row[JOURNAL["ACCEPT_ORDER"]] == sequence
+                    and row[JOURNAL["COMPLETE_ORDER"]] == sequence,
+                    f"SMP work journal slot {logical}:{index} ordering is not independent.")
+
+    evidence = _words(qmp, first_cpu, symbols["neu_smp_work_evidence"], 19, failure)
+    require(evidence[0] == EVIDENCE_MAGIC and evidence[1] == WORK_ABI,
+            "SMP work evidence header is invalid.")
+    require(evidence[2] == (2 if ipi else 1), "SMP work mode evidence is wrong.")
+    require(evidence[3] == count, "SMP work evidence CPU count is wrong.")
+    require(evidence[4] == total_work
+            and evidence[5] == (1 if case in PARALLEL_WORK else len(WORK_PLANS[case])),
+            "SMP work evidence command counts are wrong.")
+    require(evidence[6] == count - 1, "SMP work evidence stopped AP count is wrong.")
+    require(evidence[18] == 0, "SMP work driver recorded a failure.")
+    negative = 6 if case == "smp-work-invalid" else 0
+    require(evidence[11] == negative and evidence[12] == negative,
+            "SMP work negative-check evidence is wrong.")
+    sent = sum(len(work_plan(case, logical)) + 1 for logical in range(1, count)) if ipi else 0
+    require(evidence[7] == sent and evidence[8] == sent and evidence[9] == sent
+            and evidence[10] == 0,
+            "SMP work IPI evidence is inconsistent.")
+    gate = _words(qmp, first_cpu, symbols["neu_smp_work_gate"], GATE_WORDS, failure)
+    if case == "smp-work-overlap":
+        result, aux = execute(*WORK_PLANS[case][0])
+        require(evidence[13] == result and evidence[14] == aux,
+                "SMP work BSP result is not reproducible.")
+        require(evidence[15] == 1 and evidence[16] == 0b11 and evidence[17] == 1,
+                "SMP work overlap evidence is incomplete.")
+        require(gate[GATE["MAGIC"]] == GATE_MAGIC and gate[GATE["EPOCH"]] == 1
+                and gate[GATE["PARTICIPANTS"]] == 2
+                and gate[GATE["PHASE"]] == GATE_PHASE["Complete"]
+                and gate[GATE["RELEASE"]] == 1 and gate[GATE["OVERLAP"]] == 0b11
+                and gate[GATE["STOP"]] == 0 and gate[GATE["FAILURE"]] == 0,
+                "SMP work gate final state is inconsistent.")
+        for logical in (0, 1):
+            offset = GATE_HEADER_FIELDS + logical * GATE_CPU_FIELDS
+            require(gate[offset + GATE_ENTRY["ENTERED"]] == 1
+                    and gate[offset + GATE_ENTRY["READY"]] == 1
+                    and gate[offset + GATE_ENTRY["DONE"]] == 1
+                    and gate[offset + GATE_ENTRY["RESERVED"]] == 0,
+                    f"SMP work gate participant {logical} is not fully published.")
+    else:
+        require(evidence[13] == 0 and evidence[14] == 0 and evidence[15] == 0
+                and evidence[16] == 0 and evidence[17] == 0 and all(word == 0 for word in gate),
+                "SMP work profile published an unexpected BSP or gate result.")
+    observation["work"] = {
+        "layout": layout, "mailboxes": mailboxes, "gate": gate, "evidence": evidence,
+        "commands": total_work, "mode": "ipi" if ipi else "poll",
+    }
+    return observation
+
+
+def _live_registers(qmp, cpu, failure):
+    text = _registers(qmp, cpu)
+    if "CPL=0" not in text:
+        raise failure("SMP work checkpoint CPU left Ring 0.")
+    cs = re.search(r"\bCS\s*=\s*([0-9a-fA-F]+)", text)
+    gs = re.search(r"\bGS\s*=\s*[0-9a-fA-F]+\s+([0-9a-fA-F]+)", text)
+    if not cs or not gs or int(cs[1], 16) != 8:
+        raise failure("SMP work checkpoint CPU is not on the Ring 0 64-bit code segment.")
+    return {
+        "rip": _number(text, r"\bRIP=([0-9a-fA-F]+)", "RIP", failure),
+        "rsp": _number(text, r"\bRSP=([0-9a-fA-F]+)", "RSP", failure),
+        "cr3": _number(text, r"\bCR3=([0-9a-fA-F]+)", "CR3", failure),
+        "flags": _number(text, r"\bRFL=([0-9a-fA-F]+)", "RFL", failure),
+        "gs": int(gs[1], 16),
+        "cs": int(cs[1], 16),
+    }
+
+
+def observe_work_checkpoint(qmp, case, symbols, root, failure):
+    """Stops the whole VM at the published work checkpoint and rechecks both
+    the BSP and every AP inside the intended, exported work phase."""
+    if case not in WORK_CASES:
+        raise failure("SMP work checkpoint requested for an unknown profile.")
+    if root is None:
+        raise failure("SMP work checkpoint has no activated owned root.")
+    for name in ("neu_smp_work_layout", "neu_smp_work_mailboxes", "neu_smp_work_gate",
+                 "neu_smp_work_bsp_dwell_begin", "neu_smp_work_bsp_dwell_end",
+                 "neu_smp_work_ap_dwell_begin", "neu_smp_work_ap_dwell_end",
+                 "neu_smp_work_gate_wait_begin", "neu_smp_work_gate_wait_end"):
+        if name not in symbols:
+            raise failure(f"SMP work checkpoint symbol {name} is missing.")
+    if qmp.call("query-status")["status"] != "running":
+        raise failure("SMP work VM is not running before its checkpoint.")
+    qmp.call("stop")
+    try:
+        if qmp.call("query-status")["status"] != "paused":
+            raise failure("SMP work checkpoint did not pause the whole VM.")
+        count = CPUS[case]
+        fast = qmp.call("query-cpus-fast")
+        if len(fast) != count:
+            raise failure(f"SMP work checkpoint reports {len(fast)} CPUs instead of {count}.")
+        cpu_of_apic = _apic_identities(qmp, fast, failure)
+        first_cpu = fast[0]["cpu-index"]
+        layout = _words(qmp, first_cpu, symbols["neu_smp_work_layout"], 9, failure)
+        if layout != WORK_LAYOUT:
+            raise failure("SMP work checkpoint layout is not the documented one.")
+        ipi = case.startswith("smp-ipi")
+        base = symbols["neu_smp_cpus"]
+        mailbox_base = symbols["neu_smp_work_mailboxes"]
+        bsp_dwell = (symbols["neu_smp_work_bsp_dwell_begin"],
+                     symbols["neu_smp_work_bsp_dwell_end"])
+        ap_dwell = (symbols["neu_smp_work_ap_dwell_begin"],
+                    symbols["neu_smp_work_ap_dwell_end"])
+        gate_wait = (symbols["neu_smp_work_gate_wait_begin"],
+                     symbols["neu_smp_work_gate_wait_end"])
+        bsp = None
+        ap_cpus = {}
+        checkpoint = {"case": case, "cpus": count, "layout": layout,
+                      "phase": "gate" if case == "smp-work-overlap" else "parallel",
+                      "cpus_qmp": {}}
+        for apic, cpu in cpu_of_apic.items():
+            live = _live_registers(qmp, cpu, failure)
+            if live["cr3"] != root or live["flags"] & (1 << 9):
+                raise failure("SMP work checkpoint CPU is not on the owned root with IF=0.")
+            if bsp_dwell[0] <= live["rip"] < bsp_dwell[1]:
+                if bsp is not None:
+                    raise failure("SMP work checkpoint observed two BSP dwells.")
+                if live["gs"] != base:
+                    raise failure("SMP work checkpoint BSP GS base is not its block.")
+                if not symbols["__stack_bottom"] <= live["rsp"] < symbols["__stack_top"]:
+                    raise failure("SMP work checkpoint BSP RSP is outside its stack.")
+                bsp = (apic, cpu, live)
+                continue
+            if ap_dwell[0] <= live["rip"] < ap_dwell[1]:
+                phase = "ap-dwell"
+            elif gate_wait[0] <= live["rip"] < gate_wait[1]:
+                phase = "gate-wait"
+            else:
+                raise failure("SMP work checkpoint CPU is outside every exported work phase.")
+            if case != "smp-work-overlap" and phase != "ap-dwell":
+                raise failure("SMP work parallel checkpoint AP is not inside its dwell.")
+            if case == "smp-work-overlap" and phase != "gate-wait":
+                raise failure("SMP work gate checkpoint AP is not inside the barrier.")
+            offset = live["gs"] - base
+            if offset % 384 or not 1 <= offset // 384 < count:
+                raise failure("SMP work checkpoint AP GS base is not a live CPU block.")
+            logical = offset // 384
+            if logical in ap_cpus:
+                raise failure("SMP work checkpoint reported one AP logical index twice.")
+            ap_cpus[logical] = (apic, cpu, live, phase)
+        if bsp is None or len(ap_cpus) != count - 1 or set(ap_cpus) != set(range(1, count)):
+            raise failure("SMP work checkpoint did not observe every CPU in a work phase.")
+        for logical, (apic, cpu, live, phase) in ap_cpus.items():
+            table = _words(qmp, first_cpu, mailbox_base + logical * 256, 32, failure)
+            expected_phase = PHASE_IPI_BUSY if ipi else PHASE_READY
+            if (table[MAILBOX["MAGIC"]] != WORK_MAGIC
+                    or table[MAILBOX["LOGICAL"]] != logical
+                    or table[MAILBOX["APIC_ID"]] != apic):
+                raise failure(f"SMP work checkpoint mailbox {logical} identity is wrong.")
+            if table[MAILBOX["PHASE"]] != expected_phase:
+                raise failure(f"SMP work checkpoint mailbox {logical} phase is wrong.")
+            sequence = table[MAILBOX["SEQUENCE"]]
+            if (table[MAILBOX["STATE"]] != STATE_EXECUTING or sequence != 1
+                    or table[MAILBOX["PUBLISH_ORDER"]] != 1
+                    or table[MAILBOX["ACCEPT_SEQUENCE"]] != 1
+                    or table[MAILBOX["ACCEPT_ORDER"]] != 1
+                    or table[MAILBOX["ACCEPT_LOGICAL"]] != logical
+                    or table[MAILBOX["ACCEPT_APIC"]] != apic
+                    or table[MAILBOX["START_MARKER"]] != start_marker(1, logical, apic)):
+                raise failure(f"SMP work checkpoint mailbox {logical} did not publish one accepted command.")
+            if (table[MAILBOX["COMPLETE_SEQUENCE"]] != 0
+                    or table[MAILBOX["EXECUTIONS"]] != 0
+                    or table[MAILBOX["EXEC_MASK"]] != 0
+                    or table[MAILBOX["COMPLETE_MARKER"]] != 0
+                    or table[MAILBOX["RESULT"]] != 0 or table[MAILBOX["RESULT_AUX"]] != 0):
+                raise failure(f"SMP work checkpoint mailbox {logical} already published completion.")
+            stack = (symbols[f"neu_smp_ap{logical}_stack_bottom"],
+                     symbols[f"neu_smp_ap{logical}_stack_top"])
+            if (not stack[0] <= table[MAILBOX["START_RSP"]] < stack[1]
+                    or not stack[0] <= live["rsp"] < stack[1]):
+                raise failure(f"SMP work checkpoint AP{logical} start RSP is outside its private stack.")
+            checkpoint["cpus_qmp"][str(logical)] = {
+                "apic_id": apic, "cpu_index": cpu, "rip": live["rip"],
+                "phase": phase, "mailbox_state": table[MAILBOX["STATE"]],
+                "sequence": sequence,
+            }
+        checkpoint["cpu_bsp"] = {"apic_id": bsp[0], "cpu_index": bsp[1],
+                                 "rip": bsp[2]["rip"], "phase": "bsp-dwell"}
+        gate = _words(qmp, first_cpu, symbols["neu_smp_work_gate"], GATE_WORDS, failure)
+        if case == "smp-work-overlap":
+            if (gate[GATE["MAGIC"]] != GATE_MAGIC or gate[GATE["EPOCH"]] != 1
+                    or gate[GATE["PARTICIPANTS"]] != 2
+                    or gate[GATE["PHASE"]] != GATE_PHASE["Checkpoint"]
+                    or gate[GATE["RELEASE"]] != 0 or gate[GATE["OVERLAP"]] != 0b11
+                    or gate[GATE["STOP"]] != 0 or gate[GATE["FAILURE"]] != 0):
+                raise failure("SMP work gate checkpoint publication is inconsistent.")
+            for logical in (0, 1):
+                offset = GATE_HEADER_FIELDS + logical * GATE_CPU_FIELDS
+                if (gate[offset + GATE_ENTRY["ENTERED"]] != 1
+                        or gate[offset + GATE_ENTRY["READY"]] != 1
+                        or gate[offset + GATE_ENTRY["DONE"]] != 0
+                        or gate[offset + GATE_ENTRY["RESERVED"]] != 0):
+                    raise failure(f"SMP work gate participant {logical} is not simultaneously ready.")
+        else:
+            if any(gate):
+                raise failure("SMP work parallel checkpoint published an unexpected gate epoch.")
+        checkpoint["gate"] = gate
+        return checkpoint
+    finally:
+        qmp.call("cont")

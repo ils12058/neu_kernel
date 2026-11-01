@@ -22,3 +22,5 @@ pub mod inspection;
 pub mod channel;
 
 pub mod wait;
+
+pub mod smp_work;

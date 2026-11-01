@@ -282,10 +282,20 @@ extern "C" fn neu_main() -> ! {
         paging.table_count()
     );
     log!("[NEU] Kernel mappings verified: RX text, R rodata, RW/NX data, 4 guards\n");
+    // The work IPI vector is delivered through the shared LAPIC view; map it
+    // before the owned root is published so every AP inherits the mapping.
+    #[cfg(feature = "smp-ipi-test")]
+    if let Err(reason) = arch::smp_work::map_lapic(&mut paging) {
+        fail(reason);
+    }
     // Publish the owned root only after the BSP proves every per-CPU arena is
     // mapped, then wait for each AP to report a complete parked transition.
     #[cfg(feature = "smp-test")]
     if let Err(reason) = arch::smp::finish(&paging) {
+        fail(reason);
+    }
+    #[cfg(feature = "smp-work-test")]
+    if let Err(reason) = arch::smp_work::run(&paging) {
         fail(reason);
     }
     if cfg!(feature = "test-paging") {

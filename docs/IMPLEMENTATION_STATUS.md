@@ -1,5 +1,139 @@
 # Neu Kernel implementation status
 
+## K9 / Phase 9B — complete for bounded cross-CPU work and verified IPI coordination (2026-11-01)
+
+Baseline was `d9ebcd93ef70f2834e0689091012a2987c235772` on `main` with Phase 9A
+complete. Phase 9B dispatches bounded work from the BSP to real application
+processors, proves exactly-once execution and reproducible results from
+production memory, proves genuine concurrent execution against a two-phase
+barrier on two CPUs, and wakes halted APs with a documented xAPIC IPI. Every
+existing single-CPU subsystem remains BSP-owned. [ADR 0027](adr/0027-smp-crosscpu-work-and-coordination.md)
+accepts only this bounded scope. Architecture v0.2, ABI 0.5 and all fixed pools
+are unchanged; there is no ABI 0.6.
+
+### Ownership, mailboxes and ordering
+
+The BSP is the only publisher; each AP is the only executor of its own mailbox.
+`neu_smp_work_mailboxes` is a fixed four-entry array of 64-byte-aligned,
+256-byte mailboxes with 32 documented `u64` fields: identity, phase/state,
+sequence and acknowledged sequence, command kind/input/rounds, publication
+order, accept sequence/order and accepting identity, completion
+sequence/logical/APIC, start and completion markers, result and auxiliary word,
+execution count and mask, accept/complete order, failure/rejection accounting
+and IPI receive/EOI/spurious counters. `neu_smp_work_layout` publishes the ABI,
+magic, field and stride counts, gate geometry and journal geometry.
+
+Sequences start at 1. Publication writes every command field and then Release
+publishes `SEQUENCE` and `Published`; acceptance validates
+`ACCEPT_ORDER + 1 == SEQUENCE` and records the identity, start marker and RSP
+before publishing `Executing`; completion validates `COMPLETE_ORDER + 1 ==
+SEQUENCE`, records result and marker and sets the execution-mask bit before
+publishing `Completed`; acknowledgement is monotonic and rejects stale values.
+An unacknowledged command cannot be overwritten (`Busy`), a replayed accept or
+completion fails, and the execution mask must equal `(1 << sequence) - 1`.
+Command kinds are `Transform`, `Checksum`, `Stop` and a rejected `FaultProbe`;
+rounds are bounded to 1..=4096 and a `u64::MAX` sequence is rejected. Invalid
+commands are rejected and counted, never silently applied.
+
+Each AP appends every accepted command to `neu_smp_work_journal` (four slots of
+ten words: sequence, kind, input, rounds, result, auxiliary, start marker,
+completion marker, accept order, complete order). The BSP never writes the
+journal; QMP recomputes every result and marker from the journal and the
+publication order.
+
+### Gate and concurrency evidence
+
+The overlap profile publishes a fixed 24-word gate: header `{magic, epoch,
+participants, phase, release, overlap, stop, failure}` plus four participant
+entries `{entered, ready, done, reserved}`. Phases are `Closed → Open →
+Checkpoint → Released → Complete`. The AP arrives after accepting the same
+command the BSP executes, publishes readiness and spins in the exported
+`neu_smp_work_gate_wait_begin..end` loop on the Acquire `RELEASE` word; the BSP
+waits for both participants, logs the deterministic checkpoint, dwells in
+`neu_smp_work_bsp_dwell_begin..end`, verifies the gate is still `Checkpoint`,
+executes the identical command, publishes the epoch, and both CPUs must produce
+the same result before departing. The overlap mask records CPUs that entered
+concurrently. At the checkpoint QMP stops the VM and requires the BSP in its
+dwell range, the AP in its gate-wait range, both mailboxes `Executing` with no
+completion fields, gate phase `Checkpoint`, `RELEASE = 0` and `OVERLAP = 0b11`.
+
+### AP wakeup: Stage A and Stage B
+
+Stage A is a bounded `pause` polling loop with interrupts disabled; it is
+always available and proves the mailbox path without the local APIC. Stage B is
+implemented and verified. The AP publishes `IpiIdle`, executes the exported
+`sti; hlt; neu_smp_work_idle_after: cli; ret` window, and the BSP sends fixed
+delivery vector `0xF0` to the target APIC ID only after observing `IpiIdle`.
+Each AP has private IDT gates for `0xF0` and `0xFF`, both Ring 0 interrupt
+gates using IST1. The handler verifies vector and in-service state, CS = 8,
+IF = 1, RIP = `neu_smp_work_idle_after`, RSP inside the AP's stack, identity
+and phase `IpiIdle`; it EOIs once, verifies the in-service bit cleared, then
+counts the IPI and EOI. The spurious vector is counted and never EOI'd; an
+unexpected vector is terminal. No timer, MSI or x2APIC wakeup exists.
+
+### Failure semantics and isolation
+
+Every wait is bounded. Missed wakeups, delivery failure, in-service timeout,
+protocol violations, identity mismatch, unexpected interrupts, result or
+journal mismatch are distinct errors. An AP terminalizes its mailbox and
+bootstrap state and parks; the BSP never treats a failed CPU as healthy. AP
+code touches only its own block, mailbox and journal: it never allocates
+frames, mutates page tables, enters the scheduler, touches capability, Channel
+or MemoryObject state, or writes serial. The BSP writes only command,
+acknowledgement and gate words and never fabricates completion fields. No
+global was made `Sync` and no broad lock was introduced.
+
+### Profiles and independent evidence
+
+Seven stopped-CPU profiles are registered:
+
+| Case | vCPUs | Proves |
+| --- | --- | --- |
+| `smp-work-2` | 2 | One AP executes two different commands and a stop exactly once |
+| `smp-work-4` | 4 | Three APs concurrently execute different commands without aliasing |
+| `smp-work-overlap` | 2 | BSP and AP execute identical work across the two-phase gate |
+| `smp-work-repeat` | 2 | Three sequential commands with independent ordering |
+| `smp-work-invalid` | 2 | Six negative rejections with distinct error codes |
+| `smp-ipi-2` | 2 | Stage B wakeup for every command with balanced IPIs/EOIs |
+| `smp-ipi-4` | 4 | Stage B wakeup for three APs with balanced IPIs/EOIs |
+
+`tools/smp_qmp.py` stops the whole VM, resolves QMP's own CPU set and per-CPU
+`apic-id` through QOM, and reads the layout, every mailbox, every journal slot,
+the evidence words and the gate from production memory. It recomputes each
+`Transform`/`Checksum` result, start and completion marker and per-CPU order in
+Python; rejects duplicate executions, mask holes, foreign identities, wrong
+ordering, failed/rejected mailboxes, IPI accounting mismatches and unexpected
+interrupts; requires final `Stopped`/`Idle` state with exact sequence, ack and
+execution counts; and reuses the Phase 9A checks for parked APs, history,
+private stacks/tables, canaries, live registers and masked LAPIC timers. Guest
+serial lines are never accepted as evidence.
+
+### Validation and explicit non-claims
+
+`make doctor`, `make check` and `make build` passed, and a clean-target run from
+`cargo clean` repeated the check, build and host-test sequence. The host suite
+passed **275 tests** (253 Phase 9A baseline plus 22 new mailbox, barrier and
+interrupt-classification tests). The full QEMU suite passed **163 scenario
+executions (161 unique)**: the 156 Phase 9A executions (154 unique) plus the
+seven Phase 9B profiles; `smp-cpu-identity` and `smp-ap-isolation` re-execute
+the 4-CPU path for their named observer checks. The run used the unchanged
+30-second timeout under `/usr/sbin/taskpolicy -t 4` (host scheduling only) and
+contained no failures. The seven new profiles, `smp-bootstrap-4` and
+`memory-object-runtime` also passed individually afterwards. Earlier bring-up
+rejections (inverted identity negative check, packed xAPIC ISR stride, Stop
+idle-phase wait and a garbage-collected gate) are recorded in ADR 0027 History;
+no timeout, assertion or guest image was changed. Evidence is retained under
+`build/k9b-full-test.log`, `build/k9b-full-test-results.json`,
+`build/k9b-repeats.log`, `build/k9b-clean-build.log` and
+`build/test-logs/<case>.serial.log`.
+
+Excluded: Thread migration, work stealing, load balancing, per-CPU run queues,
+AP execution of existing Node Threads, concurrent frame/page-table/capability
+mutation, remote TLB shootdown, general kernel preemption, K10
+derivation/revocation, public syscalls, mmap/munmap, COW, demand paging, swap,
+huge pages and Linux compatibility. The gate is a test barrier, not a
+scheduler primitive. No hardware or hosted-CI validation is claimed.
+
 ## K9 / Phase 9A — complete for bounded SMP bootstrap and per-CPU foundations (2026-10-31)
 
 Baseline was `6cdb6ef0207473e7173e883bb50e6fcf79b95d38` on `main`. Phase 9A

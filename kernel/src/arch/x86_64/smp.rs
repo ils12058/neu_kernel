@@ -167,17 +167,17 @@ impl CpuBlock {
         }
     }
 
-    fn store(&self, field: usize, value: u64) {
+    pub(super) fn store(&self, field: usize, value: u64) {
         self.words[field].store(value, Ordering::Relaxed);
     }
 
-    fn load(&self, field: usize) -> u64 {
+    pub(super) fn load(&self, field: usize) -> u64 {
         self.words[field].load(Ordering::Relaxed)
     }
 
     /// One writer per CPU. `history` records every intermediate transition and
     /// becomes visible before the Release publication of `state`.
-    fn advance(&self, next: Bootstrap) -> Result<(), &'static str> {
+    pub(super) fn advance(&self, next: Bootstrap) -> Result<(), &'static str> {
         let state = Bootstrap::from_code(self.load(cpu::block::STATE))
             .ok_or("SMP per-CPU state is not a documented value")?;
         let mut progress = cpu::Progress::from_parts(state, self.load(cpu::block::HISTORY))
@@ -369,7 +369,7 @@ fn block_address(logical: usize) -> u64 {
 
 /// Returns the logical index only when the GS base names a published block.
 /// A fault before the AP publishes its identity falls back to CPUID matching.
-fn current_logical() -> Option<usize> {
+pub(super) fn current_logical() -> Option<usize> {
     let base = rdmsr(IA32_GS_BASE);
     let start = block_address(0);
     let end = start + cpu::BLOCK_STRIDE as u64 * cpu::MAX_CPUS as u64;
@@ -380,7 +380,7 @@ fn current_logical() -> Option<usize> {
     (neu_smp_cpus[index].load(cpu::block::MAGIC) == cpu::BLOCK_MAGIC).then_some(index)
 }
 
-fn current_ap() -> Option<&'static CpuBlock> {
+pub(super) fn current_ap() -> Option<&'static CpuBlock> {
     if let Some(logical) = current_logical() {
         return (logical != 0).then(|| &neu_smp_cpus[logical]);
     }
@@ -719,6 +719,8 @@ pub fn prepare() -> Result<(), &'static str> {
                 resources.ist_top,
             );
             exceptions::copy_kernel_idt(resources.idt as *mut u8);
+            #[cfg(feature = "smp-ipi-test")]
+            exceptions::install_ap_work_ipi(resources.idt as *mut u8)?;
         }
         let code = unsafe { ptr::read_volatile((resources.gdt + 8) as *const u64) };
         if code != 0x00af_9a00_0000_ffff {
@@ -888,6 +890,27 @@ fn apic_base_of(logical: usize) -> u64 {
     neu_smp_cpus[logical].load(cpu::block::APIC_BASE)
 }
 
+/// Stage A/B work images keep each AP live after the bootstrap prefix, so the
+/// BSP waits for the full Ready publication instead of the parked terminal.
+#[cfg(feature = "smp-work-test")]
+fn wait_work_ready(block: &CpuBlock) -> Result<(), &'static str> {
+    let mut spins = 0u64;
+    loop {
+        let state = Bootstrap::from_code(block.load(cpu::block::STATE))
+            .ok_or("SMP AP published an undocumented state")?;
+        match cpu::work_ready(state, block.load(cpu::block::HISTORY)) {
+            Wait::Complete => return Ok(()),
+            Wait::Failed => return Err("SMP AP reported a failed work-ready state"),
+            Wait::Pending => {}
+        }
+        if spins >= AP_WAIT_LIMIT {
+            return Err("SMP AP did not publish work readiness within the bounded window");
+        }
+        core::hint::spin_loop();
+        spins += 1;
+    }
+}
+
 /// Verifies the complete per-CPU publication and parks the BSP end state.
 pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str> {
     if OWNED_ROOT.load(Ordering::Acquire) != 0 {
@@ -946,23 +969,39 @@ pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str
     let mut parked = 0usize;
     for (offset, block) in neu_smp_cpus[1..ap_count].iter().enumerate() {
         let logical = offset + 1;
-        let mut spins = 0u64;
-        loop {
-            let state = Bootstrap::from_code(block.load(cpu::block::STATE))
-                .ok_or("SMP AP published an undocumented state")?;
-            match cpu::ap_wait(state, block.load(cpu::block::HISTORY)) {
-                Wait::Complete => break,
-                Wait::Failed => return Err("SMP AP reported a failed bootstrap"),
-                Wait::Pending => {}
+        #[cfg(feature = "smp-work-test")]
+        {
+            wait_work_ready(block)?;
+        }
+        #[cfg(not(feature = "smp-work-test"))]
+        {
+            let mut spins = 0u64;
+            loop {
+                let state = Bootstrap::from_code(block.load(cpu::block::STATE))
+                    .ok_or("SMP AP published an undocumented state")?;
+                match cpu::ap_wait(state, block.load(cpu::block::HISTORY)) {
+                    Wait::Complete => break,
+                    Wait::Failed => return Err("SMP AP reported a failed bootstrap"),
+                    Wait::Pending => {}
+                }
+                if spins >= AP_WAIT_LIMIT {
+                    return Err("SMP AP did not park within the bounded observation window");
+                }
+                core::hint::spin_loop();
+                spins += 1;
             }
-            if spins >= AP_WAIT_LIMIT {
-                return Err("SMP AP did not park within the bounded observation window");
-            }
-            core::hint::spin_loop();
-            spins += 1;
         }
         verify_ap(logical, root, start, end)?;
         parked += 1;
+        #[cfg(feature = "smp-work-test")]
+        log(format_args!(
+            "[NEU] SMP AP work-ready: logical={logical} apic={} ready_rsp={:#x} cr3={:#x} stack={:#x}\n",
+            block.load(cpu::block::APIC_ID),
+            block.load(cpu::block::READY_RSP),
+            block.load(cpu::block::CR3),
+            block.load(cpu::block::STACK_BOTTOM)
+        ))?;
+        #[cfg(not(feature = "smp-work-test"))]
         log(format_args!(
             "[NEU] SMP AP parked: logical={logical} apic={} entry_rsp={:#x} park_rsp={:#x} cr3={:#x} stack={:#x}\n",
             block.load(cpu::block::APIC_ID),
@@ -1024,11 +1063,19 @@ pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str
     if released != (EXPECTED - 1) as u64 {
         return Err("SMP released processor count does not match the profile");
     }
+    #[cfg(feature = "smp-work-test")]
     log(format_args!(
-        "[NEU] SMP bootstrap complete: cpus={EXPECTED} aps={} released={released} parked={parked} root={root:#x}\n",
+        "[NEU] SMP work-ready: cpus={EXPECTED} aps={} released={released} ready={parked} root={root:#x}\n",
         EXPECTED - 1
     ))?;
-    bsp_block.advance(Bootstrap::Parked)?;
+    #[cfg(not(feature = "smp-work-test"))]
+    {
+        log(format_args!(
+            "[NEU] SMP bootstrap complete: cpus={EXPECTED} aps={} released={released} parked={parked} root={root:#x}\n",
+            EXPECTED - 1
+        ))?;
+        bsp_block.advance(Bootstrap::Parked)?;
+    }
     Ok(())
 }
 
@@ -1041,10 +1088,23 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
         || block.load(cpu::block::ENTRY_COUNT) != 1
         || block.load(cpu::block::FAILURE) != 0
         || block.load(cpu::block::FAULT_VECTOR) != 0
-        || block.load(cpu::block::PARK_COUNT) != 1
         || block.load(cpu::block::SCHEDULER_LOCAL) != 0
         || block.load(cpu::block::RESERVED) != 0
     {
+        return Err("SMP AP block does not record exactly one clean kernel entry");
+    }
+    #[cfg(feature = "smp-work-test")]
+    {
+        let prefix = Bootstrap::Prepared.bit() | Bootstrap::Entered.bit() | Bootstrap::Ready.bit();
+        if Bootstrap::from_code(block.load(cpu::block::STATE)) != Some(Bootstrap::Ready)
+            || block.load(cpu::block::HISTORY) & prefix != prefix
+            || block.load(cpu::block::PARK_COUNT) != 0
+        {
+            return Err("SMP AP is not in the published work-ready state");
+        }
+    }
+    #[cfg(not(feature = "smp-work-test"))]
+    if block.load(cpu::block::PARK_COUNT) != 1 {
         return Err("SMP AP block does not record exactly one clean kernel entry");
     }
     let apic = block.load(cpu::block::APIC_ID);
@@ -1083,17 +1143,19 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
         bottom: own.stack_bottom,
         top: own.stack_top,
     };
-    for field in [
-        cpu::block::ENTRY_RSP,
-        cpu::block::READY_RSP,
-        cpu::block::PARK_RSP,
-    ] {
+    for field in [cpu::block::ENTRY_RSP, cpu::block::READY_RSP] {
         if !stack.contains(block.load(field)) {
             return Err("SMP AP reported an RSP outside its own stack");
         }
     }
-    if block.load(cpu::block::READY_RSP) < block.load(cpu::block::PARK_RSP) {
-        return Err("SMP AP park state was published before readiness");
+    #[cfg(not(feature = "smp-work-test"))]
+    {
+        if !stack.contains(block.load(cpu::block::PARK_RSP)) {
+            return Err("SMP AP reported an RSP outside its own stack");
+        }
+        if block.load(cpu::block::READY_RSP) < block.load(cpu::block::PARK_RSP) {
+            return Err("SMP AP park state was published before readiness");
+        }
     }
     let loader_rsp = block.load(cpu::block::LOADER_RSP);
     if loader_rsp == 0 || (start..end).contains(&loader_rsp) {
@@ -1157,7 +1219,7 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
     Ok(())
 }
 
-fn ap_fail(block: &CpuBlock, code: u64) -> ! {
+pub(super) fn ap_fail(block: &CpuBlock, code: u64) -> ! {
     block.store(cpu::block::FAILURE, code);
     let _ = block.advance(Bootstrap::Failed);
     silent_park()
@@ -1309,14 +1371,24 @@ extern "C" fn neu_smp_ap_main(info: *const MpInfo, logical: u64, loader_rsp: u64
 
     block.store(cpu::block::READY_RSP, stack_pointer());
     block.store(cpu::block::SELF_TEST, passed);
+    #[cfg(feature = "smp-work-test")]
+    {
+        block.store(cpu::block::ISOLATION, cpu::block::ISOLATION_AP);
+        super::smp_work::ap_initialize(index, apic);
+    }
     if block.advance(Bootstrap::Ready).is_err() {
         ap_fail(block, FAILURE_STATE);
     }
-    block.store(cpu::block::PARK_RSP, stack_pointer());
-    block.store(cpu::block::PARK_COUNT, 1);
-    block.store(cpu::block::ISOLATION, cpu::block::ISOLATION_AP);
-    if block.advance(Bootstrap::Parked).is_err() {
-        ap_fail(block, FAILURE_STATE);
+    #[cfg(feature = "smp-work-test")]
+    super::smp_work::ap_main(index, apic);
+    #[cfg(not(feature = "smp-work-test"))]
+    {
+        block.store(cpu::block::PARK_RSP, stack_pointer());
+        block.store(cpu::block::PARK_COUNT, 1);
+        block.store(cpu::block::ISOLATION, cpu::block::ISOLATION_AP);
+        if block.advance(Bootstrap::Parked).is_err() {
+            ap_fail(block, FAILURE_STATE);
+        }
+        silent_park()
     }
-    silent_park()
 }

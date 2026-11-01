@@ -234,6 +234,46 @@ pub(super) unsafe fn copy_kernel_idt(destination: *mut u8) {
     }
 }
 
+/// Installs the two Stage B work-interrupt gates into an AP-private IDT copy.
+/// Both gates use IST1 so the handler always runs on the AP's verified IST
+/// stack, and both remain Ring 0 interrupt gates.
+///
+/// # Safety
+/// `idt_base` must name the 4096-byte AP-private IDT before that AP starts.
+#[cfg(feature = "smp-ipi-test")]
+pub(super) unsafe fn install_ap_work_ipi(idt_base: *mut u8) -> Result<(), &'static str> {
+    unsafe extern "C" {
+        fn neu_smp_work_ipi();
+        fn neu_smp_work_ipi_spurious();
+    }
+    if idt_base.is_null() || idt_base as usize & 15 != 0 {
+        return Err("SMP AP work IPI IDT is misaligned");
+    }
+    let entries = [
+        (0xf0usize, neu_smp_work_ipi as *const () as u64),
+        (0xffusize, neu_smp_work_ipi_spurious as *const () as u64),
+    ];
+    for (vector, address) in entries {
+        let gate = Gate::new(address, 1);
+        // SAFETY: Caller guarantees the complete AP-private IDT is writable and
+        // not yet loaded by any processor.
+        unsafe {
+            ptr::write(idt_base.cast::<Gate>().add(vector), gate);
+            let actual = ptr::read(idt_base.cast::<Gate>().add(vector));
+            if actual.low != gate.low
+                || actual.mid != gate.mid
+                || actual.high != gate.high
+                || actual.selector != 8
+                || actual.attributes != 0x8e
+                || actual.ist != 1
+            {
+                return Err("SMP AP work IPI gate readback failed");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Loads AP-private GDTR/IDTR/TR and verifies the CPU readback. The GDT is
 /// initialized by the BSP before release and never shared with another CPU.
 #[cfg(feature = "smp-test")]
