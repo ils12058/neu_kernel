@@ -10,7 +10,9 @@ pub use mapping::{MapPermit, MapRequest, MappingBinding, TrackedMapAuthority};
 pub const HANDLES: usize = 8;
 pub const OBJECTS: usize = 4;
 pub const CHANNEL_OBJECTS: usize = 6;
-const STORAGE_OBJECTS: usize = if cfg!(any(feature = "device-test", test)) {
+const STORAGE_OBJECTS: usize = if cfg!(feature = "dma-test") {
+    11
+} else if cfg!(any(feature = "device-test", test)) {
     9
 } else {
     CHANNEL_OBJECTS
@@ -28,6 +30,8 @@ pub enum ObjectType {
     DeviceResource = 6,
     MmioRegion = 7,
     Interrupt = 8,
+    DmaDomain = 9,
+    DmaBuffer = 10,
 }
 impl ObjectType {
     fn from_raw(value: u8) -> Self {
@@ -40,6 +44,8 @@ impl ObjectType {
             6 => Self::DeviceResource,
             7 => Self::MmioRegion,
             8 => Self::Interrupt,
+            9 => Self::DmaDomain,
+            10 => Self::DmaBuffer,
             _ => Self::None,
         }
     }
@@ -101,6 +107,8 @@ impl Rights {
             ObjectType::MemoryObject => access != 0 && access & !0x0f == 0,
             ObjectType::DeviceResource => access != 0 && access & !0x14 == 0,
             ObjectType::MmioRegion | ObjectType::Interrupt => access != 0 && access & !3 == 0,
+            ObjectType::DmaDomain => access != 0 && access & !0x34 == 0,
+            ObjectType::DmaBuffer => access != 0 && access & !7 == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -748,6 +756,28 @@ impl Objects {
             kind: ObjectType::DeviceResource,
             generation: 0,
         })
+    }
+    /// Trusted DMA manager, using a previously authorized device generation.
+    pub fn install_dma_capability(
+        &mut self,
+        table: &mut Table,
+        kind: ObjectType,
+        generation: u64,
+    ) -> Result<Handle> {
+        let rights = match kind {
+            ObjectType::DmaDomain => Rights::CLAIM.union(Rights::SEND).union(Rights::INSPECT),
+            ObjectType::DmaBuffer => Rights::READ_WRITE.union(Rights::CLAIM),
+            _ => return Err(Error::Type),
+        }
+        .union(Rights::DERIVE)
+        .union(Rights::REVOKE);
+        if generation == 0 {
+            return Err(Error::Object);
+        }
+        let object = self.create(Value::Device { kind, generation })?;
+        let result = table.grant(self, &object, rights);
+        self.release(object).expect("DMA creator reference");
+        result
     }
     /// Publish both typed handles atomically under the shared transaction. Every
     /// failure releases all provisional object/lineage references.
@@ -1713,7 +1743,13 @@ impl Table {
         for slot in 0..HANDLES {
             let entry = &self.slots[slot];
             if entry.live
-                && matches!(entry.kind, ObjectType::MmioRegion | ObjectType::Interrupt)
+                && matches!(
+                    entry.kind,
+                    ObjectType::MmioRegion
+                        | ObjectType::Interrupt
+                        | ObjectType::DmaDomain
+                        | ObjectType::DmaBuffer
+                )
                 && matches!(objects.object(entry.target)?.value, Value::Device { generation: g, .. } if g == generation)
             {
                 self.close(

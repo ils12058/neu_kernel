@@ -6,10 +6,18 @@ use abi::v07 as op;
 use neu_kernel::device::{self as protocol, Device, phase, reason};
 pub(super) const MMIO: u64 = paging::LAPIC_VIEW + PAGE;
 pub(super) const IOAPIC: u64 = paging::LAPIC_VIEW + 2 * PAGE;
-const GSI: u32 = 21;
+static GSI: AtomicU64 = AtomicU64::new(21);
+static SELECTED: AtomicU64 = AtomicU64::new(0x28);
+fn gsi() -> u32 {
+    GSI.load(Ordering::Acquire) as u32
+}
+#[cfg(feature = "dma-test")]
+#[path = "smp_dma.rs"]
+mod dma;
 const ROUTE: u32 = 0xa000 | protocol::VECTOR as u32;
 const MASK: u32 = 1 << 16;
 const JOURNAL: usize = 512;
+const IRQ_LIMIT: usize = if cfg!(feature = "dma-test") { 64 } else { 16 };
 static BAR: AtomicU64 = AtomicU64::new(0);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -17,7 +25,8 @@ static EVENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[unsafe(no_mangle)]
 static neu_device_layout: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 #[unsafe(no_mangle)]
-static neu_device_irq: [[AtomicU64; 40]; 16] = [const { [const { AtomicU64::new(0) }; 40] }; 16];
+static neu_device_irq: [[AtomicU64; 40]; IRQ_LIMIT] =
+    [const { [const { AtomicU64::new(0) }; 40] }; IRQ_LIMIT];
 #[unsafe(no_mangle)]
 static neu_device_operations: [[AtomicU64; 32]; JOURNAL] =
     [const { [const { AtomicU64::new(0) }; 32] }; JOURNAL];
@@ -40,6 +49,8 @@ pub(super) struct Controller {
     pending_checkpoint: bool,
     release_checkpoint: bool,
     scrub: u64,
+    #[cfg(feature = "dma-test")]
+    dma: dma::Controller,
 }
 impl Controller {
     pub const fn new() -> Self {
@@ -54,6 +65,8 @@ impl Controller {
             pending_checkpoint: false,
             release_checkpoint: false,
             scrub: 0,
+            #[cfg(feature = "dma-test")]
+            dma: dma::Controller::new(),
         }
     }
 }
@@ -80,6 +93,7 @@ fn pci(bdf: u32, offset: u32) -> u32 {
     }
     value
 }
+#[cfg(not(feature = "dma-test"))]
 fn pci32(bdf: u32, offset: u32, value: u32) {
     pci_select(bdf, offset);
     unsafe {
@@ -107,11 +121,16 @@ fn io_write(index: u32, value: u32) {
     }
 }
 fn route() -> u32 {
-    io_read(0x10 + GSI * 2)
+    io_read(0x10 + gsi() * 2)
 }
 fn mask() {
-    io_write(0x10 + GSI * 2, ROUTE | MASK);
+    io_write(0x10 + gsi() * 2, ROUTE | MASK);
 }
+#[cfg(feature = "dma-test")]
+pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+    dma::init(paging)
+}
+#[cfg(not(feature = "dma-test"))]
 pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     if pci(0, 0) != 0x29c0_8086 || pci(0xf8, 0) != 0x2918_8086 {
         return Err("K11 requires validated Q35/ICH9");
@@ -125,7 +144,7 @@ pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
             }
         } else if id as u16 != 0xffff && bdf >> 3 < 25 {
             let pin = (pci(bdf, 0x3c) >> 8) & 0xff;
-            if (1..=4).contains(&pin) && 20 + (((bdf >> 3) + pin - 1) % 4) == GSI {
+            if (1..=4).contains(&pin) && 20 + (((bdf >> 3) + pin - 1) % 4) == gsi() {
                 return Err("K11 shared INTx route unsupported");
             }
         }
@@ -141,7 +160,7 @@ pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     pci32(bdf, 0x10, u32::MAX);
     let size = (!(pci(bdf, 0x10) & !15)).wrapping_add(1) as u64;
     pci32(bdf, 0x10, bar);
-    if bar & 15 != 0 || !protocol::valid_resource(bdf as u64, bar as u64, size, GSI as u64) {
+    if bar & 15 != 0 || !protocol::valid_resource(bdf as u64, bar as u64, size, u64::from(gsi())) {
         return Err("K11 invalid EDU aperture");
     }
     let mut cap = pci(bdf, 0x34) & 0xff;
@@ -176,13 +195,13 @@ pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         return Err("K11 I/O APIC is not a quiescent Q35 controller");
     }
     let old_route = route();
-    let old_destination = io_read(0x11 + GSI * 2);
+    let old_destination = io_read(0x11 + gsi() * 2);
     let destination = smp::neu_smp_cpus[0].load(cpu::block::APIC_ID);
     if destination >= 255 {
         return Err("K11 xAPIC destination");
     }
     mask();
-    io_write(0x11 + GSI * 2, (destination as u32) << 24);
+    io_write(0x11 + gsi() * 2, (destination as u32) << 24);
     pci16(bdf, 4, (command & !0x407) | 2);
     if pci(bdf, 4) as u16 & 0x407 != 2 || reg(0) != protocol::IDENT || reg(0x20) & 1 != 0 {
         return Err("K11 device configuration readback");
@@ -199,7 +218,7 @@ pub(super) fn init(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         (4, size),
         (5, MMIO),
         (6, IOAPIC),
-        (7, GSI as u64),
+        (7, u64::from(gsi())),
         (8, bdf as u64),
         (9, ecam & !0x0fff_ffff),
         (10, EVENT.as_ptr() as u64),
@@ -235,6 +254,9 @@ pub(super) fn bootstrap(s: &mut State) -> Result<(), &'static str> {
         .release(resource)
         .map_err(|_| "K11 resource creator")?;
     // Fixture mode is data, never a privilege checked by a public operation.
+    #[cfg(feature = "dma-test")]
+    let mode = dma::mode();
+    #[cfg(not(feature = "dma-test"))]
     let mode = if cfg!(feature = "test-smp-device-flight-fault") {
         6
     } else if cfg!(feature = "test-smp-device-fault") {
@@ -254,6 +276,8 @@ pub(super) fn bootstrap(s: &mut State) -> Result<(), &'static str> {
     Ok(())
 }
 pub(super) fn snapshot(s: &State) {
+    #[cfg(feature = "dma-test")]
+    dma::snapshot(s);
     neu_device_layout[1].store(ptr::from_ref(&s.device.device) as u64, Ordering::Release);
     neu_device_layout[2].store(size_of::<Device>() as u64, Ordering::Release);
     neu_device_layout[17].store(
@@ -268,6 +292,7 @@ pub(super) fn snapshot(s: &State) {
     {
         cell.store(value, Ordering::Release);
     }
+    neu_device_layout[45].store(IRQ_LIMIT as u64, Ordering::Release);
     barrier_word(16).store(s.device.device.phase, Ordering::Release);
     barrier_word(17).store(s.device.device.generation, Ordering::Release);
 }
@@ -385,6 +410,8 @@ fn quarantine(s: &mut State, why: u64, wake: bool) {
         );
     }
     if s.device.device.quarantines != before {
+        #[cfg(feature = "dma-test")]
+        dma::quarantine(s);
         s.device.wakes |= 1;
         event(s, 5, why, 0);
     }
@@ -433,6 +460,9 @@ pub(super) fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Fra
     let now = TICKS.load(Ordering::Acquire);
     let result = (|| -> core::result::Result<Outcome, i64> {
         if (op::owns(number) && !op::valid_arguments(number, args))
+            || (cfg!(feature = "dma-test")
+                && abi::v08::owns(number)
+                && !abi::v08::valid_arguments(number, args))
             || (abi::v06::owns(number) && !abi::v06::valid_arguments(number, args))
         {
             return Err(abi::INVALID_ARGUMENT);
@@ -444,7 +474,10 @@ pub(super) fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Fra
                     && (s.device.handles[0] == h.raw()
                         || matches!(
                             object.kind(),
-                            ObjectType::MmioRegion | ObjectType::Interrupt
+                            ObjectType::MmioRegion
+                                | ObjectType::Interrupt
+                                | ObjectType::DmaDomain
+                                | ObjectType::DmaBuffer
                         ))
                 {
                     quarantine_reason = Some(reason::CLOSE);
@@ -504,6 +537,8 @@ pub(super) fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Fra
                     c(lease.table().grant_id(&s.objects, active.node, irq))?,
                 ]);
                 assert_eq!(d(s.device.device.claim(active.node.raw(), now))?, next);
+                #[cfg(feature = "dma-test")]
+                dma::claim(s, active.node.raw(), next);
                 mmio.raw()
             }
             op::DEVICE_INTERRUPT => {
@@ -617,6 +652,19 @@ pub(super) fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Fra
                 s.device.device.acknowledge(now);
                 0
             }
+            #[cfg(feature = "dma-test")]
+            n if abi::v08::owns(n) => match dma::operation(s, lease.table_mut(), active, n, args) {
+                Ok(value) => value,
+                Err(error) => {
+                    if error == -53 {
+                        quarantine_reason = Some(reason::BUDGET);
+                    }
+                    if error == -54 {
+                        quarantine_reason = Some(reason::HARDWARE);
+                    }
+                    return Err(error);
+                }
+            },
             _ => return Err(abi::NOT_SUPPORTED),
         };
         Ok(Outcome::Return { status: 0, scalar })
@@ -632,12 +680,18 @@ pub(super) fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Fra
         Outcome::Return { status, scalar: 0 }
     });
     if let Some(ticket) = revoke {
-        if s.device.grants.iter().any(|grant| {
-            *grant != cap::GrantId::NONE
-                && s.objects
-                    .revoke_selects(&ticket, *grant)
-                    .expect("K11 revoke selection")
-        }) {
+        #[cfg(feature = "dma-test")]
+        let dma_revoke = dma::revoke_selects(s, &ticket);
+        #[cfg(not(feature = "dma-test"))]
+        let dma_revoke = false;
+        if dma_revoke
+            || s.device.grants.iter().any(|grant| {
+                *grant != cap::GrantId::NONE
+                    && s.objects
+                        .revoke_selects(&ticket, *grant)
+                        .expect("K11 revoke selection")
+            })
+        {
             quarantine(s, reason::REVOKE, true);
         }
         s.objects
@@ -740,6 +794,10 @@ pub(super) fn service() {
         let epoch = EVENT[0].swap(0, Ordering::AcqRel);
         if epoch != 0 {
             let status = EVENT[1].swap(0, Ordering::AcqRel);
+            #[cfg(feature = "dma-test")]
+            if dma::completion(s, status).is_err() {
+                quarantine(s, reason::HARDWARE, true);
+            }
             match s.device.device.interrupt(epoch, status, now) {
                 Ok(Some((thread, sequence))) => settle(s, thread, 0, sequence, true),
                 Ok(None) => (),
@@ -760,7 +818,7 @@ pub(super) fn service() {
                 quarantine(s, reason::HARDWARE, true);
             } else {
                 EPOCH.store(s.device.device.generation, Ordering::Release);
-                io_write(0x10 + GSI * 2, ROUTE);
+                io_write(0x10 + gsi() * 2, ROUTE);
                 s.device
                     .device
                     .armed(s.device.device.generation)
@@ -780,9 +838,22 @@ pub(super) fn service() {
                 || route() & 0x4000 != 0
                 || EVENT[0].load(Ordering::Acquire) != 0;
             if !pending {
+                #[cfg(feature = "dma-test")]
+                if !computing && s.device.device.flight == status && status == neu_kernel::dma::IRQ
+                {
+                    dma::completion(s, status).expect("DMA quarantine completion");
+                    s.device.device.observe_completion(false, status);
+                    event(s, 9, status, 0);
+                }
                 s.device.device.observe_completion(computing, status);
             }
-            if s.device.device.flight == 0 && !pending {
+            #[cfg(feature = "dma-test")]
+            let dma_retired = s.device.device.flight == 0
+                && !pending
+                && dma::retire(s).expect("DMA quarantine isolation retained");
+            #[cfg(not(feature = "dma-test"))]
+            let dma_retired = true;
+            if s.device.device.flight == 0 && !pending && dma_retired {
                 if s.device.scrub == 0 {
                     // The neutral command also clears COMPUTING before
                     // checking IRQFACT. Require its actual completion raise
@@ -826,8 +897,14 @@ pub(super) fn service() {
                 }
             }
         }
+        #[cfg(feature = "dma-test")]
+        let dma_checkpoint = dma::fixture_service(s).expect("DMA hardware isolation probe");
+        #[cfg(not(feature = "dma-test"))]
+        let dma_checkpoint = 0;
         let d = &s.device.device;
-        let checkpoint = if scrub_probe {
+        let checkpoint = if dma_checkpoint != 0 {
+            dma_checkpoint
+        } else if scrub_probe {
             4
         } else if d.generation == 1 && d.waiter != 0 && d.blocked > s.device.wait_checkpoints {
             s.device.wait_checkpoints = d.blocked;
@@ -861,6 +938,8 @@ pub(super) fn service() {
             2 => barrier_word(13).store(1, Ordering::Release),
             3 => barrier_word(19).store(1, Ordering::Release),
             4 => (),
+            #[cfg(feature = "dma-test")]
+            30..=33 => with_state(0, |s| dma::checkpoint_done(s, checkpoint)),
             _ => unreachable!(),
         }
     }
@@ -890,22 +969,34 @@ pub(super) fn cleanup(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         || reg(0x80) != 0
         || reg(0x88) != 0
         || reg(0x90) != 0
-        || reg(0x98) != 0
+        || reg(0x98) != if cfg!(feature = "dma-test") { 6 } else { 0 }
         || route() & (MASK | 0x4000) != MASK
     {
         return Err("K11 residual device/DMA/IRQ state");
     }
-    pci16(0x28, 4, (pci(0x28, 4) as u16 & !7) | 0x400);
+    let selected = SELECTED.load(Ordering::Acquire) as u32;
+    #[cfg(feature = "dma-test")]
+    crate::arch::pci::bus_master_path(
+        neu_kernel::pci::Bdf {
+            segment: 0,
+            bus: (selected >> 8) as u8,
+            devfn: selected as u8,
+        },
+        false,
+    );
+    pci16(selected, 4, (pci(selected, 4) as u16 & !7) | 0x400);
+    #[cfg(feature = "dma-test")]
+    dma::cleanup(paging)?;
     let msi = neu_device_layout[16].load(Ordering::Acquire) as u32;
-    if pci(0x28, 4) & 0x407 != 0x400 || pci(0x28, msi) & 0x10000 != 0 {
+    if pci(selected, 4) & 0x407 != 0x400 || pci(selected, msi) & 0x10000 != 0 {
         return Err("K11 final PCI authority");
     }
     io_write(
-        0x10 + GSI * 2,
+        0x10 + gsi() * 2,
         neu_device_layout[41].load(Ordering::Acquire) as u32,
     );
     io_write(
-        0x11 + GSI * 2,
+        0x11 + gsi() * 2,
         neu_device_layout[42].load(Ordering::Acquire) as u32,
     );
     paging

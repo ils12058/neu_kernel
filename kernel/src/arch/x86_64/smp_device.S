@@ -59,6 +59,18 @@ neu_smp_sched_query_resume:
     syscall
     DOK
     mov [rbp + 56], rdx
+.if NEU_DMA_DISABLED
+    mov ebx, 0x22
+neu_device_dma_disabled_loop:
+    mov rdi, [rbp + 56]
+    DZERO
+    mov rax, rbx
+    syscall
+    DERR -1
+    inc ebx
+    cmp ebx, 0x29
+    jne neu_device_dma_disabled_loop
+.endif
     movabs r8, 0x1122334455667788
     xor ebx, ebx
 neu_smp_sched_user_loop_begin:

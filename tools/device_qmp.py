@@ -50,7 +50,7 @@ def validate_hardware(config, regs, dma, route, destination, bar, final, require
 
 def validate_checkpoints(case, checkpoints, require):
     required = {('checkpoint', 1, 1), ('checkpoint', 3), ('scrub', 1), ('scrub', 2)}
-    if case in ('smp-device-2', 'smp-device-4'):
+    if case in ('smp-device-2', 'smp-device-4', 'smp-device-dma-disabled'):
         required.add(('checkpoint', 2))
     if case in ('smp-device-close', 'smp-device-revoke'):
         required.add(('checkpoint', 1, 2))
@@ -66,6 +66,16 @@ def validate_scrub(state, hardware, mailbox, epoch, require):
 
 
 class DeviceModel:
+    unsupported_dma = False
+    info = 0x7000003FF
+    irq_statuses = (1, 2)
+    lease_kinds = (7, 8)
+    def before_row(self, row):
+        pass
+    def after_row(self, row):
+        pass
+    def budget_exhausted(self):
+        return self.remaining == 0
     def __init__(self, initial, require):
         self.require = require
         self.tables = [{(h['generation'] << 32) | (h['slot'] + 1): copy.deepcopy(h)
@@ -129,7 +139,7 @@ class DeviceModel:
     @staticmethod
     def rights(kind, value):
         access = value & 255
-        masks = {1: 3, 2: 1, 3: 16, 4: 224, 5: 15, 6: 20, 7: 3, 8: 3}
+        masks = {1: 3, 2: 1, 3: 16, 4: 224, 5: 15, 6: 20, 7: 3, 8: 3, 9: 0x34, 10: 7}
         return bool(value and not value & ~1023 and kind in masks and not access & ~masks[kind]
                     and (access or kind == 3))
 
@@ -153,7 +163,7 @@ class DeviceModel:
         if used and any(args[used:]):
             expected = -2, 0
         elif op == 1:
-            expected = 0, 0x7000003FF
+            expected = 0, self.info
         elif op == 2:
             expected = (-101, handle) if handle <= 255 else (-2, 0)
         elif op == (MASK64 - 255):
@@ -266,6 +276,8 @@ class DeviceModel:
                     self.receiver = self.status = 0
                     self.phase = REARM
                     self.acks += 1
+        elif self.unsupported_dma and 0x22 <= op <= 0x28:
+            expected = -1, 0
         else:
             self.require(False, 'unexpected operation in device syscall journal')
         expected = expected[0] & MASK64, expected[1]
@@ -278,6 +290,7 @@ class DeviceModel:
             row = rows[index]
             self.require(len(row) == 32 and row[0] == index + 1, 'missing/reordered device transaction')
             kind = row[1]
+            self.before_row(row)
             old_deadline = self.deadline
             if kind == 0:
                 self.operation(row)
@@ -310,7 +323,7 @@ class DeviceModel:
                 self.waiter = None
                 self.results[key] = row[13], row[14]
             elif kind == 3:
-                self.require(row[7] == self.generation and row[8] in (1, 2), 'foreign IRQ generation/status')
+                self.require(row[7] == self.generation and row[8] in self.irq_statuses, 'foreign IRQ generation/status')
                 if self.deferred_irq:
                     self.require(self.status == row[8], 'wake status differs from hardware event')
                     self.deferred_irq = False
@@ -333,7 +346,7 @@ class DeviceModel:
                 if why == 4:
                     self.require(row[24] >= old_deadline and old_deadline > 0, 'watchdog fired before its deadline')
                 if why == 5:
-                    self.require(self.remaining == 0, 'operation budget quarantined prematurely')
+                    self.require(self.budget_exhausted(), 'operation budget quarantined prematurely')
                 self.phase, self.reason, self.receiver = QUARANTINE, why, 0
                 self.quarantines += 1
             elif kind == 6:
@@ -342,7 +355,7 @@ class DeviceModel:
                              'reassigned device before retiring pending work and neutral reset')
                 owner = 0 if self.owner == NODES[0] else 1
                 for handle in list(self.tables[owner]):
-                    if self.tables[owner][handle]['kind'] in (7, 8):
+                    if self.tables[owner][handle]['kind'] in self.lease_kinds:
                         del self.tables[owner][handle]
                 self.owner = self.receiver = self.status = self.remaining = 0
                 self.phase = FREE
@@ -357,6 +370,10 @@ class DeviceModel:
             elif kind == 8:
                 self.require(row[7] in NODES[:2], 'foreign Node authority teardown')
                 self.tables[0 if row[7] == NODES[0] else 1].clear()
+            elif kind == 9 and 256 in self.irq_statuses:
+                self.require(self.phase == QUARANTINE and self.flight == row[7] == 256,
+                             'masked completion lacks a quarantined DMA command')
+                self.flight = 0
             else:
                 self.require(False, 'unknown device transaction category')
             state = [self.generation, self.phase, self.owner, self.sequence, self.status,
@@ -368,10 +385,13 @@ class DeviceModel:
             if row[25] and row[25] != old_deadline:
                 self.require(self.tick + 80 <= row[25] <= row[24] + 80, 'watchdog interval was extended or shortened')
             self.tick, self.deadline = row[24], row[25]
+            self.after_row(row)
             self.rows.append(row)
 
 
 class Extension:
+    model_class = DeviceModel
+    lease_kinds = (6, 7, 8)
     def __init__(self, observer):
         self.o = observer
         self.require = observer.require
@@ -395,13 +415,13 @@ class Extension:
             result['generations'].append([memory.u32(t[3] + i*t[4] + t[6]) for i in range(8)] if any(t) else [])
             manifest = [0]*8
             for h in handles:
-                if h['slot'] == 0 or h['kind'] == 6:
-                    manifest[0 if h['slot'] == 0 else 5] = h['generation'] << 32 | h['slot']+1
+                if h['kind'] in (2, 3, 4, 6):
+                    manifest[{3: 0, 2: 3, 4: 4, 6: 5}[h['kind']]] = h['generation'] << 32 | h['slot']+1
             result['bootstrap'].append(manifest)
             for h in handles:
                 if h['grant']:
                     owners.setdefault(h['grant'], [0]*4)[0] += 1
-                if h['kind'] in (6, 7, 8):
+                if h['kind'] in self.lease_kinds:
                     self.require(not h['transferable'], 'device authority became transferable')
                     obj = object_by_id[h['target']]
                     h['lease'] = obj['target']
@@ -422,7 +442,8 @@ class Extension:
             self.require(phase == 1 and all(len(h) == 4 for h in result['handles']) and len(grants) == 2,
                          'wrong device bootstrap authority')
             self.initial = copy.deepcopy(result)
-            self.model = DeviceModel(self.initial, self.require)
+            self.model = self.model_class(self.initial, self.require)
+            self.model.unsupported_dma = self.o.case == "smp-device-dma-disabled"
         if phase == 4:
             self.require(not grants, 'device lineage leaked at final cleanup')
 
@@ -551,7 +572,7 @@ class Extension:
 
     def terminal(self, memory, physical, cpus, scheduler, authority, inventory, evidence):
         d = memory.words(self.layout(memory)[1], 24)
-        normal = self.o.case in ('smp-device-2', 'smp-device-4')
+        normal = self.o.case in ('smp-device-2', 'smp-device-4', 'smp-device-dma-disabled')
         flight_fault = self.o.case == "smp-device-flight-fault"
         irqs = 4 if normal or flight_fault else 3
         acks = 4 if normal else (2 if self.o.case in ('smp-device-fault', 'smp-device-timeout') else 3)

@@ -34,14 +34,20 @@ AUTHORITY = {"smp-authority-2": 2, "smp-authority-4": 4, "smp-authority-queued":
 CASES.update(AUTHORITY)
 DEVICE = {"smp-device-2": 2, "smp-device-4": 4, "smp-device-fault": 4, "smp-device-flight-fault": 4,
           "smp-device-close": 2, "smp-device-revoke": 4, "smp-device-timeout": 4,
-          "smp-device-budget": 2}
+          "smp-device-budget": 2, "smp-device-dma-disabled": 2}
+DMA = {"smp-dma-2": 2, "smp-dma-4": 4, "smp-dma-slot": 2, "smp-dma-bridge": 4,
+       "smp-dma-unmapped": 2, "smp-dma-readonly": 2, "smp-dma-requester": 4, "smp-dma-revoked": 4,
+       "smp-dma-close": 2, "smp-dma-revoke": 4, "smp-dma-submit-revoke": 4, "smp-dma-fault": 4,
+       "smp-dma-timeout": 2, "smp-dma-quota": 2}
+DEVICE.update(DMA)
 CASES.update(DEVICE)
 CASES["smp-device-disabled"] = 2
+CASES["smp-dma-disabled"] = 2
 AUTHORITY_FAULT = {"smp-authority-2", "smp-authority-4", "smp-authority-queued", "smp-authority-terminate"}
 MIGRATE = {"smp-schedule-migrate", "smp-schedule-stress"}
 IPC = {"smp-schedule-idle", "smp-schedule-ipc"}
 TLB = {"smp-tlb-2", "smp-tlb-4", "smp-tlb-invalid"}
-CPU_FAULT = TLB | {"smp-schedule-fault", "smp-device-fault", "smp-device-flight-fault"} | AUTHORITY_FAULT
+CPU_FAULT = TLB | {"smp-schedule-fault", "smp-device-fault", "smp-device-flight-fault", "smp-dma-fault"} | AUTHORITY_FAULT
 FAULT = CPU_FAULT | {"smp-schedule-reject"}
 MAGIC = 0x4E45555F53434831
 LAYOUT = [MAGIC, 4, 64, 832, 512, 672, 256, 32, 256]
@@ -131,7 +137,7 @@ class Observer:
         self.qmp, self.case, self.symbols = qmp, case, symbols
         self.deadline, self.failure, self.output = deadline, failure, output
         self.cpus = CASES[case]
-        self.trace_limit = 512 if case in DEVICE else 256
+        self.trace_limit = 2048 if case in DMA else 512 if case in DEVICE else 256
         self.trace_stride = self.trace_limit * 256
         self.baseline = self.prepared = None
         self.native, self.irq, self.invalidation = {}, {}, {}
@@ -139,7 +145,10 @@ class Observer:
         self.negatives = False
         self.runtime_checks = 0
         self.device_extension = None
-        if case in DEVICE:
+        if case in DMA:
+            from dma_qmp import Extension
+            self.device_extension = Extension(self)
+        elif case in DEVICE:
             from device_qmp import Extension
             self.device_extension = Extension(self)
         self.authority_extension = None
@@ -455,7 +464,7 @@ class Observer:
         if self.authority_extension:
             return self.authority_extension.authority(memory, scheduler, phase)
         d = self.array(memory, "neu_smp_sched_authority", 128)
-        self.require(d[0] == 1 and d[3] == (9 if self.device_extension else 6) and d[13:17] == [8, 8, 1, 2], "unknown capability object schema")
+        self.require(d[0] == 1 and d[3] == (11 if self.case in DMA else 9 if self.device_extension else 6) and d[13:17] == [8, 8, 1, 2], "unknown capability object schema")
         objects = []
         for slot in range(d[3]):
             row = memory.read(d[4] + slot * d[5], d[5])
@@ -750,12 +759,12 @@ class Observer:
                      "terminal observation lost execution pins before all CPUs were stopped")
         for slot, row in enumerate(data):
             self.require(row[0] > 0 and row[1] == 0x1122334455667788
-                         and row[2] == (0x7000003FF if self.device_extension else (0x6000001FF if self.authority_extension else 0x5000000FF))
+                         and row[2] == (0x8000007FF if self.case in DMA else 0x7000003FF if self.device_extension else (0x6000001FF if self.authority_extension else 0x5000000FF))
                          and (self.authority_extension or row[10] == 11) and row[7] != 0,
                          "Thread lost progress/register canary/ABI/inspection result")
             if self.case not in FAULT or slot == 1:
                 self.require(row[4] == slot + 1 and scheduler["threads"][slot]["words"][7:9] == [1, 128], "wrong normal Thread outcome")
-        if self.case == "smp-device-disabled":
+        if self.case in ("smp-device-disabled", "smp-dma-disabled"):
             self.require(all(row[13] == 7 for row in data), "legacy ABI accepted a device operation")
         if self.case == "smp-authority-disabled":
             self.require(all(row[13] == 2 for row in data), "legacy ABI did not reject both authority operations on every Thread")
@@ -844,7 +853,7 @@ class Observer:
                         rejected.append({"cpu": cpu, "address": address, "normalized": normalized, "trace": row})
                 else:
                     wanted_error = 6 if self.authority_extension else 7
-                    wanted_address = 0xffffb00000001000 if self.case in ("smp-device-fault", "smp-device-flight-fault") else 0x440000 if self.case == "smp-authority-terminate" else (0x410010 if self.authority_extension else (0x410210 if self.case in TLB else self.symbol("__text_start")))
+                    wanted_address = 0xffffb00000001000 if self.case in ("smp-device-fault", "smp-device-flight-fault", "smp-dma-fault") else 0x440000 if self.case == "smp-authority-terminate" else (0x410010 if self.authority_extension else (0x410210 if self.case in TLB else self.symbol("__text_start")))
                     wanted_site = "neu_authority_pending_fault_site" if self.case == "smp-authority-terminate" else ("neu_authority_fault_site" if self.authority_extension else ("neu_smp_sched_tlb_fault_site" if self.case in TLB else "neu_smp_sched_fault_site"))
                     self.require(self.case in CPU_FAULT and slot == 2 and row[4] == 14
                                  and row[9] == wanted_error and row[5] == wanted_address
@@ -912,7 +921,7 @@ class Observer:
         elif operation == 0x10 or operation == 0x18 and status == 0:
             self.require(status == 0 and value != 0, "bootstrap/received capability did not return a live handle")
             return
-        elif (operation in (0x19, 0x1a) and self.case == "smp-authority-disabled") or (0x1b <= operation <= 0x21 and self.case == "smp-device-disabled"):
+        elif (operation in (0x19, 0x1a) and self.case == "smp-authority-disabled") or (0x1b <= operation <= 0x21 and self.case == "smp-device-disabled") or (0x22 <= operation <= 0x28 and self.case == "smp-dma-disabled"):
             wanted = ((-1 & MASK64), 0)
         elif operation == 0x18:
             wanted = ((-32 & MASK64), 0)

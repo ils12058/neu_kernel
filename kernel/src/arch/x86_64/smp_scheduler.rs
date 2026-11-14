@@ -28,9 +28,11 @@ use neu_kernel::{
     sync::SpinLock,
     syscall::{self as abi, Frame, Outcome},
 };
-global_asm!(".set NEU_DEVICE, {device}", include_str!("smp_scheduler.S"), device = const cfg!(feature = "device-test") as u8);
-#[cfg(feature = "device-test")]
-global_asm!(include_str!("smp_device.S"));
+global_asm!(".set NEU_DEVICE, {device}", ".set NEU_ABI08_DISABLED, {disabled}", include_str!("smp_scheduler.S"), device = const cfg!(feature = "device-test") as u8, disabled = const cfg!(feature = "test-smp-dma-disabled") as u8);
+#[cfg(all(feature = "device-test", not(feature = "dma-test")))]
+global_asm!(".set NEU_DMA_DISABLED, {disabled}", include_str!("smp_device.S"), disabled = const cfg!(feature = "test-smp-device-dma-disabled") as u8);
+#[cfg(feature = "dma-test")]
+global_asm!(include_str!("smp_dma.S"));
 #[cfg(feature = "authority-test")]
 #[path = "smp_authority.rs"]
 mod authority;
@@ -39,9 +41,11 @@ mod authority;
 mod devices;
 const MAGIC: u64 = 0x4e45_555f_5343_4831;
 const WORDS: usize = 64;
-// K11 retains every AP continuation while the BSP observes device IRQ/reset
-// windows and the 80-tick watchdog. Earlier fixtures keep their original bound.
-const TRACE_LIMIT: usize = if cfg!(feature = "device-test") {
+// DMA retains every AP continuation through up to 16 transfers per claim and
+// masked scrub/IRQ windows. K11 and earlier fixtures retain their own bounds.
+const TRACE_LIMIT: usize = if cfg!(feature = "dma-test") {
+    2048
+} else if cfg!(feature = "device-test") {
     512
 } else {
     256
@@ -882,7 +886,11 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
 fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outcome {
     let number = f.registers.rax;
     #[cfg(feature = "device-test")]
-    if abi::v07::owns(number) || abi::v06::owns(number) || number == abi::v02::CAP_CLOSE {
+    if abi::v07::owns(number)
+        || abi::v06::owns(number)
+        || number == abi::v02::CAP_CLOSE
+        || (cfg!(feature = "dma-test") && abi::v08::owns(number))
+    {
         return devices::operation(s, cpu, active, f);
     }
     #[cfg(feature = "authority-test")]
@@ -907,7 +915,11 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
         let scalar = match number {
             abi::ABI_QUERY => {
                 if cfg!(feature = "device-test") {
-                    abi::v07::INFO
+                    if cfg!(feature = "dma-test") {
+                        abi::v08::INFO
+                    } else {
+                        abi::v07::INFO
+                    }
                 } else if cfg!(feature = "authority-test") {
                     abi::v06::INFO
                 } else {
@@ -1902,7 +1914,9 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
                 .raw();
             let action = if cfg!(feature = "device-test") {
                 30
-            } else if cfg!(feature = "test-smp-device-disabled") {
+            } else if cfg!(feature = "test-smp-device-disabled")
+                || cfg!(feature = "test-smp-dma-disabled")
+            {
                 18
             } else if cfg!(feature = "authority-test") {
                 20

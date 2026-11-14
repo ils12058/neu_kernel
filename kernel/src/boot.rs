@@ -67,6 +67,92 @@ struct HhdmResponse {
     offset: u64,
 }
 
+#[cfg(feature = "dma-test")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RsdpResponse {
+    revision: u64,
+    address: u64,
+}
+
+#[cfg(feature = "dma-test")]
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static RSDP: LoaderCell<Request<RsdpResponse>> = LoaderCell(UnsafeCell::new(Request::new([
+    0xc5e7_7b6b_397e_7b43,
+    0x2763_7845_accd_cf3c,
+])));
+
+#[cfg(feature = "dma-test")]
+static PCI_FIRMWARE: LoaderCell<neu_kernel::acpi::Firmware> =
+    LoaderCell(UnsafeCell::new(neu_kernel::acpi::Firmware::new()));
+#[cfg(feature = "dma-test")]
+static PCI_COPIED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "dma-test")]
+pub fn pci_firmware() -> &'static neu_kernel::acpi::Firmware {
+    assert!(PCI_COPIED.load(Ordering::Acquire));
+    // SAFETY: Boot copies this value once before publishing it. No runtime
+    // writer exists and no firmware-owned reference escapes the adapter.
+    unsafe { &*PCI_FIRMWARE.0.get() }
+}
+
+#[cfg(feature = "dma-test")]
+pub fn copy_pci_firmware(info: &BootInfo) -> Result<(), &'static str> {
+    struct Reader<'a> {
+        map: &'a MemoryMap<'static>,
+        hhdm: u64,
+    }
+    impl neu_kernel::acpi::Reader for Reader<'_> {
+        fn read(&self, physical: u64, output: &mut [u8]) -> neu_kernel::acpi::Result<()> {
+            use neu_kernel::acpi::Error;
+            let end = physical
+                .checked_add(output.len() as u64)
+                .ok_or(Error::Range)?;
+            if output.is_empty()
+                || !self.map.regions().iter().any(|r| {
+                    matches!(r.kind, 2 | 3 | 8) && r.base <= physical && end <= r.base + r.length
+                })
+            {
+                return Err(Error::Access);
+            }
+            let virtual_address = self.hhdm.checked_add(physical).ok_or(Error::Range)?;
+            if !arch::valid_boot_range(virtual_address as usize, output.len(), 1) {
+                return Err(Error::Range);
+            }
+            // SAFETY: Limine base 6 maps retained ACPI/NVS/reserved-mapped RAM.
+            // The complete physical extent was checked against those regions.
+            for (i, byte) in output.iter_mut().enumerate() {
+                *byte = unsafe { ptr::read_volatile((virtual_address as *const u8).add(i)) };
+            }
+            Ok(())
+        }
+    }
+    if PCI_COPIED.load(Ordering::Acquire) {
+        return Err("PCI firmware already copied");
+    }
+    let response =
+        unsafe { read_boot_value(ptr::read_volatile(ptr::addr_of!((*RSDP.0.get()).response)))? };
+    let physical = response
+        .address
+        .checked_sub(info.hhdm_offset)
+        .ok_or("invalid RSDP HHDM address")?;
+    let value = neu_kernel::acpi::Firmware::discover(
+        &Reader {
+            map: &info.memory_map,
+            hhdm: info.hhdm_offset,
+        },
+        physical,
+    )
+    .map_err(|_| "invalid PCI/IOMMU ACPI tables")?;
+    // SAFETY: Once-only BSP write; readers use the release/acquire publication.
+    unsafe {
+        ptr::write(PCI_FIRMWARE.0.get(), value);
+    }
+    PCI_COPIED.store(true, Ordering::Release);
+    Ok(())
+}
+
 struct KernelRegions(UnsafeCell<[MemoryRegion; MAX_REGIONS]>);
 // SAFETY: A once-only BSP initialization publishes immutable descriptors. No
 // loader or kernel writer retains access once initialize() returns.

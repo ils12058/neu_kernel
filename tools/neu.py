@@ -100,6 +100,7 @@ SMP_CASES = smp_qmp.CASES
 SMP_WORK = smp_qmp.WORK_CASES
 SMP_REJECT = smp_qmp.REJECT
 FEATURES.update({name: "test-" + name for name in (*SMP_CASES, *SMP_REJECT)})
+FEATURES["dma-no-iommu"] = "test-dma-no-iommu"
 SMP_SCHEDULE = smp_scheduler_qmp.CASES
 FEATURES.update({name: "test-" + name for name in SMP_SCHEDULE})
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
@@ -201,7 +202,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_", "neu_authority_", "neu_device_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_", "neu_authority_", "neu_device_", "neu_pci_", "neu_iommu_", "neu_dma_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high",
                     "__text_start", "__text_end", "__data_start", "__rodata_start", "__rodata_end",
@@ -448,6 +449,9 @@ EXPECT = {
     "missing-map": (COMMON + ["[NEU] BOOT FAILURE: required Limine memory-map response is missing"],
                     ["[NEU] Kernel bootstrap successful", "[NEU] Boot protocol initialized", "[NEU] PANIC:"]),
 }
+EXPECT["dma-no-iommu"] = (COMMON + PROTOCOL + OWNED + PAGING +
+    ["[NEU] SMP schedule baseline: cpus=2 root=", "[NEU] BOOT FAILURE: DMA unavailable: no validated IOMMU"],
+    ["[NEU] Kernel bootstrap successful", "[NEU] SMP schedule prepared:", "[NEU] PANIC:", "[NEU] EXCEPTION:"])
 EXPECT["memory"] = (COMMON + PROTOCOL + OWNED + ["[NEU] Memory self-test passed:",
     *PAGING, "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"], EXPECT["boot"][1])
 EXPECT["paging"] = (COMMON + PROTOCOL + OWNED + PAGING + ["[NEU] Paging self-test passed:",
@@ -3252,8 +3256,18 @@ def run_case(case, esp, timeout):
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint,
-                                 SMP_SCHEDULE.get(case, smp_qmp.CPUS.get(case, 1)))
-        if case in smp_scheduler_qmp.DEVICE:
+                                 SMP_SCHEDULE.get(case, smp_qmp.CPUS.get(case, 2 if case == "dma-no-iommu" else 1)))
+        if case in smp_scheduler_qmp.DMA:
+            arguments += ["-device", "intel-iommu,caching-mode=on,intremap=off"]
+            if case == "smp-dma-bridge":
+                arguments += ["-device", "pcie-root-port,id=rp0,addr=06.0,chassis=1",
+                              "-device", "edu,id=edu0,bus=rp0,addr=00.0"]
+            else:
+                slot = "07.0" if case == "smp-dma-slot" else "05.0"
+                arguments += ["-device", "edu,id=edu0,addr=" + slot]
+            if case == "smp-dma-requester":
+                arguments += ["-device", "edu,id=edu1,addr=06.0"]
+        elif case in smp_scheduler_qmp.DEVICE or case == "dma-no-iommu":
             arguments += ["-device", "edu,id=edu0,addr=05.0"]
         if case == "smp-schedule-stress":
             arguments[arguments.index("-m") + 1] = "1024M"
@@ -3465,6 +3479,9 @@ def run_case(case, esp, timeout):
                     raise Failure("Missing independent stopped-CPU runtime mapping checkpoints.")
                 if case in SMP_SCHEDULE and smp_schedule_observation is None:
                     raise Failure("Missing independent scheduled-SMP checkpoints.")
+                if case == "dma-no-iommu":
+                    from dma_qmp import rejected_isolation
+                    result["dma_rejection"] = rejected_isolation(qmp, symbols, Failure)
                 fault = check_fault(case, text, symbols)
                 live_evidence = check_live(case, text, symbols, live_observation) if case in LIVE_CASES else None
                 cap_evidence = check_cap(case, text, symbols, cap_observation) if case in MEMORY_CAP_CASES else None
@@ -3560,6 +3577,7 @@ def main():
         command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
         command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
         command([require("python3"), str(ROOT / "tools/test_device_qmp.py")])
+        command([require("python3"), str(ROOT / "tools/test_dma_qmp.py")])
         command([require("cargo"), "fmt", "--all", "--", "--check"])
         for feature in FEATURES.values():
             arguments = [require("cargo"), "clippy", "--locked", "--target", TARGET]
@@ -3584,6 +3602,7 @@ def main():
                 command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
                 command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
                 command([require("python3"), str(ROOT / "tools/test_device_qmp.py")])
+                command([require("python3"), str(ROOT / "tools/test_dma_qmp.py")])
                 report["observer_tests"] = {"passed": True}
             if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer", "switch"):
                 target = host_target()

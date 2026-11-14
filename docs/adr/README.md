@@ -380,3 +380,19 @@ All 339 host tests pass in three configurations, 42 Python regressions pass,
 The frozen-source/image/conservation audit, lint and default build pass.
 [K11 completion](../K11_COMPLETION.md) records the fixed QEMU scope and limits;
 earlier ADRs retain their historical facts.
+
+
+## Post-K11 record — PCI discovery, IOMMU isolation and authorized DMA
+
+| ADR | Status | Related scope |
+| --- | --- | --- |
+| [0032: PCI, IOMMU and authorized DMA](0032-pci-iommu-authorized-dma.md) | Accepted for bounded local x86-64/QEMU completion | Validated ACPI/PCI discovery, Intel VT-d default-deny translation, typed DMA authority and verified lifetime |
+
+Reusable discovery replaces fixed-slot assumptions for DMA profiles. The selected
+EDU receives only explicitly mapped, generation-bound buffers. Real faults prove
+hardware rejection; in-flight close/revoke/Node-loss and full host/SRAM scrub
+precede reassignment. ABI 0.7 profiles retain ADR 0031's disabled-DMA contract.
+[PCI/DMA completion](../PCI_DMA_COMPLETION.md) records 215 QEMU profiles, 17
+same-image repeats, four 368-test host configurations, 52 observer tests and
+the frozen evidence audit. This is post-K11 work without an assigned K12;
+broader platform and driver support remain separate obligations.

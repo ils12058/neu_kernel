@@ -814,7 +814,11 @@ neu_device_disabled:
     mov rdi, [rbp + 56]
     xor esi, esi
     AUTH_ZERO
+.if NEU_ABI08_DISABLED
+    mov r13d, 0x22
+.else
     mov r13d, 0x1b
+.endif
 neu_device_disabled_loop:
     mov rax, r13
     syscall
@@ -824,7 +828,11 @@ neu_device_disabled_loop:
     jne neu_smp_sched_bad
     inc qword ptr [rbp + 104]
     inc r13
+.if NEU_ABI08_DISABLED
+    cmp r13, 0x29
+.else
     cmp r13, 0x22
+.endif
     jne neu_device_disabled_loop
     jmp neu_smp_sched_user_done
 neu_authority_disabled:

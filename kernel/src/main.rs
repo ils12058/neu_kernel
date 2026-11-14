@@ -162,6 +162,23 @@ const _: () = assert!(
         + cfg!(feature = "test-smp-authority-stress") as u8
         + cfg!(feature = "test-smp-authority-terminate") as u8
         + cfg!(feature = "test-smp-authority-disabled") as u8
+        + cfg!(feature = "test-smp-dma-2") as u8
+        + cfg!(feature = "test-smp-dma-4") as u8
+        + cfg!(feature = "test-smp-dma-slot") as u8
+        + cfg!(feature = "test-smp-dma-bridge") as u8
+        + cfg!(feature = "test-smp-dma-unmapped") as u8
+        + cfg!(feature = "test-smp-dma-readonly") as u8
+        + cfg!(feature = "test-smp-dma-requester") as u8
+        + cfg!(feature = "test-smp-dma-revoked") as u8
+        + cfg!(feature = "test-smp-dma-close") as u8
+        + cfg!(feature = "test-smp-dma-submit-revoke") as u8
+        + cfg!(feature = "test-smp-dma-revoke") as u8
+        + cfg!(feature = "test-smp-dma-fault") as u8
+        + cfg!(feature = "test-smp-dma-timeout") as u8
+        + cfg!(feature = "test-smp-dma-quota") as u8
+        + cfg!(feature = "test-dma-no-iommu") as u8
+        + cfg!(feature = "test-smp-device-dma-disabled") as u8
+        + cfg!(feature = "test-smp-dma-disabled") as u8
         + cfg!(feature = "test-smp-device-2") as u8
         + cfg!(feature = "test-smp-device-4") as u8
         + cfg!(feature = "test-smp-device-fault") as u8
@@ -247,6 +264,10 @@ extern "C" fn neu_main() -> ! {
         Err(reason) => fail(reason),
     };
     log!("[NEU] Boot protocol initialized: Limine base 6, UEFI64\n");
+    #[cfg(feature = "dma-test")]
+    if let Err(reason) = boot::copy_pci_firmware(&info) {
+        fail(reason);
+    }
     log!(
         "[NEU] Memory map validated: {} regions, {} usable bytes\n",
         info.memory_regions,

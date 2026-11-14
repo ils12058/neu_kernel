@@ -1464,6 +1464,15 @@ impl Paging<'_, '_> {
                         pat,
                     )?;
                     tree.map_device_uc(&mut self.memory, LAPIC_VIEW + 2 * PAGE, 0xfec0_0000, pat)?;
+                    #[cfg(feature = "dma-test")]
+                    for unit in 0..super::iommu::count() {
+                        tree.map_device_uc(
+                            &mut self.memory,
+                            super::iommu::VIEW + unit as u64 * PAGE,
+                            super::iommu::physical(unit),
+                            pat,
+                        )?;
+                    }
                 }
             }
             tree.map(&mut self.memory, WINDOW, tree.root, Permissions::RW)?;
@@ -1959,6 +1968,21 @@ impl Paging<'_, '_> {
             return Err(Error::Flags);
         }
         Ok(leaf)
+    }
+    #[cfg(feature = "dma-test")]
+    pub fn map_platform_registers(&mut self, address: u64, physical: u64, pat: u64) -> Result<()> {
+        self.map_peripheral_uc(address, physical, pat).map(|_| ())
+    }
+    #[cfg(feature = "dma-test")]
+    pub fn unmap_platform_registers(&mut self, address: u64) -> Result<()> {
+        if current_root() != self.tree.root || interrupts_enabled() {
+            return Err(Error::InUse);
+        }
+        self.tree.unmap(&mut self.memory, address)?;
+        if self.tree.translate(&self.memory, address)?.is_some() {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
     #[cfg(feature = "device-test")]
     pub fn map_edu(&mut self, physical: u64, pat: u64) -> Result<()> {

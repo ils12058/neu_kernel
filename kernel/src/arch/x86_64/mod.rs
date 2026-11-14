@@ -8,6 +8,8 @@ pub mod cooperative;
 pub mod exceptions;
 #[cfg(any(feature = "timer-test", feature = "preempt-test"))]
 pub mod interrupts;
+#[cfg(feature = "dma-test")]
+pub mod iommu;
 #[cfg(feature = "memory-object-cap-test")]
 pub mod memory_object_cap;
 #[cfg(feature = "memory-object-runtime-test")]
@@ -28,6 +30,8 @@ pub mod nodes;
     allow(dead_code)
 )]
 pub mod paging;
+#[cfg(feature = "dma-test")]
+pub mod pci;
 #[cfg(feature = "preempt-test")]
 pub mod preemptive;
 pub mod serial;

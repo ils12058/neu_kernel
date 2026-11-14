@@ -1,5 +1,59 @@
 # Neu Kernel implementation status
 
+## Post-K11 / PCI, IOMMU and authorized DMA — complete for bounded x86-64/QEMU (2026-11-14)
+
+This work starts from accepted K11 commit
+`813b3e677a43c72fa813542c9d433183e0d8810a` on `codex/pci-iommu-dma`.
+[PCI/DMA completion](PCI_DMA_COMPLETION.md),
+[ADR 0032](adr/0032-pci-iommu-authorized-dma.md),
+[experimental ABI 0.8](abi/experimental-v0.8.md) and the
+[DMA QMP protocol](testing/dma-qmp.md) define the implementation and acceptance.
+No new numbered architecture milestone is assigned.
+
+Validated ACPI MCFG/DMAR data drives reusable PCI enumeration, multifunction and
+bridge discovery, capability chains and BAR resource checks. EDU is selected by
+identity; alternate placement and secondary-bus routing pass. PCI command writes
+preserve W1C status. All discovered requesters are quarantined before VT-d setup.
+Intel legacy translation uses empty default-deny contexts, exact direction
+permissions and synchronous invalidation before the selected bus-master path
+is enabled. Missing IOMMU support refuses DMA startup.
+
+ABI 0.8 adds typed DmaDomain/DmaBuffer authority and seven scalar operations.
+One claim owns an 8192-byte, physically noncontiguous buffer; transfers are
+1–4096 bytes with sixteen submissions per generation. Userspace supplies typed
+handles and offsets. CPU access remains mediated, and no raw physical-address,
+PCI configuration or DMA-register operation exists. Original anchors, mapping
+grants and active submission grants are distinct authority dependencies.
+
+Actual hardware faults prove unmapped/read-only/other-requester/revoked-IOVA
+isolation. Close/revoke/Node-fault fixtures independently observe quarantine
+while RUN is still set. Physical ownership persists until completion,
+invalidation, host zeroing and a full masked SRAM zero-write/readback finish.
+Both generations then complete the existing factorial reset before release.
+Final VT-d remains enabled against empty reserved roots; no identity fallback
+or prematurely reusable buffer is introduced.
+
+| Validation | Accepted result | Artifact |
+| --- | --- | --- |
+| Rust host tests | 368/368 in default, authority, device and DMA configurations | `build/pci-dma-full-test.log`, `build/pci-dma-host-*-test.log` |
+| Python observers | 52/52 regressions, including ten DMA oracle tests | `build/pci-dma-check.log`, `build/pci-dma-full-test.log` |
+| Full QEMU matrix | 215/215 registered profiles; unchanged 30-second deadline | `build/pci-dma-full-test-results.json`, `build/pci-dma-full-test-evidence/` |
+| Same-image repeats | All 17 new profiles pass again | `build/pci-dma-repeat-results.json`, `build/pci-dma-repeat-evidence/` |
+| Formatting/lint, doctor and build | 215 selections plus host-library lint; default image matches full-run boot | `build/pci-dma-check.log`, `build/pci-dma-doctor.log`, `build/pci-dma-build.log` |
+| Frozen evidence audit | 106 inputs, all image hashes, 45 scheduled profiles, DMA/native/IRQ/resource checks and preserved K11 evidence | `build/pci-dma-validation-summary.json` |
+
+Source aggregate: `d9596bb7eb290928871bd030128475a22181dc4dbadafbf2fc0cb703711735ba`. Default kernel:
+`fce9c7187af9af7e9ea44d3fd2e48d4fcd9ca0d7245166c8f57e1622309b837c`. Longest full-run guest:
+28.347 seconds; longest repeat:
+28.234 seconds. No project QEMU process remains.
+
+Scope is local QEMU q35/EDU/Intel legacy VT-d with two/four CPUs, two Nodes,
+three Threads, fixed pools and integer contexts. Physical hardware, AMD IOMMU,
+MSI/interrupt remapping, hotplug/AML, ATS/PASID/SVA, general drivers and
+FPU/SIMD/TLS remain outside this acceptance. Earlier ABI versions retain their
+behavior. The dated sections below preserve historical counts and scope;
+this section supersedes their statements that PCI/IOMMU/DMA is entirely future.
+
 ## K11 / Device primitives — complete for bounded x86-64/QEMU (2026-11-14)
 
 K11 starts from completed K10 commit

@@ -5,53 +5,49 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-**K11 / Device primitives is complete for bounded x86-64/QEMU.** A static
-userspace driver exclusively claims one QEMU EDU device, accesses allowlisted
-32-bit registers through typed capabilities, blocks for real hardware IRQs and
-acknowledges exact delivery sequences. Two/four-CPU profiles demonstrate
-liveness, factorial calculation, rejected unauthorized access, driver faults,
-close/revoke cancellation, watchdog/budget quarantine and safe reassignment.
+**PCI discovery → IOMMU isolation → authorized DMA is complete for the bounded
+x86-64/QEMU platform.** Reusable ACPI/PCI code discovers functions, bridges,
+capabilities and BARs. The Q35 backend selects EDU dynamically, including an
+alternate slot and a secondary PCIe bus. Intel VT-d constrains the requester to
+explicitly mapped buffers before bus mastering is enabled.
 
-The trusted backend uses Q35 INTx through I/O APIC GSI 21 to BSP vector 240.
-The device page stays supervisor RW/NX/UC; bus mastering and MSI stay disabled.
-Cleanup waits for the old command and the neutral reset's actual completion,
-drains interrupt state and scrubs register data before the next claim. The
-successor driver also completes its own factorial operation. New service work
-uses the existing wake/IPI protocol when the BSP is idle.
+Experimental ABI 0.8 adds generation-bound DmaDomain/DmaBuffer capabilities and
+seven scalar operations. Userspace performs real DMA in both directions across
+noncontiguous physical pages, using the existing blocking IRQ/ACK protocol.
+Actual IOMMU faults prove rejection of unmapped, read-only, other-requester and
+revoked translations. Close, descendant revocation and Node fault are tested
+while hardware RUN is still active; ownership persists through completion,
+invalidation and verified host/device-buffer scrub before reassignment.
 
-Validation passes **339 Rust tests in each of default, authority and device
-configurations; 42 Python observer regressions; all 198 QEMU profiles; and nine
-K11 repeats using the exact same images**. Formatting, all profile/host-library
-clippy checks, doctor and the default build pass. The audit verifies all 94
-frozen code/build/observer inputs, tested image hashes, actual IRQ/reset/native
-observations and exact resource conservation in all 29 scheduled profiles.
+Validation passes **368 Rust tests in each of four configurations; 52 Python
+observer regressions; all 215 QEMU profiles; and all 17 new profiles repeated
+using the exact same images**. Formatting, lint for all 215 profiles and the host
+library, doctor and default build pass. The audit verifies 106 frozen inputs, image and
+firmware hashes, native/IRQ/DMA evidence, and exact final resource conservation
+in all 45 scheduled profiles. Earlier K11 evidence is preserved.
 
-[K11 completion](docs/K11_COMPLETION.md) records scope, hashes and preserved
-development corrections. [Implementation status](docs/IMPLEMENTATION_STATUS.md),
-[ADR 0031](docs/adr/0031-bounded-userspace-device-primitives.md),
-[experimental ABI 0.7](docs/abi/experimental-v0.7.md) and
-[the device QMP protocol](docs/testing/device-qmp.md) describe device authority,
-hardware retirement and independent verification.
+[PCI/DMA completion](docs/PCI_DMA_COMPLETION.md) records scope, measured results,
+hashes and development corrections. [ABI 0.8](docs/abi/experimental-v0.8.md),
+[ADR 0032](docs/adr/0032-pci-iommu-authorized-dma.md) and
+[the DMA QMP protocol](docs/testing/dma-qmp.md) define the interface and evidence.
+This is post-K11 work; the architecture roadmap has not assigned a K12.
 
-K10 supplies derivation/revocation and mapping lifetime with actual remote TLB
-invalidation; [its completion contract](docs/K10_COMPLETION.md) retains that
-evidence. K9 supplies synchronized per-CPU scheduling, native/timer contexts,
-idle/IPI wakeups and Node-fault quiescence. K8 supplies shared MemoryObjects.
-Architecture v0.2 remains the baseline and earlier images retain their ABI
-versions. Device profiles advertise ABI 0.7; authority profiles retain 0.6.
+K11 supplies exclusive device claims, mediated registers, real INTx delivery and
+safe reassignment; its ABI 0.7 profiles retain disabled DMA. K10 supplies derived
+authority and remote TLB invalidation, K9 supplies SMP scheduling and K8 shared
+MemoryObjects. Their dated completion records and older ABI contracts remain.
 
-The accepted environment remains at most four CPUs, two Nodes, three Threads,
-fixed pools, integer contexts and IRQ-disabled shared transactions. The
-roadmap's K0–K11 milestones are bounded kernel proofs. General PCI/driver loading,
-direct user MMIO, DMA/IOMMU, MSI/MSI-X, public object/mapping/Thread factories,
-arbitrary AP allocation, balancing, kernel preemption, TLS/FPU/SIMD scheduling,
-COW and demand paging remain future work.
+Executable acceptance uses QEMU 11.0.0 TCG/q35, Intel legacy VT-d, EDU,
+two/four CPUs, two Nodes, three Threads, fixed pools and integer contexts.
+Discovery is reusable; interrupt routing and the DMA engine remain platform
+and device specific. MSI/MSI-X delivery, interrupt remapping, AMD IOMMU,
+hotplug/AML, ATS/PASID/SVA, general driver loading, public factories,
+balancing, kernel preemption, FPU/SIMD/TLS, COW and demand paging remain future
+work. Physical hardware and hosted CI have not been validated.
 
-Default and legacy images boot one vCPU; SMP profiles select 1, 2 or 4. Normal
-profiles use 512 MiB; the longer scheduling stress profile uses 1 GiB. The
-verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF, Rust 1.95.0 and
-Limine 12.9.4/base 6 on Apple Silicon. Validation is local; physical hardware
-and hosted CI have not been exercised.
+Default and legacy images use one vCPU; SMP profiles select 1, 2 or 4. Normal
+profiles use 512 MiB, and scheduling stress uses 1 GiB. The verified host is
+Apple Silicon with Rust 1.95.0, Python 3.14.7, UEFI/OVMF and Limine 12.9.4/base 6.
 
 ## Build and run
 
@@ -184,13 +180,24 @@ fault; `--case smp-device-flight-fault` also retires an old in-flight command.
 `--case smp-device-close` and `--case smp-device-revoke` cancel actual blocked
 IRQ waits. `--case smp-device-timeout` and `--case smp-device-budget` enforce
 progress limits; `--case smp-device-disabled` verifies legacy ABI rejection.
-The tool adds EDU only for the eight enabled profiles. Each requires actual
+These original K11 profiles use EDU with DMA disabled. Each requires actual
 hardware IRQ and masked-reset completion observations, every returning syscall
 and exact final device/allocator/authority cleanup.
+
+Run `python3 tools/neu.py test --case smp-dma-4` for actual authorized DMA,
+`--case smp-dma-slot` or `--case smp-dma-bridge` for dynamic PCI placement,
+`--case smp-dma-requester` for a different requester's rejected hardware write,
+and `--case smp-dma-submit-revoke` for revocation during active DMA. The
+[DMA test protocol](docs/testing/dma-qmp.md) lists all 17 new profiles, including
+no-IOMMU and ABI 0.5/0.7 controls. DMA profiles add Intel VT-d; ordinary K11
+profiles keep bus mastering disabled.
 
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
+- [Accepted PCI/IOMMU/DMA completion contract](docs/PCI_DMA_COMPLETION.md)
+- [Experimental DMA ABI 0.8](docs/abi/experimental-v0.8.md)
+- [DMA QMP evidence](docs/testing/dma-qmp.md)
 - [Accepted K11 completion contract](docs/K11_COMPLETION.md)
 - [Experimental device ABI 0.7](docs/abi/experimental-v0.7.md)
 - [Device QMP evidence](docs/testing/device-qmp.md)

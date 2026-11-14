@@ -27,7 +27,11 @@ pub mod smp_work;
 
 pub mod smp_user;
 
+pub mod acpi;
 pub mod device;
+pub mod dma;
+pub mod iommu;
+pub mod pci;
 pub mod shootdown;
 pub mod smp_scheduler;
 pub mod sync;

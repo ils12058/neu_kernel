@@ -196,6 +196,53 @@ pub mod v07 {
     }
 }
 
+/// PCI/VT-d DMA extension. Buffer handles carry authority; addresses do not.
+pub mod v08 {
+    pub const DMA_DOMAIN: u64 = 0x22;
+    pub const DMA_BUFFER: u64 = 0x23;
+    pub const DMA_MAP: u64 = 0x24;
+    pub const DMA_UNMAP: u64 = 0x25;
+    pub const DMA_READ: u64 = 0x26;
+    pub const DMA_WRITE: u64 = 0x27;
+    pub const DMA_SUBMIT: u64 = 0x28;
+    pub const INFO: u64 = super::version(0, 8, 0x7ff);
+    pub fn owns(number: u64) -> bool {
+        (DMA_DOMAIN..=DMA_SUBMIT).contains(&number)
+    }
+    pub fn valid_arguments(number: u64, args: [u64; 6]) -> bool {
+        let used = match number {
+            DMA_DOMAIN | DMA_BUFFER => 1,
+            DMA_UNMAP | DMA_READ => 2,
+            DMA_MAP | DMA_WRITE => 3,
+            DMA_SUBMIT => 5,
+            _ => return false,
+        };
+        args[used..].iter().all(|v| *v == 0)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn dma_namespace_is_scalar_versioned_and_unavailable_in_legacy_dispatch() {
+            assert_eq!(INFO, 0x8000007ff);
+            for op in DMA_DOMAIN..=DMA_SUBMIT {
+                assert!(valid_arguments(op, [0; 6]));
+                assert_eq!(
+                    super::super::dispatch(op, [0; 6]),
+                    super::super::Outcome::Return {
+                        status: -1,
+                        scalar: 0
+                    }
+                );
+                let mut args = [0; 6];
+                args[5] = 1;
+                assert!(!valid_arguments(op, args));
+            }
+            assert!(!owns(0x29));
+        }
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
