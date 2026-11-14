@@ -35,7 +35,7 @@ struct Tss {
     iomap: u16,
 }
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct Gate {
     low: u16,
@@ -82,7 +82,13 @@ static TSS: Table<Tss> = Table(UnsafeCell::new(Tss {
     reserved3: 0,
     iomap: 104,
 }));
-const GDT_ENTRIES: usize = if cfg!(feature = "user-test") { 8 } else { 5 };
+/// Ring 3 selectors are compiled whenever an image can reach CPL3, including
+/// the Phase 9C-1 two-CPU profile. AP-private GDT copies need the same eight
+/// entries as the BSP table.
+const USER_SELECTORS: bool = cfg!(feature = "user-test")
+    || cfg!(feature = "smp-user-test")
+    || cfg!(feature = "smp-scheduler-test");
+const GDT_ENTRIES: usize = if USER_SELECTORS { 8 } else { 5 };
 static GDT: Table<[u64; GDT_ENTRIES]> = Table(UnsafeCell::new([0; GDT_ENTRIES]));
 static IDT: Table<[Gate; 256]> = Table(UnsafeCell::new([Gate::EMPTY; 256]));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -126,7 +132,11 @@ pub fn initialize() -> Result<(), &'static str> {
         let base = TSS.0.get() as u64;
         let gdt = GDT.0.get().cast::<u64>();
         build_kernel_gdt(gdt, base);
-        #[cfg(feature = "user-test")]
+        #[cfg(any(
+            feature = "user-test",
+            feature = "smp-user-test",
+            feature = "smp-scheduler-test"
+        ))]
         {
             // Preserve selector 0x28 as an invalid descriptor for the old #GP
             // test. User data=0x33, long-mode code=0x3b (DPL/RPL=3).
@@ -181,9 +191,11 @@ pub(super) fn tables() -> Tables {
 
 /// Writes the kernel selectors and the TSS descriptor. Code and data entries
 /// deliberately match the BSP so every CPU executes the same flat segments.
+/// Images that can reach CPL3 also receive the shared user data/code pair.
 ///
 /// # Safety
-/// `destination` must name at least five writable, mapped `u64` slots.
+/// `destination` must name at least five writable, mapped `u64` slots, or eight
+/// when Ring 3 selectors are compiled.
 pub(super) unsafe fn build_kernel_gdt(destination: *mut u64, tss_base: u64) {
     unsafe {
         ptr::write(destination.add(1), 0x00af_9a00_0000_ffff); // 64-bit kernel code.
@@ -193,6 +205,17 @@ pub(super) unsafe fn build_kernel_gdt(destination: *mut u64, tss_base: u64) {
             103 | ((tss_base & 0xff_ffff) << 16) | (0x89 << 40) | (((tss_base >> 24) & 0xff) << 56),
         );
         ptr::write(destination.add(4), tss_base >> 32);
+        #[cfg(any(
+            feature = "user-test",
+            feature = "smp-user-test",
+            feature = "smp-scheduler-test"
+        ))]
+        {
+            // DPL3 data 0x33, DPL3 long-mode code 0x3b. Entry 5 (0x28) stays
+            // invalid so the legacy #GP probe still observes a null descriptor.
+            ptr::write(destination.add(6), 0x00cf_f300_0000_ffff);
+            ptr::write(destination.add(7), 0x00af_fb00_0000_ffff);
+        }
     }
 }
 
@@ -269,6 +292,154 @@ pub(super) unsafe fn install_ap_work_ipi(idt_base: *mut u8) -> Result<(), &'stat
             {
                 return Err("SMP AP work IPI gate readback failed");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 9C-1: installs the shared DPL3 `INT 0x80` exit gate into a private IDT
+/// image. The handler is the same assembly trap used by the legacy single-CPU
+/// fixture, but no SYSCALL/SYSRET path is configured by this profile.
+///
+/// # Safety
+/// `idt_base` must name a 4096-byte, 16-byte-aligned IDT image that no CPU has
+/// loaded yet.
+#[cfg(feature = "smp-user-test")]
+pub(super) unsafe fn install_smp_user_trap(idt_base: *mut u8) -> Result<(), &'static str> {
+    unsafe extern "C" {
+        fn neu_user_trap();
+    }
+    if idt_base.is_null() || idt_base as usize & 15 != 0 {
+        return Err("SMP user trap IDT is misaligned");
+    }
+    let mut gate = Gate::new(neu_user_trap as *const () as u64, 0);
+    gate.attributes = 0xee;
+    // SAFETY: Caller guarantees a complete, writable, not-yet-loaded IDT image.
+    unsafe {
+        ptr::write(idt_base.cast::<Gate>().add(128), gate);
+        let actual = ptr::read(idt_base.cast::<Gate>().add(128));
+        if actual.low != gate.low
+            || actual.mid != gate.mid
+            || actual.high != gate.high
+            || actual.selector != 8
+            || actual.attributes != 0xee
+            || actual.ist != 0
+        {
+            return Err("SMP user trap gate readback failed");
+        }
+    }
+    Ok(())
+}
+
+/// Phase 9C-1 BSP entry contract. The BSP IDT gains the DPL3 `INT 0x80` gate
+/// and TSS.RSP0 moves to the image-reserved user-entry stack; the interrupted
+/// kernel continuation keeps its own stack.
+#[cfg(feature = "smp-user-test")]
+pub(super) fn arm_smp_user(rsp0: u64) -> Result<(), &'static str> {
+    if !INITIALIZED.load(Ordering::Relaxed) || rsp0 == 0 || rsp0 & 15 != 0 {
+        return Err("SMP user entry requires initialized tables and an aligned RSP0");
+    }
+    // SAFETY: BSP, IF=0, no user execution is active. The gate and RSP0 are
+    // published before the only IRETQ that can observe them.
+    unsafe {
+        install_smp_user_trap(IDT.0.get().cast::<u8>())?;
+        ptr::write_unaligned(ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(), rsp0);
+    }
+    if rsp0_bsp() != rsp0 {
+        return Err("SMP user RSP0 publication failed");
+    }
+    Ok(())
+}
+
+/// Restores the fatal-only vector 128 gate and the bootstrap RSP0 after the
+/// last concurrent Ring 3 execution has been reaped.
+#[cfg(feature = "smp-user-test")]
+pub(super) fn disarm_smp_user() -> Result<(), &'static str> {
+    if !INITIALIZED.load(Ordering::Relaxed) {
+        return Err("SMP user teardown requires initialized tables");
+    }
+    if FAULTING.load(Ordering::Relaxed) {
+        return Err("SMP user teardown observed the fatal fault guard");
+    }
+    // SAFETY: BSP, IF=0, both Threads are terminal and no CPU is at CPL3.
+    unsafe {
+        ptr::write(
+            IDT.0.get().cast::<Gate>().add(128),
+            Gate::new(neu_isr_255 as *const () as u64, 0),
+        );
+        ptr::write_unaligned(
+            ptr::addr_of_mut!((*TSS.0.get()).rsp).cast::<u64>(),
+            ptr::addr_of!(__stack_top) as u64,
+        );
+    }
+    Ok(())
+}
+
+/// Restores the fatal-only vector 128 gate and the bootstrap RSP0 of an
+/// application processor. Only the BSP may call this, and only after the target
+/// CPU has published its terminal park state with interrupts disabled: the
+/// parked CPU can never read either table again or enter Ring 3 a second time.
+#[cfg(feature = "smp-user-test")]
+pub(super) fn disarm_smp_user_cpu(
+    idt_base: u64,
+    tss_base: u64,
+    rsp0: u64,
+) -> Result<(), &'static str> {
+    if idt_base == 0 || idt_base & 15 != 0 || tss_base == 0 || tss_base & 7 != 0 {
+        return Err("SMP user CPU disarm target is misaligned");
+    }
+    if rsp0 == 0 || rsp0 & 15 != 0 {
+        return Err("SMP user CPU disarm RSP0 is invalid");
+    }
+    // SAFETY: Caller proved the target CPU is parked and that no CPL3 context
+    // can be created for it again. The write targets its private IDT/TSS image.
+    unsafe {
+        ptr::write(
+            (idt_base as *mut Gate).add(128),
+            Gate::new(neu_isr_255 as *const () as u64, 0),
+        );
+        ptr::write_unaligned(
+            (tss_base + mem::offset_of!(Tss, rsp) as u64) as *mut u64,
+            rsp0,
+        );
+        let gate = ptr::read((idt_base as *mut Gate).add(128));
+        if gate.low != neu_isr_255 as *const () as u64 as u16
+            || gate.attributes != 0x8e
+            || gate.selector != 8
+            || ptr::read_unaligned((tss_base + mem::offset_of!(Tss, rsp) as u64) as *const u64)
+                != rsp0
+        {
+            return Err("SMP user CPU disarm readback failed");
+        }
+    }
+    Ok(())
+}
+
+/// Reads the BSP TSS RSP0 without borrowing the packed field.
+#[cfg(feature = "smp-user-test")]
+pub(super) fn rsp0_bsp() -> u64 {
+    // SAFETY: Initialized packed TSS; the read has no side effects.
+    unsafe { ptr::read_unaligned(ptr::addr_of!((*TSS.0.get()).rsp).cast::<u64>()) }
+}
+
+/// Publishes a CPU-private TSS RSP0 from the BSP after that CPU proved its
+/// bootstrap state and before it is released into Ring 3.
+///
+/// # Safety
+/// `tss_base` must name the target CPU's 104-byte TSS arena and that CPU must
+/// not be able to enter CPL3 yet.
+#[cfg(feature = "smp-user-test")]
+pub(super) unsafe fn write_tss_rsp0(tss_base: u64, rsp0: u64) -> Result<(), &'static str> {
+    if tss_base == 0 || tss_base & 7 != 0 || rsp0 == 0 || rsp0 & 15 != 0 {
+        return Err("SMP user TSS RSP0 target is invalid");
+    }
+    let field = (tss_base + mem::offset_of!(Tss, rsp) as u64) as *mut u64;
+    // SAFETY: Caller guarantees the TSS arena is mapped, CPU-private and not
+    // concurrently used for a privilege transition.
+    unsafe {
+        ptr::write_unaligned(field, rsp0);
+        if ptr::read_unaligned(field) != rsp0 {
+            return Err("SMP user TSS RSP0 readback failed");
         }
     }
     Ok(())
@@ -391,14 +562,31 @@ static NEU_LAST_FAULT: Table<FaultRecord> = Table(UnsafeCell::new(FaultRecord {
     handler_rsp: 0,
 }));
 
+/// Phase 9C-1 containment check. The BSP fatal record is only written by the
+/// single fatal-fault path, which halts before returning; an untouched record
+/// with a clear guard therefore proves no CPL3 exit reached that path.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn fatal_record_clear() -> bool {
+    if FAULTING.load(Ordering::Relaxed) {
+        return false;
+    }
+    // SAFETY: BSP read after both Threads are terminal. A writer would have
+    // halted, so no write can race this snapshot.
+    let record = unsafe { ptr::read_volatile(NEU_LAST_FAULT.0.get()) };
+    record.frame.gpr.iter().all(|word| *word == 0)
+        && record.frame.vector == 0
+        && record.frame.error == 0
+        && record.frame.rip == 0
+        && record.frame.cs == 0
+        && record.frame.flags == 0
+        && record.frame.rsp == 0
+        && record.frame.ss == 0
+        && record.cr2 == 0
+        && record.handler_rsp == 0
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
-    if FAULTING.swap(true, Ordering::Relaxed) {
-        serial::emergency(format_args!(
-            "[NEU] EXCEPTION: nested fatal fault; halting\n"
-        ));
-        halt();
-    }
     let handler_rsp: u64;
     // SAFETY: Only assembly entry passes this complete normalized kernel-stack
     // frame. Original user RSP/RIP are copied as numbers, never dereferenced.
@@ -406,11 +594,28 @@ extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
         asm!("mov {}, rsp", out(reg) handler_rsp, options(nomem, nostack, preserves_flags));
         ptr::read(frame)
     };
+    #[cfg(feature = "smp-scheduler-test")]
+    if frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18) {
+        super::smp_scheduler::fault(frame, cr2, handler_rsp);
+    }
+    #[cfg(feature = "smp-user-test")]
+    if frame.cs & 3 == 3 {
+        // Two CPUs can be at CPL3 simultaneously. Each Ring 3 exit is a
+        // per-CPU terminal event: it must bypass the BSP-only nested-fault
+        // guard, the AP fatal record and the single fatal fault record.
+        super::smp_user::boundary(frame, cr2, handler_rsp);
+    }
     #[cfg(feature = "smp-test")]
     if !super::smp::is_bsp() {
         // The AP records its own raw frame in its per-CPU block and parks
         // silently; it never reaches the BSP's fatal serial/global path.
         super::smp::ap_fault(&frame, cr2, handler_rsp);
+    }
+    if FAULTING.swap(true, Ordering::Relaxed) {
+        serial::emergency(format_args!(
+            "[NEU] EXCEPTION: nested fatal fault; halting\n"
+        ));
+        halt();
     }
     #[cfg(feature = "user-test")]
     if (frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18)) || frame.vector == 128 {
@@ -449,6 +654,33 @@ extern "C" fn neu_exception(frame: *const ExceptionFrame, cr2: u64) -> ! {
         u8::from(ist)
     ));
     halt()
+}
+
+/// Installs native-scheduler timer/IPI gates while every target CPU has IF=0
+/// and is waiting for the release publication. Exception gates stay intact.
+/// # Safety
+/// The target is a validated private IDT, and no target CPU admits IRQs or user
+/// entry until the caller publishes the completed setup with Release ordering.
+#[cfg(feature = "smp-scheduler-test")]
+pub(super) unsafe fn install_smp_scheduler_gates(idt: *mut u8) -> Result<(), &'static str> {
+    unsafe extern "C" {
+        fn neu_smp_sched_timer();
+        fn neu_smp_sched_ipi();
+        fn neu_smp_sched_spurious();
+    }
+    if idt.is_null() || idt as usize & 15 != 0 {
+        return Err("SMP scheduler IDT alignment");
+    }
+    for (vector, handler) in [
+        (224, neu_smp_sched_timer as *const () as u64),
+        (241, neu_smp_sched_ipi as *const () as u64),
+        (255, neu_smp_sched_spurious as *const () as u64),
+    ] {
+        unsafe {
+            ptr::write(idt.cast::<Gate>().add(vector), Gate::new(handler, 0));
+        }
+    }
+    Ok(())
 }
 
 pub fn test_invalid_opcode() -> ! {

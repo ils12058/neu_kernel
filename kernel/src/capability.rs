@@ -275,7 +275,7 @@ impl Objects {
     }
     /// Test-only schema for the independent stopped-CPU observer. The
     /// descriptor contains addresses and offsets, never authority.
-    #[cfg(feature = "cap-move-test")]
+    #[cfg(any(feature = "cap-move-test", feature = "smp-scheduler-test"))]
     pub fn diagnostic_layout(&self) -> [u64; 18] {
         use core::mem::{offset_of as off, size_of as size};
         [
@@ -328,6 +328,10 @@ impl Objects {
     }
     pub fn channel_state(&self) -> &crate::channel::Channels {
         &self.channels
+    }
+    #[cfg(feature = "smp-scheduler-test")]
+    pub fn smp_wait_addresses(&self) -> [u64; crate::wait::WAITERS * 8] {
+        self.waits.smp_field_addresses()
     }
     pub fn queued_references(&self) -> u32 {
         self.channels.queued_capabilities()
@@ -953,7 +957,7 @@ impl Table {
         addresses
     }
     /// Test-only schema for the independent stopped-CPU observer.
-    #[cfg(feature = "cap-move-test")]
+    #[cfg(any(feature = "cap-move-test", feature = "smp-scheduler-test"))]
     pub fn diagnostic_layout(&self) -> [u64; 20] {
         use core::mem::{offset_of as off, size_of as size};
         [

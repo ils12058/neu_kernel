@@ -88,6 +88,13 @@ pub mod block {
     pub const ISOLATION_AP: u64 = (1 << 6) - 1;
     /// The BSP legitimately enters paging and the boot subsystems.
     pub const ISOLATION_BSP: u64 = ISOLATION_AP & !ISOLATION_NO_SUBSYSTEM;
+    /// Phase 9C-1: this CPU is hosting a Ring 3 Thread of a private static
+    /// AddressSpace. The NO_USER claim must be clear while that is true.
+    pub const ISOLATION_SMP_USER: u64 = 1 << 6;
+    /// AP claims during Ring 3 execution: every AP claim except NO_USER.
+    pub const ISOLATION_USER_AP: u64 = (ISOLATION_AP & !ISOLATION_NO_USER) | ISOLATION_SMP_USER;
+    /// BSP claims during Ring 3 execution: the BSP prefix except NO_USER.
+    pub const ISOLATION_USER_BSP: u64 = (ISOLATION_BSP & !ISOLATION_NO_USER) | ISOLATION_SMP_USER;
 }
 
 /// Fixed minimum sizes for the BSP and application-processor bootstrap stacks.

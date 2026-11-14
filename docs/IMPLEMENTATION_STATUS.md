@@ -1,5 +1,328 @@
 # Neu Kernel implementation status
 
+## K9 / Phases 9C-2, 9C-3 and 9D — complete for bounded SMP (2026-11-14)
+
+This completion started from `46ef2214788cbb9f561af1394391654848ea7976`
+plus the existing Phase 9C-1 work, preserved in `build/k9-starting-state/`.
+The [K9 completion contract](K9_COMPLETION.md) defines the accepted bounded
+SMP acceptance. [ADR 0029](adr/0029-bounded-scheduled-smp.md) records the
+scheduler, shared transaction and remote invalidation decisions. Architecture
+v0.2 and experimental ABI 0.5 remain the baselines, with at most four CPUs,
+two Nodes, three Threads, fixed pools and integer-only execution.
+
+### Synchronized scheduling and CPU-local contexts
+
+`kernel/src/smp_scheduler.rs` supplies CPU-local FIFO queues, one owner and
+affinity mask per Thread, and generation-bound Node-fault origins. Admission,
+dispatch, reschedule, block, wake, migration and completion validate the owning
+Node/Thread/context and preserve one execution slot. The invariant verifier
+also rejects sparse queues, duplicate entries, incompatible Thread state,
+orphan owners, invalid saved contexts, wrong roots/stacks and malformed stop
+origins. Fault queue removal is staged before publication; terminal stop
+origins clear before generation reuse.
+
+All CPUs execute the same controller loop in
+`kernel/src/arch/x86_64/smp_scheduler.rs`. A1/A2 share Node A's root and
+capability table, with separate guarded user/kernel stacks; B1 has Node B's
+private root. Two CPUs schedule A1/B1 through CPU0's FIFO and A2 on CPU1.
+Four CPUs initially use CPU0/CPU1/CPU2, with CPU3 idling and then hosting a
+migrated A2 in the migration/stress profiles. These are fixture placements;
+Node, Thread and scheduler types contain no permanent core roles.
+
+`kernel/src/sync.rs` supplies a bounded Acquire/Release `SpinLock<State>` for
+shared Nodes, queues, capabilities, Channels and inspection bindings. The
+guard is not Send; callers require IF=0/DF=0 and return authority leases
+before unlock. No mutable borrow or lock survives user entry, IPI delivery
+or an interrupt wait. IRQ handlers never acquire the lock. Allocation,
+root/stack preparation, final destruction and serial stay BSP-owned; a live
+permission transaction changes existing mappings under the same lock.
+
+The reusable assembly bridge in `smp_scheduler.S` preserves all 15 GPRs and
+the five-word user return context. Native SYSCALL selects the CPU's trusted
+stack with SWAPGS and the correct SFMASK MSR; timer/IPI stubs use the same
+176-byte normalized layout and copy owned 160-byte Frames. User GS is zero,
+so hardware APIC identity is verified before accessing CPU-local storage.
+Every CPU saves/restores its CR0/CR3/EFER, GS/KERNEL_GS, STAR/LSTAR/SFMASK,
+SYSENTER_CS and kernel segments. User entry installs its Thread's actual
+TSS.RSP0 and validated root/stack/context. FPU/SIMD execution remains disabled.
+
+Three PIT samples calibrate the LAPIC 10 ms one-shot quantum. Timer vector
+224 and IPI vector 241 pair actual ISR state with an EOI; spurious vector
+255 has no EOI. Native/timer exits relinquish their CPU slot and save a full
+validated context under the transaction lock. Only RAX/RDX can change at a
+native operation return. Idle checks a wake generation with IF clear before
+`sti; hlt; cli`, avoiding a lost publication between queue inspection and halt.
+
+### Migration, blocking, authority and fault quiescence
+
+Migration accepts only queued runnable work with an owned saved context and
+an allowed destination. A2 executes on CPU1, then resumes on CPU3 after its
+source CPU has recorded at least ten timer preemptions. No running or blocked
+Thread migrates through that path. The full entry/exit history retains its
+Thread/Node/root/stack binding across the transfer.
+
+Channel receive registers a real object/root-pinned waiter, blocks B1 and
+releases its CPU slot. Scalar delivery settles the continuation and admits
+one wake; Flag capability movement retains exact rights, gives B1 a fresh
+handle and makes A1's old handle stale. The four-CPU profile performs those
+transactions on different CPUs and observes CPU2's actual IF-enabled halt
+while its Thread waits. Shared authority lookup, close/use and lifecycle
+transactions follow the same lock ordering.
+
+A Node fault elects one active origin, removes queued siblings and sends
+reschedule IPIs to running siblings. They finish as `Cancelled { by: origin }`
+before the origin commits `UserFault`; competing origins join that elected
+cancellation. Normal or unauthorized completion during a stop, and completion
+with an outstanding authority lease, reject before shared mutation. B1's
+unrelated Node remains runnable and completes normally.
+
+Malformed native/timer frames are validated **before** any operation can
+change authority, Channel or waiter state. A user RSP/flags violation follows
+`FaultSource::RejectedReturn` through the same quiescence protocol instead of
+panicking at saved-context publication. The real rejection fixture enters
+SYSCALL with RSP `0x40cff9` and DF set; its normalized frame is independently
+read and must never resume. CPU exception and rejected-return counters remain
+distinct, and the fatal kernel record stays zero in every scheduled profile.
+
+After terminal lifecycle transitions, every CPU returns to the kernel root,
+drains/masks its LAPIC and restores TSS.RSP0 to the permanent bootstrap stack.
+Inspection views expire before stack destruction and execution-pin release.
+Retired AddressSpace object references are reaped before user roots/backing
+are destroyed. This ordering preserves authority/backing at the pre-commit
+fault checkpoint and prevents a live CPU or inspection binding from naming
+reclaimed storage.
+
+### Real remote translation invalidation
+
+`kernel/src/shootdown.rs` binds an epoch, root, page address and online target
+mask. Overlap, malformed participants/addresses, stale/foreign/duplicate ACKs,
+premature commit, generation exhaustion and failed sessions cannot commit.
+The x86-64 adapter prevalidates the coordinator, registry and actual PTE,
+atomically clears only W on an existing writable DATA alias, then publishes
+the request with Release ordering.
+
+Every target executes INVLPG when running the changed root or reloads its
+actual CR3 otherwise. The ACK remains unpublished in an observation window
+after the actual instruction. The coordinator commits only when all targets
+acknowledge the current request; a timeout fails stop with backing retained.
+A2's warmed alias at `0x410000` subsequently denies a store at `0x410210`
+with a genuine user `#PF`, error 7, and the scratch value remains 3.
+
+The negative profile independently checks 22 exact rejection results against
+the real PTE before/after each attempt. Simulated ACKs use a separate local
+coordinator; the actual epoch stays zero until the real hardware transaction.
+
+### Execution profiles and independent acceptance
+
+Twelve scheduled SMP profiles extend the retained matrix:
+
+| Cases | vCPUs | Required evidence |
+| --- | --- | --- |
+| `smp-schedule-2`, `smp-schedule-4` | 2 / 4 | Full native/timer contexts, FIFO owners, simultaneous same-Node CPL3 and terminal conservation |
+| `smp-schedule-shared` | 2 | Real shared atomic counter equals both Threads' combined progress |
+| `smp-schedule-migrate`, `smp-schedule-stress` | 4 | Saved A2 executes on CPU3 after CPU1; stress omits native/IRQ pauses |
+| `smp-schedule-fault`, `smp-schedule-reject` | 2 | Sibling quiescence, contained actual fault/rejected syscall and normal B1 survival |
+| `smp-schedule-idle`, `smp-schedule-ipc` | 4 / 2 | Actual blocked/pinned waiter, one wake, scalar/Flag delivery and stale sender handle |
+| `smp-tlb-2`, `smp-tlb-4`, `smp-tlb-invalid` | 2 / 4 / 2 | Actual invalidation before ACK on every target, RO PTE, denied store and inert negatives |
+
+`tools/smp_scheduler_qmp.py` has its own expectations and uses only generic
+QMP/physical-memory helpers from the static-placement observer. It stops all
+CPUs, checks QOM APIC identities and live registers, reads actual normalized
+frames, follows raw production queue/Thread/CPU-slot fields, accounts for
+authority/Channel/wait pins, walks every table/owned frame and compares the
+final allocator **bitmap** and original table inventory to their baseline.
+Only snapshots with the actual transaction lock clear are accepted. Serial
+lines and guest counters do not substitute for hardware/ownership evidence.
+The [SMP QMP protocol](testing/smp-qmp.md) documents schemas and checkpoints.
+
+All checkpoints in the completion contract are **accepted** on local branch
+`codex/k9-smp-completion`. The full matrix passes **181 registered QEMU
+executions**, comprising the retained 169 executions plus the twelve scheduled
+SMP profiles. The Rust host suite passes **306 tests**, and all **eight Python
+observer regression tests** pass. The original 30-second per-case deadline
+remains in force; `/usr/sbin/taskpolicy -t 4` affects only host scheduling.
+
+| Validation | Result | Retained evidence |
+| --- | --- | --- |
+| Toolchain/firmware doctor | Rust 1.95.0, Python 3.14.7, QEMU 11.0.0 and discovered OVMF pair verified | `build/k9-doctor.log` |
+| Host models and observer accounting | 306 Rust tests and eight Python regression tests pass | `build/k9-host-tests.log`, `build/k9-full-test.log` |
+| Formatting and lint | Formatting, all 181 feature selections and host-library clippy pass | `build/k9-check.log` |
+| Complete legacy/new QEMU matrix | 181/181 pass; longest guest execution 16.546 seconds | `build/k9-full-test-results.json`, `build/k9-full-test.log` |
+| Focused concurrency repeats | Stress, migration, idle/wakeup, four-CPU shootdown and rejected return all pass again with identical image hashes | `build/k9-repeat-results.json`, `build/k9-repeat.log` |
+| Default image build | Pass; kernel SHA-256 matches the full regression's boot execution | `build/k9-build.log`, `build/boot/manifest.json` |
+| Source, image and conservation audit | All 78 frozen sources and 181 image hashes match; every scheduled profile restores exact bitmap/tables and zero final roots, pins, references, authority and waits | `build/k9-full-smp-audit.json`, `build/k9-validation-summary.json` |
+
+The default kernel hash is
+`9ae7c0e04d383793f11d3df62d132459d1a6594e4f3a7bd61d387d53514a8dd5`.
+The full report was preserved before the targeted repeats overwrote the default
+`build/test-results.json`. Original full-run SMP JSON, serial, QEMU and image
+manifests are retained in `build/k9-full-test-evidence/`; repeat captures are
+in `build/k9-repeat-evidence/`. The validation summary records artifact hashes,
+individual profile checkpoints and the absence of residual project QEMU
+processes. The source inventory remains
+`build/k9-validation-source-manifest.json`.
+
+The first full attempt stopped after 74 passing cases at `preempt`. Its user
+IRQs were ticks 1–8 and 10–17; tick 9 was an explicitly recorded kernel drain
+on the common root, with IF=0, one EOI and no scheduler switch. Final counters
+were ticks=17, EOI=17, user=16 and drain=1. The older observer incorrectly
+assumed that every global tick was a user frame. Only `tools/neu.py` changed
+after that attempt, with `tools/test_preempt_accounting.py` added; the kernel
+sources stayed frozen.
+
+The corrected observer reconciles the separate user/kernel ledger and retains
+the existing maximum of one kernel drain. It rejects missing, duplicate or
+reordered ticks, foreign roots, mismatched EOIs and replayed/excessive drains.
+All frame, owner, flag, IRQ-origin, conservation and timeout checks remain.
+The failed attempt remains in `build/k9-full-test-first-attempt.log` and
+`build/k9-full-test-first-attempt-results.json`, with its original
+`build/k9-preempt-first-attempt.json` and
+`build/k9-preempt-first-attempt.serial.log`. The corrected preemption recheck
+and complete replacement matrix both passed.
+
+### Scope after K9
+
+This is the initial conventional SMP scheduler for the fixed x86-64/QEMU
+profile. Normal cases use 512 MiB; the longer four-CPU stress case uses 1 GiB.
+Kernel transactions remain IRQ-disabled and non-preemptible; allocation and
+final paging teardown stay BSP-owned. Work stealing, load balancing, general
+kernel preemption, arbitrary AP allocation, public mapping/Thread factories,
+TLS/FPU/SIMD scheduling, physical hardware, COW and demand paging remain later
+work. **K10** is the next roadmap milestone: capability derivation/revocation,
+rights-subset enforcement and safe concurrent mapping invalidation.
+
+The records below retain their original milestone scope. The current scheduled
+SMP behavior is specified above; older exclusions describe those earlier
+profiles and do not override this completion contract.
+
+## K9 / Phase 9C-1 — complete for static two-CPU Ring 3 execution (2026-11-03)
+
+Baseline was `46ef2214788cbb9f561af1394391654848ea7976` on `main` with Phase 9B
+complete. Phase 9C-1 executes two distinct Node Threads in Ring 3 at the same
+time on the BSP and one application processor. Logical CPU 0 runs Node A /
+Thread A1 in AddressSpace A; logical CPU 1 runs Node B / Thread B1 in
+AddressSpace B. Placement is fixed before either CPU is released; the BSP owns
+every allocating subsystem and every registry. [ADR 0028](adr/0028-static-smp-user-execution.md)
+accepts only this bounded scope. Architecture v0.2, ABI 0.5 and all fixed pools
+are unchanged; there is no ABI 0.6 and no legacy selector or assertion changed.
+
+### Placement and ownership
+
+`kernel/src/smp_user.rs` is a CPU-instruction-free model of the placement
+session. A slot binds one logical CPU to one ActiveContext, one fresh
+`SavedContext`, one descriptor and one image-reserved kernel entry arena.
+Placement rejects a duplicate Thread, Node, space, root or arena, a forged or
+stale saved context, a kernel address space, an unaligned or overlapping arena
+and an out-of-range CPU. `ready` requires both roles and a bound page-aligned
+barrier; `release` requires both placements; `enter`, `exit`, `complete`,
+`acknowledge` and `reap` are one-shot and ordered; `acknowledge` requires both
+completions. The phases are `Prepared → Released → Entered → Exited →
+Completed → Acknowledged → Reaped`. The x86-64 controller uses the same
+transitions around the hardware entry and exit, and the AP waits for the
+terminal `REAPED` phase after the BSP publishes it.
+
+The production `Nodes` registry gained statically assigned CPU slots
+(`start_on`, `complete_on`, `active_on`, `concurrent_count`) next to the legacy
+single-CPU `active` field. The legacy field must stay empty while any CPU slot
+is occupied, a Thread can occupy at most one slot, and completion is only
+accepted from the slot that hosted it. The BSP creates both Nodes, installs both
+`SavedContext`s, dispatches both Threads and later completes, releases and
+reclaims them in the model's order.
+
+Each CPU receives one 96-word, 64-byte-aligned descriptor at
+`neu_smp_user_blocks + logical * neu_smp_user_layout[3]` (layout
+`[magic, MAX_CPUS, fields, stride]`). It carries CPU/APIC identity, role,
+Node/Thread/space identities and Thread generation, kernel and user roots,
+entry and saved Ring 3 context, stack binding, kernel arena and RSP0,
+TSS/GDT/IDT bases, barrier virtual/physical addresses, user frame identities,
+the exact expected exit tuple, the allocator/table baseline and the phase. The
+BSP is the only publisher; each CPU writes only its own block and bridge
+record. The AP path never reaches `Nodes`, `Paging`, the paging registry, the
+capability registry or serial. No global was made `Sync`, no broad lock was
+introduced and no `&mut` alias crosses a CPU boundary.
+
+### Ring 3 entry, exit and CPU identity
+
+`neu_smp_user_enter` saves the CPU's kernel continuation, root, CR0, EFER and
+GS base in its own bridge record, disables SYSCALL/SYSENTER and FPU/SIMD
+exposure, loads the private user root, publishes the user selectors and
+`iretq`s to CPL3 with IF clear. No SWAPGS is used: the entry clears
+`IA32_GS_BASE` and every CPL3 exit re-derives the logical identity from CPUID
+before touching any block. The exit path validates the kernel CS after the
+transition, user CS/SS, the expected vector, error, RIP, RSP, CR2, RFLAGS
+policy, the handler RSP inside the CPU's own arena, the exit root equal to the
+published user root and the expected registers before recording the raw exit
+and publishing `Exited`. It then restores the CPU's kernel root, CR0, EFER and
+GS base and resumes the suspended Rust continuation. A mismatch is terminal for
+that CPU; the peer's evidence is never substituted.
+
+### Concurrency, isolation and containment
+
+Both private roots alias one image-owned barrier page read/write at user level,
+and no page table is mutated to coordinate execution. Each role publishes a
+stage-A bit and waits for `0b11`, dwells in a bounded loop, synchronizes at
+stage B, and role 0 publishes a survivor word that role 1 observes from the
+other address space. QMP stops the VM at the prepared window (both CPUs at
+CPL0, no entry) and again while both CPUs are inside the Ring 3 fixture span at
+CPL3 with distinct user CR3s and the stage-A barrier word `0b11`. The overlap
+profile additionally requires the two execution intervals to intersect.
+
+The AP-fault profile stores to the kernel text virtual address. The AP takes a
+genuine `#PF` at CPL3 with error 7 and CR2 equal to the text base, records the
+raw frame on its own arena, resumes and parks. The BSP peer keeps executing,
+completes stage B and exits normally through `int 0x80`; both Threads complete
+exactly once, the AP's outcome is `ExitReason::UserFault`, and the fatal kernel
+fault record stays untouched. The isolation profile proves no user frame or
+root is shared and re-verifies each root's W^X/NX/guard layout.
+
+### Profiles and independent evidence
+
+Six stopped-CPU profiles are registered:
+
+| Case | vCPUs | Proves |
+| --- | --- | --- |
+| `smp-user-2` | 2 | Both Threads prepared, statically assigned, concurrently at CPL3, real user work, exact completion and baseline teardown |
+| `smp-user-overlap` | 2 | The execution intervals intersect inside the Ring 3 payload |
+| `smp-user-isolation` | 2 | No user frame or root is shared; each root re-verifies its own layout |
+| `smp-user-ap-fault` | 2 | AP `#PF` containment with a normally completing BSP peer |
+| `smp-user-completion` | 2 | Duplicate completion, acknowledgement and dispatch are rejected |
+| `smp-user-invalid` | 2 | Nine placement/identity/root/barrier/generation rejections, no entry |
+
+`tools/smp_qmp.py` stops the whole VM (requiring `paused`), resolves QMP's own
+vCPU set and per-CPU `apic-id` through QOM, and reads the descriptors, the
+model identities, the saved contexts, the private roots and effective PTEs,
+the raw physical user frames, the barrier page, the bridge records, the CPU
+blocks, the fault record, the completion/ownership state and the final
+allocator/table inventories. It verifies the exact Ring 3 checkpoints, the
+distinct roots, per-CPU stacks and descriptor tables, the raw exit and fault
+tuples, the survivor observations and the baseline restoration. Guest serial
+lines are never accepted as evidence.
+
+### Validation and explicit non-claims
+
+`make doctor`, `make check`, `make build` and the full QEMU suite pass. The host
+suite passed **286 tests** (275 Phase 9B baseline plus 11 placement, barrier,
+ownership, completion and stale-generation tests). The full QEMU suite passed
+**169 scenario executions (167 unique)** with zero failures: the 163 Phase 9B
+executions (161 unique) plus the six Phase 9C-1 profiles; `smp-cpu-identity`
+and `smp-ap-isolation` remain the two re-executions of the 4-CPU path. The run
+used the unchanged 30-second timeout under `/usr/sbin/taskpolicy -t 4` (host
+scheduling only). The six new profiles were also run individually and repeated,
+and a clean-target rebuild repeated fmt, every-feature clippy, the default
+image build and the host suite. Evidence is retained under
+`build/k9c1-full-test.log`, `build/k9c1-full-test-results.json`,
+`build/k9c1-repeats.log`, `build/k9c1-clean-build.log` and
+`build/test-logs/<case>.serial.log`.
+
+Excluded: Thread migration, work stealing, load balancing, per-CPU run queues,
+a preemptive multi-CPU scheduler, AP-owned registry or page-table mutation,
+concurrent frame/capability mutation, remote TLB shootdown, general kernel
+preemption, K10 derivation/revocation, public syscalls, mmap/munmap, COW,
+demand paging, swap, huge pages and Linux compatibility. The two Threads are
+statically assigned and never migrate; user execution is non-preemptible (IF
+clear) and per-AP timers stay masked. Architecture v0.2 and experimental ABI
+0.5 remain the baselines.
+
 ## K9 / Phase 9B — complete for bounded cross-CPU work and verified IPI coordination (2026-11-01)
 
 Baseline was `d9ebcd93ef70f2834e0689091012a2987c235772` on `main` with Phase 9A

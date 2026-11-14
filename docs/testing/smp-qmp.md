@@ -1,4 +1,9 @@
-# SMP QMP evidence (bounded Phase 9A and 9B)
+# SMP QMP evidence (K9)
+
+The bootstrap, mailbox and static Ring 3 sections retain their original phase
+contracts. The [scheduled SMP protocol](#scheduled-smp-evidence-phases-9c-2-9c-3-and-9d)
+below covers the conventional scheduler, shared lifecycle transactions,
+migration, blocking, fault quiescence and remote TLB invalidation.
 
 The `smp-*` images boot real application processors into Neu kernel entry code.
 The guest prints topology and park lines, but those lines are **not** evidence.
@@ -198,3 +203,202 @@ do not execute x86 SMP code; the multi-vCPU profiles are the execution
 evidence. Thread migration, per-CPU run queues, AP scheduling, remote TLB
 shootdown and concurrent allocator/capability mutation remain untested and
 unclaimed.
+
+# Static two-CPU Ring 3 evidence (bounded Phase 9C-1)
+
+## Profiles
+
+| Case | vCPUs | Purpose |
+| --- | --- | --- |
+| `smp-user-2` | 2 | Both statically assigned Threads execute real Ring 3 work concurrently |
+| `smp-user-overlap` | 2 | The two execution intervals intersect inside the Ring 3 payload |
+| `smp-user-isolation` | 2 | No user frame or root is shared; each root re-verifies its own layout |
+| `smp-user-ap-fault` | 2 | AP `#PF` containment with a normally completing BSP peer |
+| `smp-user-completion` | 2 | Duplicate completion, acknowledgement and dispatch are rejected |
+| `smp-user-invalid` | 2 | Nine placement/identity/root/barrier/generation rejections, no entry |
+
+## Publication and checkpoints
+
+The guest publishes one 96-word, 64-byte-aligned block per CPU at
+`neu_smp_user_blocks + logical * neu_smp_user_layout[3]`; the layout witness is
+`[magic, MAX_CPUS, fields, stride]`. The oracle stops the whole VM at two
+exported windows:
+
+1. **Prepared** — both CPUs at CPL0, no Ring 3 entry. Every descriptor
+   identity, Node/Thread generation, space/root, saved context, stack binding,
+   entry arena, TSS/GDT/IDT base, RSP0 and baseline word is matched against the
+   ELF symbols and the documented constants; both CPU blocks must be `Ready`
+   and the private roots distinct.
+2. **Concurrent** — both CPUs inside the Ring 3 fixture span at CPL3, on user
+   CS/SS with the RFLAGS policy, each on its own user CR3, RIP inside the
+   copied payload range, and the stage-A barrier word equal to `0b11`. Both
+   descriptor phases must be `Entered`, and each CPU's bridge continuation RSP
+   must lie inside its own published kernel arena.
+
+The VM is resumed after each checkpoint. A guest `both_running` word or a
+serial line is never accepted.
+
+## Final checks
+
+After the idle marker, the oracle re-reads both descriptors and requires:
+exactly one entry, exit, completion and acknowledgement per CPU; a normal exit
+(`int 0x80`) on the BSP and, for the fault profile, a `#PF` tuple with vector
+14, error 7, the fault-site RIP and the text-base CR2 on the AP; the raw
+exit RIP/RSP/RFLAGS/CS/SS and the exit CR3 equal to the published user root;
+the restored kernel root, GS base, CR0 and EFER equal to the pre-entry state;
+the handler RSP inside the CPU's own arena; the barrier and both DATA frames
+showing the survivor publication observed from the other address space; and,
+for the isolation and overlap profiles, the documented frame disjointness and
+interval intersection. The private roots must still translate every user page
+with its published W^X/NX/rights and translate the guard/unmapped pages as
+absent.
+
+The model identities are cross-checked against the production objects: the
+Thread generation, the exact Node/Thread/space IDs, the completion outcome
+(including `UserFault` for the AP-fault profile), the reclaimed Thread state
+and the final allocator/table inventory equal to the pre-execution baseline.
+Both CPUs must be parked, the AP timer masked, the local APIC untouched by this
+profile and the fatal fault record clear.
+
+## Invalid checks
+
+`smp-user-invalid` publishes `Cancelled` with checks `0x1ff`, zero entry, exit,
+completion and acknowledgement counts, zero baseline/final difference and no
+Ring 3 bridge use. The oracle verifies that every unpublished descriptor word
+is zero, that the CPU descriptor tables and gates are still the disarmed
+kernel ones, and that the fatal fault record is untouched. The nine rejections
+are: duplicate Thread/Node/space and CPU slot, forged `SavedContext`, kernel
+address space, accepted page-aligned barrier, unaligned barrier, second barrier
+binding, one-CPU release, repeated Thread on a second CPU and stale Thread
+generation after slot reuse.
+
+## Limits
+
+The two Threads are statically assigned before release and never migrate. No
+per-CPU run queue, preemptive multi-CPU scheduler, load balancing, AP-owned
+registry or page-table mutation, remote TLB shootdown or concurrent allocation
+is tested or claimed by the static profiles. Host tests cover the placement
+and lifecycle state machines; the stopped-CPU multi-vCPU profiles are the
+execution evidence.
+
+# Scheduled SMP evidence (Phases 9C-2, 9C-3 and 9D)
+
+## Profiles
+
+| Case | vCPUs | Purpose |
+| --- | --- | --- |
+| `smp-schedule-2` | 2 | CPU-local FIFO scheduling, native returns and timer preemption of three Threads |
+| `smp-schedule-4` | 4 | The same scheduling loop on all CPUs, including an idle CPU |
+| `smp-schedule-shared` | 2 | Concurrent same-Node Threads perform real atomic increments of one shared counter |
+| `smp-schedule-migrate` | 4 | A2 resumes its saved context on CPU3 after executing on CPU1 |
+| `smp-schedule-fault` | 2 | A2's user protection fault cancels its running sibling; B1 survives |
+| `smp-schedule-reject` | 2 | Unsafe user RSP/DF at a real SYSCALL is contained before any operation or resume |
+| `smp-schedule-idle` | 4 | B1 blocks with a pinned Channel wait; its CPU enters real STI/HLT and wakes |
+| `smp-schedule-ipc` | 2 | Scalar/Flag Channel transactions while shared-Node Threads run on two CPUs |
+| `smp-schedule-stress` | 4 | Longer scheduling/migration run with native/IRQ observation pauses disabled |
+| `smp-tlb-2` | 2 | Live write-permission removal, remote invalidation and denied user store |
+| `smp-tlb-4` | 4 | Every CPU invalidates or flushes its root before acknowledging the change |
+| `smp-tlb-invalid` | 2 | Twenty-two inert mapping/coordinator rejections followed by the real shootdown |
+
+`python3 tools/neu.py test --case <case>` builds the isolated feature and selects
+the matching CPU count. Normal profiles use 512 MiB; stress uses 1 GiB. The
+default deadline remains 30 seconds. Three PIT calibration samples determine
+the local APIC's 10 ms one-shot quantum; the observer recomputes the median
+frequency and initial count from those samples. Work release requires 40 BSP
+timer preemptions (90 for stress).
+
+## Production schemas and observation
+
+`tools/smp_scheduler_qmp.py` is a dedicated observer with its own expectations.
+It reuses only generic QMP/physical-memory helpers from the earlier observer.
+It repeatedly stops **all** QEMU CPUs, verifies the paused state and QOM APIC
+identities, inspects registers and raw production storage, and resumes the VM.
+A snapshot with the actual transaction lock held is skipped; an unlocked
+snapshot must satisfy the scheduler, authority and waiter invariants.
+
+The ELF exports locate storage rather than certify it:
+
+- `neu_smp_sched_layout` identifies four 832-byte CPU records, each with 64
+  atomic metadata words, the owned 160-byte ABI Frame at offset 512 and the
+  128-byte bridge at offset 672.
+- `neu_smp_sched_value_layout`, `neu_smp_sched_threads`,
+  `neu_smp_sched_queues` and `neu_smp_sched_contexts` locate the actual
+  StackBinding, SavedContext, Thread, FIFO, owner/affinity and CPU-slot fields.
+- `neu_smp_sched_entries` and `neu_smp_sched_traces` retain up to 256 32-word
+  records per CPU. Each record includes the full 20-word Frame, Thread/Node,
+  root, entry sequence and CPU identity. Exit records also carry the vector,
+  error, CR2, actual stack-frame address, KERNEL_GS and ISR/EOI evidence.
+- `neu_smp_sched_authority`, `neu_smp_sched_inventory` and
+  `neu_smp_sched_tlb` locate actual capability tables, objects, Channel queues,
+  wait pins, Node fields, frame bitmap, page-table metadata and shootdown state.
+
+The observer independently reads the first native and timer normalized
+176-byte frames directly from each executing CPU's virtual stack. Their
+registers, vector/error and owning root/stack must match the traces. Native
+and IRQ entries retain the CPU's trusted KERNEL_GS bridge; the generic CPU
+exception stub clears both GS MSRs before Rust. Every CPU's live GDT, TSS,
+IDT, guard pages, CR0, EFER, root and GS identity are checked independently.
+Timer vector 224 and IPI vector 241 require an actual ISR bit followed by one
+EOI; spurious vector 255 has no EOI.
+
+The baseline, prepared and terminal resource checkpoints use bounded masked
+LAPIC observation windows. Normal profiles also expose the first native/IRQ
+frames in such windows. Stress omits those native/IRQ pauses and retains full
+entry/exit histories and stopped-CPU invariant checks. None of these windows
+fabricates a user execution, saved frame, IRQ or acknowledgement.
+
+## Scheduling, authority and containment
+
+Two Nodes contain A1/B1/A2; A1 and A2 share Node A's root and authority table
+but have distinct guarded stacks. At least one stopped snapshot must show
+both same-Node Threads simultaneously at CPL3, with distinct CPU ownership.
+The shared-counter profile additionally requires the physical counter to equal
+the sum of both Threads' final progress counts. Queues, saved frames, Thread
+states, active CPU slots and affinity must agree at every accepted snapshot.
+The migration profile must show the actual A2 user registers on CPU3 after
+its CPU1 execution. Every resumed Frame is reconstructed from the previous
+exit, allowing only RAX/RDX operation results at a native return.
+
+The Channel profiles require a raw blocked/pinned B1 waiter, exactly one
+block/wake admission, scalar receipt and a transferred Flag with a stale
+sender handle. The four-CPU idle profile also requires CPU2 at the actual
+`sti; hlt; cli` path, IF set, no active Thread and no missed wake. Actual
+authority entries and queued transfers must account for every object reference
+and waiter pin; terminal tables, queues and waits must be empty.
+
+Fault profiles stop A1 before A2 commits its Node fault. The observer checks
+the pre-commit active slots, cancelled sibling and retained authority, backing
+and root pins. B1 must continue to normal exit and `NEU_LAST_FAULT` stay zero.
+The rejection profile independently reads A2's real SYSCALL frame with RSP
+`0x40cff9`, DF set, vector 128/error 0 and the linked rejection resume site.
+That frame must be the last A2 entry boundary, never a resumed context; the
+CPU records exactly one rejected return and zero CPU exceptions.
+
+## Remote translations and final conservation
+
+The TLB profiles warm a writable DATA alias at `0x410000`. A prevalidated
+transaction atomically clears only W in its actual PTE and publishes a bound
+epoch/root/address/target set. For every target, QMP observes the CPU after its
+actual INVLPG or CR3-reload instruction, inside the linked observation span,
+with that CPU's ACK still unpublished. The coordinator commits only after
+all targets acknowledge the current request. A2's subsequent store at
+`0x410210` must take a genuine user `#PF` (error 7) and leave the warmed value
+3 unchanged. The unrelated Node cannot map the private alias.
+
+The invalid profile checks all 22 exact errors and reads the real PTE before
+and after each rejected request. Simulated coordinator acknowledgements use a
+separate model and cannot advance the actual hardware epoch.
+
+After all CPUs stop, each TSS.RSP0 must name its permanent bootstrap stack.
+Inspection views expire before Thread-stack destruction and root-pin release.
+The observer checks every allocated frame, ownership record, table and reachable
+translation, then requires the final allocator **bitmap** and original table
+inventory to match the baseline exactly, with zero user roots, pins,
+references, mappings, capability authority or waiters. Every CPU restores its
+kernel controls and has empty LAPIC ISR/IRR state before the existing Neu halt
+checks and host-controlled QMP exit.
+
+This protocol covers the bounded four-CPU, two-Node, three-Thread integer
+execution model with IRQ-disabled kernel transactions. Work stealing, load
+balancing, general kernel preemption, arbitrary allocation from APs, a public
+mapping ABI and K10 derivation/revocation remain later work.

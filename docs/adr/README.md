@@ -313,3 +313,37 @@ remote TLB shootdown, general kernel preemption or concurrent capability,
 frame or page-table mutation. Architecture v0.2, ABI 0.5 and ADRs 0005–0026
 remain in force.
 
+## K9 / Phase 9C-1 record — static two-CPU Ring 3 execution
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0028: Static two-CPU Ring 3 execution with verified ownership](0028-static-smp-user-execution.md) | Accepted for bounded Phase 9C-1; statically assigned BSP/AP Ring 3 Threads, distinct private roots, contained AP fault and stopped-CPU evidence verified | NEU-003; NEU-004; NEU-005; NEU-011; NEU-013; NEU-017; NEU-018; NEU-020; NEU-021; NEU-023; NEU-024 |
+
+ADR 0028 fixes one Node Thread to each of two CPUs before either is released,
+prepares both private roots and stacks on the BSP, publishes one validated
+descriptor per CPU, and proves concurrent CPL3 execution from stopped-CPU QMP
+state against a shared user barrier. It contains an AP-side user fault, keeps
+the BSP peer running to a normal exit, records completion and acknowledgement
+exactly once and returns the allocator and table inventory to baseline. It does
+not accept a preemptive multi-CPU scheduler, Thread migration, per-CPU run
+queues, load balancing, AP-owned registry or page-table mutation, remote TLB
+shootdown or concurrent allocation. Architecture v0.2, ABI 0.5 and ADRs
+0005–0027 remain in force.
+
+## K9 / Phases 9C-2, 9C-3 and 9D record — bounded scheduled SMP
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0029: Bounded scheduled SMP with shared transactions and remote invalidation](0029-bounded-scheduled-smp.md) | Accepted for bounded K9 completion; two/four-CPU preemptive scheduling, saved-context migration, shared authority/Channel transactions, fault quiescence and real remote invalidation verified | NEU-003; NEU-004; NEU-005; NEU-011; NEU-013; NEU-017; NEU-018; NEU-020; NEU-021; NEU-023; NEU-024 |
+
+ADR 0029 adds per-CPU FIFO/affinity and a reusable full-context bridge on every
+CPU, one explicit shared transaction lock, generation-protected idle wakeups,
+remote sibling cancellation and an epoch-bound TLB invalidation protocol.
+The 306 host tests, eight observer regressions, full 181-execution QEMU matrix,
+five focused repeats, lint and default build pass for the fixed four-CPU,
+two-Node, three-Thread integer execution model. Architecture v0.2 and ABI 0.5
+remain in force; kernel transactions are non-preemptible and allocation/final
+teardown remain BSP-owned. K10 derivation/revocation, general kernel
+preemption, balancing, public mapping/Thread creation and physical hardware
+validation remain later work. Earlier ADRs retain their original scoped facts.
+

@@ -135,7 +135,25 @@ const _: () = assert!(
         + cfg!(feature = "test-memory-object-runtime-read-denied") as u8
         + cfg!(feature = "test-memory-object-runtime-fault") as u8
         + cfg!(feature = "test-memory-object-runtime-peer-exit") as u8
-        + cfg!(feature = "test-memory-object-runtime-cancel") as u8)
+        + cfg!(feature = "test-memory-object-runtime-cancel") as u8
+        + cfg!(feature = "test-smp-user-2") as u8
+        + cfg!(feature = "test-smp-user-overlap") as u8
+        + cfg!(feature = "test-smp-user-isolation") as u8
+        + cfg!(feature = "test-smp-user-ap-fault") as u8
+        + cfg!(feature = "test-smp-user-completion") as u8
+        + cfg!(feature = "test-smp-user-invalid") as u8
+        + cfg!(feature = "test-smp-schedule-2") as u8
+        + cfg!(feature = "test-smp-schedule-4") as u8
+        + cfg!(feature = "test-smp-schedule-shared") as u8
+        + cfg!(feature = "test-smp-schedule-migrate") as u8
+        + cfg!(feature = "test-smp-schedule-fault") as u8
+        + cfg!(feature = "test-smp-schedule-reject") as u8
+        + cfg!(feature = "test-smp-schedule-idle") as u8
+        + cfg!(feature = "test-smp-schedule-ipc") as u8
+        + cfg!(feature = "test-smp-schedule-stress") as u8
+        + cfg!(feature = "test-smp-tlb-2") as u8
+        + cfg!(feature = "test-smp-tlb-4") as u8
+        + cfg!(feature = "test-smp-tlb-invalid") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );
@@ -288,10 +306,22 @@ extern "C" fn neu_main() -> ! {
     if let Err(reason) = arch::smp_work::map_lapic(&mut paging) {
         fail(reason);
     }
+    #[cfg(feature = "smp-scheduler-test")]
+    if let Err(reason) = arch::smp_scheduler::map_lapic(&mut paging) {
+        fail(reason);
+    }
     // Publish the owned root only after the BSP proves every per-CPU arena is
     // mapped, then wait for each AP to report a complete parked transition.
     #[cfg(feature = "smp-test")]
     if let Err(reason) = arch::smp::finish(&paging) {
+        fail(reason);
+    }
+    #[cfg(feature = "smp-user-test")]
+    if let Err(reason) = arch::smp_user::run(&mut paging) {
+        fail(reason);
+    }
+    #[cfg(feature = "smp-scheduler-test")]
+    if let Err(reason) = arch::smp_scheduler::run(&mut paging) {
         fail(reason);
     }
     #[cfg(feature = "smp-work-test")]

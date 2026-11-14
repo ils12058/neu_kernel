@@ -228,3 +228,29 @@ test-smp-work-repeat = ["smp-two", "smp-work-test"]
 test-smp-work-invalid = ["smp-two", "smp-work-test"]
 test-smp-ipi-2 = ["smp-two", "smp-work-test", "smp-ipi-test"]
 test-smp-ipi-4 = ["smp-four", "smp-work-test", "smp-ipi-test"]
+
+# K9C-1 Phase 9C-1: statically assigned Ring 3 threads executing concurrently
+# on the BSP and one AP. Every profile is a two-CPU image; placement is fixed
+# before execution and no thread may migrate.
+smp-user-test = []
+test-smp-user-2 = ["smp-two", "smp-user-test"]
+test-smp-user-overlap = ["smp-two", "smp-user-test"]
+test-smp-user-isolation = ["smp-two", "smp-user-test"]
+test-smp-user-ap-fault = ["smp-two", "smp-user-test"]
+test-smp-user-completion = ["smp-two", "smp-user-test"]
+test-smp-user-invalid = ["smp-two", "smp-user-test"]
+
+# K9 completion: shared lifecycle transactions and per-CPU native/timer entry.
+smp-scheduler-test = []
+test-smp-schedule-2 = ["smp-two", "smp-scheduler-test"]
+test-smp-schedule-4 = ["smp-four", "smp-scheduler-test"]
+test-smp-schedule-shared = ["smp-two", "smp-scheduler-test"]
+test-smp-schedule-migrate = ["smp-four", "smp-scheduler-test"]
+test-smp-schedule-fault = ["smp-two", "smp-scheduler-test"]
+test-smp-schedule-reject = ["smp-two", "smp-scheduler-test"]
+test-smp-schedule-idle = ["smp-four", "smp-scheduler-test"]
+test-smp-schedule-ipc = ["smp-two", "smp-scheduler-test"]
+test-smp-schedule-stress = ["smp-four", "smp-scheduler-test"]
+test-smp-tlb-2 = ["smp-two", "smp-scheduler-test"]
+test-smp-tlb-4 = ["smp-four", "smp-scheduler-test"]
+test-smp-tlb-invalid = ["smp-two", "smp-scheduler-test"]

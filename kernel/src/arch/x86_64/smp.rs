@@ -96,6 +96,18 @@ const FAILURE_CANARY: u64 = 10;
 const FAILURE_APIC: u64 = 11;
 const FAILURE_STATE: u64 = 12;
 const FAILURE_FAULT: u64 = 13;
+/// Phase 9C-1: AP-side user-execution failures. The AP publishes these in its
+/// own block; the BSP reports them after it observes the terminal state.
+#[cfg(feature = "smp-user-test")]
+pub(super) const FAILURE_USER_BLOCK: u64 = 14;
+#[cfg(feature = "smp-user-test")]
+pub(super) const FAILURE_USER_WAIT: u64 = 15;
+#[cfg(feature = "smp-user-test")]
+pub(super) const FAILURE_USER_DESCRIPTOR: u64 = 16;
+#[cfg(feature = "smp-user-test")]
+pub(super) const FAILURE_USER_ENTRY: u64 = 17;
+#[cfg(feature = "smp-user-test")]
+pub(super) const FAILURE_USER_EXIT: u64 = 18;
 
 // Limine MP protocol, base revision 6. Request ID and field offsets follow
 // limine-protocol 3a0526b700e356f0eac1b71a77697b3fd1c707a3 (v12.9.4).
@@ -362,9 +374,62 @@ pub fn is_guard(address: u64) -> bool {
     guards().contains(&address)
 }
 
-fn block_address(logical: usize) -> u64 {
+pub(super) fn block_address(logical: usize) -> u64 {
     // SAFETY: `logical < MAX_CPUS` is checked by every caller.
     unsafe { ptr::addr_of!(neu_smp_cpus).cast::<CpuBlock>().add(logical) as u64 }
+}
+
+/// Phase 9C-1: recovers a CPU's logical index from its published APIC identity.
+/// A Ring 3 exit has already had its GS base cleared by the exception entry, so
+/// the identity must be re-established before any per-CPU state is touched.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn logical_by_apic(apic: u32) -> Option<usize> {
+    (0..cpu::MAX_CPUS).find(|&logical| {
+        neu_smp_cpus[logical].load(cpu::block::MAGIC) == cpu::BLOCK_MAGIC
+            && neu_smp_cpus[logical].load(cpu::block::APIC_ID) == u64::from(apic)
+    })
+}
+
+/// Frozen copy of the per-CPU kernel resources a user profile publishes to its
+/// QMP oracle. Only the BSP reads this after the AP has proved readiness.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+#[derive(Clone, Copy)]
+pub(super) struct UserCpu {
+    pub apic_id: u32,
+    pub gdt: u64,
+    pub tss: u64,
+    pub idt: u64,
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn user_cpu(logical: usize) -> Option<UserCpu> {
+    let resources = match logical {
+        0 => {
+            let tables = exceptions::tables();
+            let start = ptr::addr_of!(__stack_bottom) as u64;
+            let end = ptr::addr_of!(__stack_top) as u64;
+            Resources {
+                stack_bottom: start,
+                stack_top: end,
+                ist_bottom: ptr::addr_of!(__df_stack_bottom) as u64,
+                ist_top: ptr::addr_of!(__df_stack_top) as u64,
+                guard_low: 0,
+                guard_mid: 0,
+                guard_ist: 0,
+                gdt: tables.gdt_base,
+                tss: tables.tss_base,
+                idt: tables.idt_base,
+                entry: 0,
+            }
+        }
+        _ => resources(logical)?,
+    };
+    Some(UserCpu {
+        apic_id: neu_smp_cpus[logical].load(cpu::block::APIC_ID) as u32,
+        gdt: resources.gdt,
+        tss: resources.tss,
+        idt: resources.idt,
+    })
 }
 
 /// Returns the logical index only when the GS base names a published block.
@@ -391,6 +456,43 @@ pub(super) fn current_ap() -> Option<&'static CpuBlock> {
                 && neu_smp_cpus[logical].load(cpu::block::APIC_ID) == apic
         })
         .map(|logical| &neu_smp_cpus[logical])
+}
+
+/// Phase 9C-1 per-CPU read-back helpers. Each one executes on the processor it
+/// describes and returns only that processor's privileged state.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn cpu_count() -> usize {
+    EXPECTED
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn apic_id() -> u32 {
+    cpuid_apic_id()
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn rsp() -> u64 {
+    stack_pointer()
+}
+
+#[cfg(feature = "smp-user-test")]
+pub(super) fn gs_base() -> u64 {
+    rdmsr(IA32_GS_BASE)
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn cr0() -> u64 {
+    read_cpu_state().0
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn efer() -> u64 {
+    read_cpu_state().3
+}
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn ap_fail_index(index: usize, code: u64) -> ! {
+    ap_fail(&neu_smp_cpus[index], code)
 }
 
 /// The BSP is the only CPU allowed to touch COM1, the panic handler, the fatal
@@ -721,10 +823,20 @@ pub fn prepare() -> Result<(), &'static str> {
             exceptions::copy_kernel_idt(resources.idt as *mut u8);
             #[cfg(feature = "smp-ipi-test")]
             exceptions::install_ap_work_ipi(resources.idt as *mut u8)?;
+            #[cfg(feature = "smp-user-test")]
+            exceptions::install_smp_user_trap(resources.idt as *mut u8)?;
         }
         let code = unsafe { ptr::read_volatile((resources.gdt + 8) as *const u64) };
         if code != 0x00af_9a00_0000_ffff {
             return Err("SMP AP GDT code descriptor readback failed");
+        }
+        #[cfg(feature = "smp-user-test")]
+        {
+            let user_data = unsafe { ptr::read_volatile((resources.gdt + 6 * 8) as *const u64) };
+            let user_code = unsafe { ptr::read_volatile((resources.gdt + 7 * 8) as *const u64) };
+            if user_data != 0x00cf_f300_0000_ffff || user_code != 0x00af_fb00_0000_ffff {
+                return Err("SMP AP GDT user descriptor readback failed");
+            }
         }
         let tss_rsp = unsafe { ptr::read_unaligned((resources.tss + 4) as *const u64) };
         let tss_ist = unsafe { ptr::read_unaligned((resources.tss + 36) as *const u64) };
@@ -890,9 +1002,14 @@ fn apic_base_of(logical: usize) -> u64 {
     neu_smp_cpus[logical].load(cpu::block::APIC_BASE)
 }
 
-/// Stage A/B work images keep each AP live after the bootstrap prefix, so the
-/// BSP waits for the full Ready publication instead of the parked terminal.
-#[cfg(feature = "smp-work-test")]
+/// Stage A/B work images and the Phase 9C-1 user image keep each AP live after
+/// the bootstrap prefix, so the BSP waits for the full Ready publication instead
+/// of the parked terminal.
+#[cfg(any(
+    feature = "smp-work-test",
+    feature = "smp-user-test",
+    feature = "smp-scheduler-test"
+))]
 fn wait_work_ready(block: &CpuBlock) -> Result<(), &'static str> {
     let mut spins = 0u64;
     loop {
@@ -969,11 +1086,19 @@ pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str
     let mut parked = 0usize;
     for (offset, block) in neu_smp_cpus[1..ap_count].iter().enumerate() {
         let logical = offset + 1;
-        #[cfg(feature = "smp-work-test")]
+        #[cfg(any(
+            feature = "smp-work-test",
+            feature = "smp-user-test",
+            feature = "smp-scheduler-test"
+        ))]
         {
             wait_work_ready(block)?;
         }
-        #[cfg(not(feature = "smp-work-test"))]
+        #[cfg(not(any(
+            feature = "smp-work-test",
+            feature = "smp-user-test",
+            feature = "smp-scheduler-test"
+        )))]
         {
             let mut spins = 0u64;
             loop {
@@ -1001,7 +1126,22 @@ pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str
             block.load(cpu::block::CR3),
             block.load(cpu::block::STACK_BOTTOM)
         ))?;
-        #[cfg(not(feature = "smp-work-test"))]
+        #[cfg(all(
+            any(feature = "smp-user-test", feature = "smp-scheduler-test"),
+            not(feature = "smp-work-test")
+        ))]
+        log(format_args!(
+            "[NEU] SMP AP user-ready: logical={logical} apic={} ready_rsp={:#x} cr3={:#x} stack={:#x}\n",
+            block.load(cpu::block::APIC_ID),
+            block.load(cpu::block::READY_RSP),
+            block.load(cpu::block::CR3),
+            block.load(cpu::block::STACK_BOTTOM)
+        ))?;
+        #[cfg(not(any(
+            feature = "smp-work-test",
+            feature = "smp-user-test",
+            feature = "smp-scheduler-test"
+        )))]
         log(format_args!(
             "[NEU] SMP AP parked: logical={logical} apic={} entry_rsp={:#x} park_rsp={:#x} cr3={:#x} stack={:#x}\n",
             block.load(cpu::block::APIC_ID),
@@ -1068,7 +1208,19 @@ pub fn finish(paging: &super::paging::Paging<'_, '_>) -> Result<(), &'static str
         "[NEU] SMP work-ready: cpus={EXPECTED} aps={} released={released} ready={parked} root={root:#x}\n",
         EXPECTED - 1
     ))?;
-    #[cfg(not(feature = "smp-work-test"))]
+    #[cfg(all(
+        any(feature = "smp-user-test", feature = "smp-scheduler-test"),
+        not(feature = "smp-work-test")
+    ))]
+    log(format_args!(
+        "[NEU] SMP user-ready: cpus={EXPECTED} aps={} released={released} ready={parked} root={root:#x}\n",
+        EXPECTED - 1
+    ))?;
+    #[cfg(not(any(
+        feature = "smp-work-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    )))]
     {
         log(format_args!(
             "[NEU] SMP bootstrap complete: cpus={EXPECTED} aps={} released={released} parked={parked} root={root:#x}\n",
@@ -1093,7 +1245,11 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
     {
         return Err("SMP AP block does not record exactly one clean kernel entry");
     }
-    #[cfg(feature = "smp-work-test")]
+    #[cfg(any(
+        feature = "smp-work-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    ))]
     {
         let prefix = Bootstrap::Prepared.bit() | Bootstrap::Entered.bit() | Bootstrap::Ready.bit();
         if Bootstrap::from_code(block.load(cpu::block::STATE)) != Some(Bootstrap::Ready)
@@ -1103,7 +1259,11 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
             return Err("SMP AP is not in the published work-ready state");
         }
     }
-    #[cfg(not(feature = "smp-work-test"))]
+    #[cfg(not(any(
+        feature = "smp-work-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    )))]
     if block.load(cpu::block::PARK_COUNT) != 1 {
         return Err("SMP AP block does not record exactly one clean kernel entry");
     }
@@ -1148,7 +1308,11 @@ fn verify_ap(logical: usize, root: u64, start: u64, end: u64) -> Result<(), &'st
             return Err("SMP AP reported an RSP outside its own stack");
         }
     }
-    #[cfg(not(feature = "smp-work-test"))]
+    #[cfg(not(any(
+        feature = "smp-work-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    )))]
     {
         if !stack.contains(block.load(cpu::block::PARK_RSP)) {
             return Err("SMP AP reported an RSP outside its own stack");
@@ -1376,12 +1540,22 @@ extern "C" fn neu_smp_ap_main(info: *const MpInfo, logical: u64, loader_rsp: u64
         block.store(cpu::block::ISOLATION, cpu::block::ISOLATION_AP);
         super::smp_work::ap_initialize(index, apic);
     }
+    #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+    block.store(cpu::block::ISOLATION, cpu::block::ISOLATION_AP);
     if block.advance(Bootstrap::Ready).is_err() {
         ap_fail(block, FAILURE_STATE);
     }
     #[cfg(feature = "smp-work-test")]
     super::smp_work::ap_main(index, apic);
-    #[cfg(not(feature = "smp-work-test"))]
+    #[cfg(feature = "smp-scheduler-test")]
+    super::smp_scheduler::ap_main(index, apic);
+    #[cfg(feature = "smp-user-test")]
+    super::smp_user::ap_main(index, apic);
+    #[cfg(not(any(
+        feature = "smp-work-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    )))]
     {
         block.store(cpu::block::PARK_RSP, stack_pointer());
         block.store(cpu::block::PARK_COUNT, 1);

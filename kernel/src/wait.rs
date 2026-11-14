@@ -198,6 +198,26 @@ impl Default for Waits {
     }
 }
 impl Waits {
+    #[cfg(feature = "smp-scheduler-test")]
+    pub fn smp_field_addresses(&self) -> [u64; WAITERS * 8] {
+        let mut words = [0; WAITERS * 8];
+        for (slot, waiter) in self.slots.iter().enumerate() {
+            if let Some(w) = waiter {
+                let thread = w.active.thread.smp_field_addresses();
+                words[slot * 8..slot * 8 + 8].copy_from_slice(&[
+                    thread[0],
+                    thread[1],
+                    core::ptr::from_ref(&w.token) as u64,
+                    core::ptr::from_ref(&w.state) as u64,
+                    core::ptr::from_ref(&w.pinned) as u64,
+                    core::ptr::from_ref(&w.active.context.root) as u64,
+                    core::ptr::from_ref(&w.kind) as u64,
+                    core::ptr::from_ref(&w.object) as u64,
+                ]);
+            }
+        }
+        words
+    }
     #[cfg(feature = "test-cap-moves-terminal-order")]
     pub fn debug_addresses(&self) -> [u64; 3] {
         self.slots.iter().flatten().next().map_or([0; 3], |w| {

@@ -1,5 +1,6 @@
 //! Pure bounded clockevent policy. No scheduler, clocksource or hardware access.
 pub const TIMER_VECTOR: u8 = 0x30;
+pub const SMP_TIMER_VECTOR: u8 = 0xe0;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const PIT_HZ: u64 = 1_193_182;
 pub const REFERENCE_TICKS: u16 = 11_932;
@@ -96,6 +97,14 @@ pub struct Configuration {
 impl Configuration {
     pub fn new(period_us: u64, vector: u8) -> Result<Self> {
         if !(100..=10_000).contains(&period_us) || vector != TIMER_VECTOR {
+            return Err(Error::Configuration);
+        }
+        Ok(Self { period_us, vector })
+    }
+    /// SMP owns a separate clockevent gate; the legacy single-CPU constructor
+    /// keeps rejecting every vector except its existing gate.
+    pub fn smp(period_us: u64, vector: u8) -> Result<Self> {
+        if !(100..=10_000).contains(&period_us) || vector != SMP_TIMER_VECTOR {
             return Err(Error::Configuration);
         }
         Ok(Self { period_us, vector })
@@ -217,6 +226,11 @@ mod tests {
         assert_eq!(classify(0x80), Vector::TestGate);
         assert_eq!(classify(0xff), Vector::Spurious);
         assert_eq!(classify(0x41), Vector::Unexpected);
+        assert!(Configuration::new(10_000, SMP_TIMER_VECTOR).is_err());
+        assert!(Configuration::smp(10_000, SMP_TIMER_VECTOR).is_ok());
+        for vector in [0, 31, TIMER_VECTOR, 0x80, 0xf1, SPURIOUS_VECTOR] {
+            assert!(Configuration::smp(10_000, vector).is_err());
+        }
     }
     #[test]
     fn controller_selection_prefers_verified_x2_capability_and_requires_uc_fallback() {

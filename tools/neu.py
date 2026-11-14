@@ -20,6 +20,7 @@ import time
 
 import memory_object_qmp
 import smp_qmp
+import smp_scheduler_qmp
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -99,6 +100,8 @@ SMP_CASES = smp_qmp.CASES
 SMP_WORK = smp_qmp.WORK_CASES
 SMP_REJECT = smp_qmp.REJECT
 FEATURES.update({name: "test-" + name for name in (*SMP_CASES, *SMP_REJECT)})
+SMP_SCHEDULE = smp_scheduler_qmp.CASES
+FEATURES.update({name: "test-" + name for name in SMP_SCHEDULE})
 USER_CODE, USER_RSP = 0x400000, 0x404ff8
 TEST_ADDRESS = 0xffffa00000000000
 
@@ -201,7 +204,8 @@ def elf_info(path):
             if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high",
-                    "__text_start", "__text_end", "__data_start", "__rodata_start"):
+                    "__text_start", "__text_end", "__data_start", "__rodata_start", "__rodata_end",
+                    "__requests_start", "__requests_end", "neu_isr_255", "NEU_LAST_FAULT"):
                 symbols[label] = value
     if symbols.get("__stack_top", 0) - symbols.get("__stack_bottom", 0) != 65536:
         raise Failure("Kernel ELF is missing its 64 KiB stack.")
@@ -504,7 +508,7 @@ for name, kind in NATIVE_CASES.items():
 
 
 for name, count in SMP_CASES.items():
-    if name in SMP_WORK:
+    if name in SMP_WORK or name in smp_qmp.USER_CASES:
         continue
     parked = [f"[NEU] SMP AP parked: logical={logical} " for logical in range(1, count)]
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
@@ -513,6 +517,21 @@ for name, count in SMP_CASES.items():
         f"[NEU] SMP bootstrap complete: cpus={count} aps={count - 1} released={count - 1} parked={count - 1}",
         "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"],
         EXPECT["boot"][1])
+for name, count in SMP_SCHEDULE.items():
+    markers = COMMON + PROTOCOL + OWNED + [
+        f"[NEU] SMP topology: cpus={count} aps={count - 1} bsp_apic=",
+        f"[NEU] SMP bootstrap armed: expected={count} released={count - 1}"] + PAGING + [
+        f"[NEU] SMP schedule baseline: cpus={count} root="]
+    if name == "smp-tlb-invalid":
+        markers.append("[NEU] SMP TLB negatives: checks=22 PTE=unchanged")
+    markers += [f"[NEU] SMP schedule prepared: cpus={count} roots=",
+                f"[NEU] SMP schedule concurrent: cpus={count}"]
+    if name in smp_scheduler_qmp.TLB:
+        markers.append(f"[NEU] SMP TLB committed: epoch=1 targets={((1 << count) - 1):#x}")
+    markers += ["[NEU] SMP schedule terminal: threads=3",
+                f"[NEU] SMP schedule complete: cpus={count} threads=3 baseline=restored",
+                "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
+    EXPECT[name] = (markers, EXPECT["boot"][1] + ["SMP scheduler failure:", "verified=false"])
 for name, count in SMP_WORK.items():
     ipi = name.startswith("smp-ipi")
     markers = COMMON + PROTOCOL + OWNED + [
@@ -558,6 +577,26 @@ for name, count in SMP_WORK.items():
     markers += ["[NEU] SMP work complete: mode=",
                 "[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
     EXPECT[name] = (markers, EXPECT["boot"][1])
+for name, count in smp_qmp.USER_CASES.items():
+    markers = COMMON + PROTOCOL + OWNED + [
+        f"[NEU] SMP topology: cpus={count} aps={count - 1} bsp_apic=",
+        f"[NEU] SMP bootstrap armed: expected={count} released={count - 1}"] + PAGING
+    markers.append(f"[NEU] SMP AP user-ready: logical={count - 1} ")
+    markers.append(f"[NEU] SMP user-ready: cpus={count} aps={count - 1} released={count - 1} ready={count - 1} root=")
+    if name == "smp-user-invalid":
+        markers.append("[NEU] SMP user invalid: rejections=0x1ff baseline=")
+    else:
+        markers += ["[NEU] SMP user prepared: root0=", "[NEU] SMP user released: kernel=",
+                    "[NEU] SMP user exits: kernel=",
+                    f"[NEU] SMP user complete: checks={smp_qmp.USER_CHECKS[name]:#x} profile={smp_qmp.USER_PROFILE_NAMES[name]}"]
+    markers += ["[NEU] Kernel bootstrap successful", "[NEU] Idle: interrupts disabled; halting"]
+    forbidden = EXPECT["boot"][1] + ["[NEU] SMP bootstrap complete:", "[NEU] SMP AP parked:"]
+    if name == "smp-user-invalid":
+        forbidden += ["[NEU] SMP user prepared:", "[NEU] SMP user released:",
+                      "[NEU] SMP user exits:", "[NEU] SMP user complete:"]
+    else:
+        forbidden.append("[NEU] SMP user invalid:")
+    EXPECT[name] = (markers, forbidden)
 for name in SMP_REJECT:
     EXPECT[name] = (COMMON + PROTOCOL + OWNED + [
         "[NEU] BOOT FAILURE: SMP processor count does not match the configured 2-CPU profile"],
@@ -640,6 +679,72 @@ def check_user(case, text, symbols, observed):
         "rsp": rsp, "rflags": flags, "result": result, "kernel_cs": kernel_cs, "handler_rsp": handler_rsp}
     return observed
 
+
+
+def check_smp_user(case, text, symbols, root, tables, checkpoints):
+    """Cross-checks the published Phase 9C-1 serial against the stopped stages."""
+    topology = re.search(r"\[NEU\] SMP topology: cpus=(\d+) aps=(\d+) bsp_apic=(\d+)", text)
+    armed = re.search(r"\[NEU\] SMP bootstrap armed: expected=(\d+) released=(\d+)\n", text)
+    if (not topology or (int(topology[1]), int(topology[2])) != (2, 1)
+            or not armed or (int(armed[1]), int(armed[2])) != (2, 1)):
+        raise Failure("SMP user profile did not publish the documented two-CPU bootstrap.")
+    ap = re.search(r"\[NEU\] SMP AP user-ready: logical=1 apic=(\d+) ready_rsp=(0x[0-9a-f]+) "
+                   r"cr3=(0x[0-9a-f]+) stack=(0x[0-9a-f]+)\n", text)
+    stack_bottom = symbols["neu_smp_ap1_stack_bottom"]
+    stack_top = symbols["neu_smp_ap1_stack_top"]
+    if (not ap or int(ap[3], 16) != root
+            or not stack_bottom <= int(ap[2], 16) < stack_top
+            or int(ap[4], 16) != stack_bottom):
+        raise Failure(f"SMP user AP readiness record does not match its own root/stack: "
+                      f"match={ap.groups() if ap else None} root={root:#x} "
+                      f"stack=[{stack_bottom:#x},{stack_top:#x}).")
+    ready = re.search(r"\[NEU\] SMP user-ready: cpus=2 aps=1 released=1 ready=1 root=(0x[0-9a-f]+)\n", text)
+    if not ready or int(ready[1], 16) != root:
+        raise Failure("SMP user aggregate readiness does not name the owned kernel root.")
+    if case == "smp-user-invalid":
+        invalid = re.search(r"\[NEU\] SMP user invalid: rejections=(0x[0-9a-f]+) baseline=(\d+) tables=(\d+)\n", text)
+        if (not invalid or int(invalid[1], 16) != 0x1FF or int(invalid[2], 10) <= 0
+                or int(invalid[3], 10) != tables):
+            raise Failure("SMP user invalid rejections/baseline are not the documented set.")
+        return {"invalid": {"rejections": int(invalid[1], 16),
+                            "baseline_free": int(invalid[2], 10),
+                            "baseline_tables": int(invalid[3], 10)}}
+    prepared = re.search(r"\[NEU\] SMP user prepared: root0=(0x[0-9a-f]+) root1=(0x[0-9a-f]+) "
+                         r"thread0=(\d+) thread1=(\d+) barrier=(0x[0-9a-f]+)\n", text)
+    capture = checkpoints.get("prepared")
+    if not prepared or capture is None:
+        raise Failure("SMP user prepared publication or its stopped capture is missing.")
+    roots = (int(prepared[1], 16), int(prepared[2], 16))
+    threads = (int(prepared[3], 10), int(prepared[4], 10))
+    if (roots[0] == roots[1] or root in roots or 0 in roots
+            or threads != smp_qmp.USER_THREADS
+            or int(prepared[5], 16) != capture["barrier"]
+            or list(roots) != capture["roots"]):
+        raise Failure("SMP user prepared roots/threads/barrier disagree with the stopped state.")
+    released = re.search(r"\[NEU\] SMP user released: kernel=(0x[0-9a-f]+) code=(0x[0-9a-f]+) "
+                         r"rsp=(0x[0-9a-f]+)\n", text)
+    if (not released or int(released[1], 16) != root
+            or int(released[2], 16) != smp_qmp.USER_VA["CODE"]
+            or int(released[3], 16) != smp_qmp.USER_RSP):
+        raise Failure("SMP user release does not name the owned root and documented entry.")
+    if "concurrent" not in checkpoints or "results" not in checkpoints:
+        raise Failure("SMP user positive profile is missing a stopped Ring 3 stage.")
+    exits = re.search(r"\[NEU\] SMP user exits: kernel=(0x[0-9a-f]+) bsp=(0x[0-9a-f]+) "
+                      r"ap=(0x[0-9a-f]+)\n", text)
+    expected = (smp_qmp.user_site(symbols, "neu_smp_user_done_resume"),
+                smp_qmp.user_site(symbols, "neu_smp_user_fault_site"
+                                  if case == "smp-user-ap-fault"
+                                  else "neu_smp_user_done_resume"))
+    if (not exits or int(exits[1], 16) != root
+            or (int(exits[2], 16), int(exits[3], 16)) != expected):
+        raise Failure("SMP user exit publication does not match the fixture sites.")
+    complete = re.search(r"\[NEU\] SMP user complete: checks=(0x[0-9a-f]+) profile=(\w+)\n", text)
+    if (not complete or int(complete[1], 16) != smp_qmp.USER_CHECKS[case]
+            or complete[2] != smp_qmp.USER_PROFILE_NAMES[case]):
+        raise Failure("SMP user completion mask/profile is not the documented one.")
+    return {"roots": list(roots), "threads": list(threads),
+            "barrier": capture["barrier"], "checks": int(complete[1], 16),
+            "profile": complete[2]}
 
 
 for name, number in NODE_CASES.items():
@@ -1161,6 +1266,33 @@ def check_preempt_loop_registers(case,frame,seed,symbols):
     if frame[:14]!=expected or frame[14]==0:raise Failure('An ordinary interrupted/resumed loop lost a supported integer register.')
 
 
+def preempt_drain_records(text, kernel_root):
+    records = []
+    for before, after, eois, root in re.findall(
+            r'Preempt deferred drained: before=(\d+) after=(\d+) eois=(\d+) root=(0x[0-9a-f]+) IF=0 kernel_switch=false', text):
+        before, after, eois, root = int(before), int(after), int(eois), int(root, 16)
+        if after != before + 1 or eois != after or root != kernel_root:
+            raise Failure('Deferred kernel drain changed scheduling or violated acknowledgment.')
+        records.append({'before': before, 'after': after, 'eois': eois, 'root': root})
+    if len(records) > 1 or len({row['after'] for row in records}) != len(records):
+        raise Failure('Preemption exceeded its single bounded kernel drain.')
+    return records
+
+
+def check_preempt_tick_accounting(events, drains, ticks, eois, user, drain):
+    if ticks != eois or user != len(events) or ticks != user + drain or drain > 1 or not len(drains) <= drain <= len(drains) + 1:
+        raise Failure('Timer events, EOI and scheduler counts were conflated.')
+    # A pending one-shot can drain on the common kernel stack between user
+    # slices. Its global tick is not a user frame or a scheduling capture.
+    user_ticks = [event['tick'] for event in events]
+    if user_ticks != sorted(set(user_ticks)):
+        raise Failure('User IRQ ticks were duplicated or reordered.')
+    observed = set(user_ticks) | {row['after'] for row in drains}
+    if observed != set(range(1, ticks + 1)) and not (
+            drain == len(drains) + 1 and observed == set(range(1, ticks))):
+        raise Failure('Missing hardware event accounting between user and kernel windows.')
+
+
 def check_preempt(case,text,symbols,observations,kernel_root,qmp):
     final_lapic=qmp.call('human-monitor-command',{'command-line':'info lapic'})
     calibrated=re.search(r'Timer calibrated: PIT_Hz=(\d+) reference=(\d+) samples=(\d+),(\d+),(\d+) divided_Hz=(\d+) initial=(\d+) divide=16 period_us=10000',text)
@@ -1177,6 +1309,7 @@ def check_preempt(case,text,symbols,observations,kernel_root,qmp):
             if not re.search(r'ISR\s+48\b',final_lapic):raise Failure('Unsupported-origin test did not use a real hardware event.')
         elif not re.search(r'ISR\s+\(none\)',final_lapic):raise Failure('Software negative unexpectedly acknowledged a real IRQ.')
         return {'expected_rejection':reason,'vector':vector,'final_lapic':final_lapic}
+    drains=preempt_drain_records(text,kernel_root)
     ready=re.findall(r'Switch Thread ready: label=(\d+) node=(\d+) thread=(\d+) space=(\d+) root=(0x[0-9a-f]+) bottom=(0x[0-9a-f]+) top=(0x[0-9a-f]+) pa0=(0x[0-9a-f]+) pa1=(0x[0-9a-f]+) code_pa=(0x[0-9a-f]+) data_pa=(0x[0-9a-f]+) user_stack_pa=(0x[0-9a-f]+) seed=(\d+)',text)
     if len(ready)!=2:raise Failure('Missing two independently owned initial Threads.')
     threads={int(v[0]):dict(zip(('label','node','thread','space','root','bottom','top','pa0','pa1','code','data','user_stack','seed'),map(lambda x:int(x,0),v))) for v in ready}
@@ -1211,7 +1344,7 @@ def check_preempt(case,text,symbols,observations,kernel_root,qmp):
         if len(irq_frames)!=len(irq_matches):raise Failure('IRQ count and integer-context trace differ.')
         for irq,(owner,words) in zip(irq_matches,irq_frames):
             tick,sequence,n,t,s,r,rip,rsp,flags,cs,ss,handler=map(lambda x:int(x,0),irq.groups()[:-1]);switch=irq[13]=='true'
-            if tick!=len(events)+1 or (sequence,n,t,s,r)!=(seq,node,thread,space,root) or cs!=0x3b or ss!=0x33 or flags&0x202!=0x202 or flags&~0x10ad7 or not record['bottom']<=handler<record['top']-176 or switch!=bool(fifo) or owner!=thread or words[15:]!=[rip,cs,flags,rsp,ss]:raise Failure('IRQ ownership/origin/acknowledgment/frame mismatch.')
+            if tick!=len(events)+1+sum(row['after']<tick for row in drains) or (sequence,n,t,s,r)!=(seq,node,thread,space,root) or cs!=0x3b or ss!=0x33 or flags&0x202!=0x202 or flags&~0x10ad7 or not record['bottom']<=handler<record['top']-176 or switch!=bool(fifo) or owner!=thread or words[15:]!=[rip,cs,flags,rsp,ss]:raise Failure('IRQ ownership/origin/acknowledgment/frame mismatch.')
             check_preempt_loop_registers(case,words,record['seed'],symbols)
             events.append({'tick':tick,'sequence':seq,'label':label,'frame':words,'switched':switch})
         yielded=logged_frames(episode,'preempt-saved')
@@ -1250,13 +1383,14 @@ def check_preempt(case,text,symbols,observations,kernel_root,qmp):
     restored=re.search(r'Preempt accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)',text)
     if not stopped or not done or not baseline or not restored or baseline.groups()[:3]!=restored.groups() or int(baseline[4],16)!=kernel_root:raise Failure('Missing exact resource and timer cleanup.')
     ticks,eois,user,drain=map(int,stopped.groups())
-    if ticks!=eois or user!=len(events) or ticks!=user+drain or drain>1 or tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('Timer events, EOI and scheduler counts were conflated.')
+    check_preempt_tick_accounting(events,drains,ticks,eois,user,drain)
+    if tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('Timer events, EOI and scheduler counts were conflated.')
     if not re.search(r'LVTT\s+0x00010030.*masked',final_lapic) or 'APIC disabled' not in final_lapic or 'TPR 0xff' not in final_lapic or not re.search(r'ISR\s+\(none\)',final_lapic) or not re.search(r'IRR\s+\(none\)',final_lapic) or not re.search(r'initial_count = 0 current_count = 0',final_lapic):raise Failure('Timer did not stop and drain before final halt.')
     for name in ('neu_native_busy','neu_native_selected_top','neu_native_saved_user_rsp','neu_user_saved_rsp'):
         if debug_words(qmp,symbols[name],1)[0]!=0:raise Failure('Stale active native/current stack state at halt.')
     if debug_words(qmp,symbols['neu_preempt_busy'],1)[0]&255:raise Failure('Stale IRQ handoff guard at halt.')
     if int(re.search(r'EFER=([0-9a-fA-F]+)',qmp.call('human-monitor-command',{'command-line':'info registers'}))[1],16)&1:raise Failure('Preemption left native SCE enabled.')
-    return {'threads':threads,'order':order,'preemptions':counts,'events':events,'outcomes':outcomes,'user_samples':user_samples,'observations':observations,'calibration':{'samples':[a,b,c],'divided_hz':divided,'initial':initial},'ticks':ticks,'eois':eois,'drain_ticks':drain,'accounting':list(map(int,restored.groups())),'final_lapic':final_lapic}
+    return {'threads':threads,'order':order,'preemptions':counts,'events':events,'outcomes':outcomes,'user_samples':user_samples,'observations':observations,'calibration':{'samples':[a,b,c],'divided_hz':divided,'initial':initial},'ticks':ticks,'eois':eois,'drain_ticks':drain,'deferred_drains':drains,'accounting':list(map(int,restored.groups())),'final_lapic':final_lapic}
 
 
 def multi_site(symbols,name):
@@ -3102,7 +3236,10 @@ def run_case(case, esp, timeout):
     with tempfile.TemporaryDirectory(prefix="neu-", dir="/tmp") as directory:
         temporary = Path(directory)  # Keep QMP Unix socket paths below macOS's limit.
         endpoint = temporary / "qmp.sock"
-        arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint, smp_qmp.CPUS.get(case, 1))
+        arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint,
+                                 SMP_SCHEDULE.get(case, smp_qmp.CPUS.get(case, 1)))
+        if case == "smp-schedule-stress":
+            arguments[arguments.index("-m") + 1] = "1024M"
         if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic","memory-object-user-xapic"):
             arguments[arguments.index("-cpu") + 1] = "max,x2apic=off"
         result["command"] = arguments
@@ -3134,6 +3271,13 @@ def run_case(case, esp, timeout):
                     result["memory_object_runtime_checkpoints"] = runtime_snapshots
                 user_observation = None
                 native_observation = None
+                smp_user_checkpoints = {}
+                smp_schedule_observation = None
+                smp_schedule_checkpoints = []
+                if case in SMP_SCHEDULE:
+                    result["smp_scheduler_checkpoints"] = smp_schedule_checkpoints
+                if case in smp_qmp.USER_CASES:
+                    result["smp_user_checkpoints"] = smp_user_checkpoints
                 node_observations = {}
                 timer_observations = {}
                 switch_observations = {}
@@ -3148,6 +3292,12 @@ def run_case(case, esp, timeout):
                         raise Failure(f"QEMU exited early with status {process.returncode}.")
                     if time.monotonic() - started >= timeout:
                         raise Failure(f"{case}: timed out after {timeout:g}s waiting for the expected serial result.")
+                    if case in SMP_SCHEDULE and smp_schedule_observation is None and "[NEU] SMP schedule baseline:" in transcript(serial):
+                        if qmp is None:
+                            qmp = QMP(endpoint, started + timeout)
+                        smp_schedule_observation = smp_scheduler_qmp.observe(
+                            qmp, case, symbols, started + timeout, Failure, smp_schedule_checkpoints)
+                        result["smp_scheduler"] = smp_schedule_observation
                     if case in MEMORY_OBJECT_CASES and memory_observation is None and "Memory checkpoint:" in transcript(serial):
                         if qmp is None: qmp = QMP(endpoint, started + timeout)
                         memory_observation = memory_object_qmp.observe(qmp, serial, symbols, started + timeout,
@@ -3228,7 +3378,32 @@ def run_case(case, esp, timeout):
                             raise Failure("SMP work checkpoint appeared before the owned root.")
                         work_checkpoint = smp_qmp.observe_work_checkpoint(qmp, case, symbols, int(root_match[1], 16), Failure)
                         result["smp_work_checkpoint"] = work_checkpoint
-                    time.sleep(0.001 if case in USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES or case in RUNTIME_CASES or case in SMP_WORK else 0.05)
+                    if case in smp_qmp.USER_CASES and case != "smp-user-invalid":
+                        current = transcript(serial)
+                        if "prepared" not in smp_user_checkpoints and "[NEU] SMP user prepared:" in current:
+                            if qmp is None:
+                                qmp = QMP(endpoint, started + timeout)
+                            root_match = re.search(r"Kernel paging activated: CR3=(0x[0-9a-f]+)", current)
+                            if not root_match:
+                                raise Failure("SMP user prepared appeared before the activated root.")
+                            smp_user_checkpoints["prepared"] = smp_qmp.observe_user_checkpoint(
+                                qmp, case, symbols, smp_qmp.USER_PREPARED,
+                                int(root_match[1], 16), None, Failure, started + timeout)
+                        if "concurrent" not in smp_user_checkpoints and "[NEU] SMP user released:" in current:
+                            capture = smp_user_checkpoints.get("prepared")
+                            if capture is None:
+                                raise Failure("SMP user release appeared before its prepared capture.")
+                            smp_user_checkpoints["concurrent"] = smp_qmp.observe_user_checkpoint(
+                                qmp, case, symbols, smp_qmp.USER_CONCURRENT,
+                                capture["kernel_root"], capture, Failure, started + timeout)
+                        if "results" not in smp_user_checkpoints and "[NEU] SMP user exits:" in current:
+                            capture = smp_user_checkpoints.get("prepared")
+                            if capture is None:
+                                raise Failure("SMP user exits appeared before its prepared capture.")
+                            smp_user_checkpoints["results"] = smp_qmp.observe_user_checkpoint(
+                                qmp, case, symbols, smp_qmp.USER_RESULTS,
+                                capture["kernel_root"], capture, Failure, started + timeout)
+                    time.sleep(0.001 if case in USER_CASES or case in smp_qmp.USER_CASES or case in NATIVE_CASES or case in NODE_CASES or case in TIMER_CASES or case in SWITCH_CASES or case in PREEMPT_CASES or case in MULTI_CASES or case in CAP_CASES or case in AS_CASES or case in IPC_CASES or case in RUNTIME_CASES or case in SMP_WORK else 0.05)
                 if qmp is None:
                     qmp = QMP(endpoint, started + timeout)
                 paging = None
@@ -3271,11 +3446,15 @@ def run_case(case, esp, timeout):
                     raise Failure("Missing independent stopped-CPU capability checkpoints.")
                 if case in RUNTIME_CASES and runtime_observation is None:
                     raise Failure("Missing independent stopped-CPU runtime mapping checkpoints.")
+                if case in SMP_SCHEDULE and smp_schedule_observation is None:
+                    raise Failure("Missing independent scheduled-SMP checkpoints.")
                 fault = check_fault(case, text, symbols)
                 live_evidence = check_live(case, text, symbols, live_observation) if case in LIVE_CASES else None
                 cap_evidence = check_cap(case, text, symbols, cap_observation) if case in MEMORY_CAP_CASES else None
                 runtime_evidence = check_runtime(case, text, symbols, runtime_observation) if case in RUNTIME_CASES else None
                 user = check_user(case, text, symbols, user_observation) if case in USER_CASES else None
+                smp_user = check_smp_user(case, text, symbols, paging["root"], paging["tables"],
+                                          smp_user_checkpoints) if case in smp_qmp.USER_CASES else None
                 native = check_native(case, text, symbols, native_observation) if case in NATIVE_CASES else None
                 nodes = check_nodes(case,text,symbols,node_observations) if case in NODE_CASES else None
                 if nodes and (any(item["kernel_root"] != paging["root"] for item in node_observations.values()) or int(re.search(r"EFER=([0-9a-fA-F]+)",second)[1],16)&1):
@@ -3310,7 +3489,9 @@ def run_case(case, esp, timeout):
                 if case == 'memory-object-fail-stop':
                     result['expected_fail_stop'] = memory_object_qmp.verify_fail_stop(qmp, memory_snapshots[-1], debug_words, Failure)
                 if case in SMP_CASES or case in SMP_REJECT:
-                    result["smp"] = smp_qmp.observe(qmp, case, symbols, paging["root"] if paging else None, Failure)
+                    capture = smp_user_checkpoints.get("prepared") if case in smp_qmp.USER_CASES else None
+                    result["smp"] = smp_qmp.observe(qmp, case, symbols, paging["root"] if paging else None,
+                                                    Failure, capture=capture)
                 qmp.call("quit")  # A host-controlled exit after the observed halt.
                 if process.wait(timeout=5) != 0:
                     raise Failure(f"QEMU did not exit cleanly after QMP quit: {process.returncode}")
@@ -3318,7 +3499,7 @@ def run_case(case, esp, timeout):
                 address_space=check_address_space(case,text,symbols,members,cap_state) if case in AS_CASES else None
                 ipc=check_ipc(case,text,symbols,members,cap_state) if case in MOVE_CASES else check_ipc_wait('channels-wait' if case=='channels-wait-move-disabled' else case,text,symbols,members,cap_state) if case in WAIT_CASES else check_ipc(case,text,symbols,members,cap_state) if case in IPC_CASES else None
                 result.update(ipc=ipc,address_space=address_space,timer=timer,switching=switching,preemption=preemption,members=members,capabilities=capabilities)
-                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence, memory_object_cap_evidence=cap_evidence, memory_object_runtime_evidence=runtime_evidence)
+                result.update(passed=True, halt_observations=[first, second], exception=fault, paging=paging, user=user, native=native, nodes=nodes, live=live_evidence, memory_object_cap_evidence=cap_evidence, memory_object_runtime_evidence=runtime_evidence, smp_user=smp_user)
                 print(f"PASS {case}: expected serial result; HLT=1, CPL=0, IF=0 in Neu halt loop; clean QMP exit", flush=True)
                 return result
             except Exception as error:
@@ -3359,6 +3540,7 @@ def main():
     elif args.action == "build":
         build()
     elif args.action == "check":
+        command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
         command([require("cargo"), "fmt", "--all", "--", "--check"])
         for feature in FEATURES.values():
             arguments = [require("cargo"), "clippy", "--locked", "--target", TARGET]
@@ -3379,6 +3561,9 @@ def main():
             code, variables = firmware()
             report.update(qemu=version("qemu-system-x86_64"), ovmf_code=str(code),
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
+            if not args.case:
+                command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
+                report["observer_tests"] = {"passed": True}
             if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer", "switch"):
                 target = host_target()
                 command([require("cargo"), "test", "--locked", "--lib", "--target", target])

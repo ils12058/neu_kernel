@@ -21,6 +21,13 @@ impl NodeId {
     }
 }
 impl ThreadId {
+    #[cfg(feature = "smp-scheduler-test")]
+    pub(crate) fn smp_field_addresses(&self) -> [u64; 2] {
+        [
+            core::ptr::from_ref(&self.slot) as u64,
+            core::ptr::from_ref(&self.generation) as u64,
+        ]
+    }
     #[cfg(feature = "test-cap-moves-terminal-order")]
     pub fn debug_addresses(&self) -> [u64; 2] {
         [
@@ -126,6 +133,10 @@ pub struct Nodes {
     node_generations: [u32; MAX_NODES],
     thread_generations: [u32; MAX_THREADS],
     active: Option<ActiveContext>,
+    /// Statically assigned execution slots for the Phase 9C-1 controller. A
+    /// Thread may appear in at most one slot, and the single-CPU `active` field
+    /// must stay empty while any slot is occupied.
+    cpu_active: [Option<ActiveContext>; crate::cpu::MAX_CPUS],
     tables: [Option<crate::capability::Table>; MAX_NODES],
 }
 impl Default for Nodes {
@@ -141,8 +152,24 @@ impl Nodes {
             node_generations: [0; MAX_NODES],
             thread_generations: [0; MAX_THREADS],
             active: None,
+            cpu_active: [None; crate::cpu::MAX_CPUS],
             tables: [const { None }; MAX_NODES],
         }
+    }
+    fn concurrent(&self) -> bool {
+        self.cpu_active.iter().any(Option::is_some)
+    }
+    fn concurrent_thread(&self, id: ThreadId) -> bool {
+        self.cpu_active.iter().flatten().any(|a| a.thread == id)
+    }
+    fn concurrent_node(&self, id: NodeId) -> bool {
+        self.cpu_active.iter().flatten().any(|a| a.node == id)
+    }
+    pub fn active_on(&self, cpu: usize) -> Option<ActiveContext> {
+        self.cpu_active.get(cpu).copied().flatten()
+    }
+    pub fn concurrent_count(&self) -> usize {
+        self.cpu_active.iter().flatten().count()
     }
     pub fn authority(&self, id: NodeId) -> Result<&crate::capability::Table> {
         if self.node(id)?.state == NodeState::Reclaimed {
@@ -154,7 +181,7 @@ impl Nodes {
             .ok_or(Error::InUse)
     }
     pub fn authority_mut(&mut self, id: NodeId) -> Result<&mut crate::capability::Table> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(Error::InUse);
         }
         self.authority(id)?;
@@ -198,7 +225,7 @@ impl Nodes {
             }
             self.authority(id).map_err(|_| C::Owner)?;
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(C::InUse);
         }
         let (a, b) = if a.slot < b.slot {
@@ -246,6 +273,9 @@ impl Nodes {
             .flatten()
             .filter(|t| t.id == id)
             .ok_or(Error::Identity)
+    }
+    pub(crate) fn thread_at(&self, slot: usize) -> Option<Thread> {
+        self.threads.get(slot).copied().flatten()
     }
     pub fn create(&mut self) -> Result<NodeId> {
         let slot = (0..MAX_NODES)
@@ -341,6 +371,7 @@ impl Nodes {
     pub fn member_thread(&mut self, node: NodeId, context: ThreadContext) -> Result<ThreadId> {
         let n = self.node(node)?;
         if self.active.is_some()
+            || self.concurrent()
             || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || n.space != Some(context.space)
         {
@@ -401,6 +432,7 @@ impl Nodes {
     pub fn abort_member(&mut self, id: ThreadId) -> Result<()> {
         let mut t = self.thread(id)?;
         if self.active.is_some()
+            || self.concurrent()
             || t.state != ThreadState::Ready
             || t.stack.is_some()
             || t.saved.is_some()
@@ -425,6 +457,7 @@ impl Nodes {
     pub fn reclaim_thread(&mut self, id: ThreadId) -> Result<()> {
         let mut t = self.thread(id)?;
         if self.active.is_some()
+            || self.concurrent_thread(id)
             || t.state != ThreadState::Exited
             || t.stack.is_some()
             || t.saved.is_some()
@@ -440,6 +473,7 @@ impl Nodes {
         let t = self.thread(id)?;
         let n = self.node(t.node)?;
         if self.active.is_some()
+            || self.concurrent_thread(id)
             || n.space != Some(t.context.space)
             || t.saved.is_some()
             || t.queued
@@ -481,7 +515,7 @@ impl Nodes {
     pub fn start(&mut self, id: ThreadId) -> Result<ActiveContext> {
         let mut t = self.thread(id)?;
         let mut n = self.node(t.node)?;
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(Error::InUse);
         }
         if t.state != ThreadState::Ready
@@ -502,8 +536,330 @@ impl Nodes {
         self.active = Some(active);
         Ok(active)
     }
+    /// SMP admission. The caller exclusively owns the shared scheduler/lifecycle
+    /// lock; other CPUs may execute user instructions but cannot mutate Nodes.
+    pub fn enqueue_smp(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        if self.active.is_some()
+            || self.concurrent_thread(id)
+            || !matches!(t.state, ThreadState::Ready | ThreadState::Runnable)
+            || t.queued
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
+            || n.space != Some(t.context.space)
+            || t.stack
+                .is_none_or(|stack| t.saved.is_none_or(|s| !s.valid(active, stack)))
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Runnable;
+        t.queued = true;
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    /// Transfers a queued, fully saved Thread into one CPU slot. No pointer to
+    /// the registry escapes: the returned Dispatch owns copies of every value.
+    pub fn dispatch_on(&mut self, cpu: usize, id: ThreadId) -> Result<Dispatch> {
+        if cpu >= crate::cpu::MAX_CPUS {
+            return Err(Error::Capacity);
+        }
+        let mut t = self.thread(id)?;
+        let mut n = self.node(t.node)?;
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        let saved = t.saved.ok_or(Error::State)?;
+        if self.active.is_some()
+            || self.cpu_active[cpu].is_some()
+            || self.concurrent_thread(id)
+            || t.state != ThreadState::Runnable
+            || !t.queued
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
+            || n.space != Some(t.context.space)
+            || t.stack.is_none_or(|stack| !saved.valid(active, stack))
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Running;
+        t.saved = None;
+        t.queued = false;
+        n.state = NodeState::Active;
+        self.threads[id.slot] = Some(t);
+        self.nodes[n.id.slot] = Some(n);
+        self.cpu_active[cpu] = Some(active);
+        Ok(Dispatch { active, saved })
+    }
+    /// Called only after this CPU has left user mode and restored its kernel
+    /// root. Saving and dropping the CPU slot form one lock-held transaction.
+    pub fn suspend_on(&mut self, cpu: usize, saved: SavedContext, blocked: bool) -> Result<()> {
+        let active = saved.active;
+        let mut t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        if self.active.is_some()
+            || self.cpu_active.get(cpu).copied().flatten() != Some(active)
+            || self.tables[active.node.slot].is_none()
+            || n.state != NodeState::Active
+            || t.state != ThreadState::Running
+            || t.queued
+            || t.saved.is_some()
+            || t.stack.is_none_or(|stack| !saved.valid(active, stack))
+            || saved.fresh
+            || (blocked && !saved.continuation)
+        {
+            return Err(Error::Association);
+        }
+        t.state = if blocked {
+            ThreadState::Blocked
+        } else {
+            ThreadState::Runnable
+        };
+        t.saved = Some(saved);
+        self.threads[t.id.slot] = Some(t);
+        self.cpu_active[cpu] = None;
+        Ok(())
+    }
+    /// A wake makes a blocked Thread admissible once. Queue admission is the
+    /// next step in the same exclusive SMP scheduler transaction.
+    pub fn wake_smp(&mut self, id: ThreadId) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let n = self.node(t.node)?;
+        if self.active.is_some()
+            || self.concurrent_thread(id)
+            || t.state != ThreadState::Blocked
+            || t.queued
+            || t.saved.is_none()
+            || n.state != NodeState::Active
+        {
+            return Err(Error::Association);
+        }
+        t.state = ThreadState::Ready;
+        self.threads[id.slot] = Some(t);
+        Ok(())
+    }
+    /// Final operation results are installed while the Thread remains Blocked,
+    /// before the single wake/enqueue transaction admits that continuation.
+    pub fn settle_blocked_smp(&mut self, id: ThreadId, status: i64, scalar: u64) -> Result<()> {
+        let mut t = self.thread(id)?;
+        let mut saved = t.saved.ok_or(Error::State)?;
+        if t.state != ThreadState::Blocked
+            || t.queued
+            || self.concurrent_thread(id)
+            || !saved.continuation
+        {
+            return Err(Error::Association);
+        }
+        saved.frame.registers.rax = status as u64;
+        saved.frame.registers.rdx = scalar;
+        if !saved.valid(saved.active, saved.stack) {
+            return Err(Error::Association);
+        }
+        t.saved = Some(saved);
+        self.threads[id.index()] = Some(t);
+        Ok(())
+    }
+    pub fn close_authority_smp(
+        &mut self,
+        id: NodeId,
+        objects: &mut crate::capability::Objects,
+    ) -> Result<()> {
+        if self.active.is_some()
+            || self.concurrent_node(id)
+            || self.node(id)?.state != NodeState::Exited
+        {
+            return Err(Error::InUse);
+        }
+        self.tables[id.slot]
+            .as_mut()
+            .ok_or(Error::Identity)?
+            .drain(objects, id)
+            .map(|_| ())
+            .map_err(|_| Error::Association)
+    }
+    #[cfg(feature = "smp-scheduler-test")]
+    pub fn smp_debug_addresses(&self, id: ThreadId) -> Result<[u64; 18]> {
+        let t = self
+            .threads
+            .get(id.index())
+            .and_then(Option::as_ref)
+            .filter(|t| t.id == id)
+            .ok_or(Error::Identity)?;
+        Ok([
+            core::ptr::from_ref(&t.id.slot) as u64,
+            core::ptr::from_ref(&t.id.generation) as u64,
+            core::ptr::from_ref(&t.state) as u64,
+            core::ptr::from_ref(&t.queued) as u64,
+            core::ptr::from_ref(&t.context.root) as u64,
+            t.saved
+                .as_ref()
+                .map_or(0, |s| core::ptr::from_ref(&s.frame) as u64),
+            core::ptr::from_ref(&t.outcome) as u64,
+            t.context.entry,
+            t.context.rsp,
+            t.node.raw(),
+            t.context.space.raw(),
+            t.stack.map_or(0, |s| s.top),
+            core::ptr::from_ref(&t.node.slot) as u64,
+            core::ptr::from_ref(&t.node.generation) as u64,
+            core::ptr::from_ref(&t.context.space) as u64,
+            core::ptr::from_ref(&t.context.entry) as u64,
+            core::ptr::from_ref(&t.context.rsp) as u64,
+            t.stack
+                .as_ref()
+                .map_or(0, |s| core::ptr::from_ref(s) as u64),
+        ])
+    }
+    #[cfg(feature = "smp-scheduler-test")]
+    pub fn smp_cpu_addresses(&self) -> [u64; 36] {
+        let mut words = [0; 36];
+        words[..4].copy_from_slice(&[1, crate::cpu::MAX_CPUS as u64, 8, 0]);
+        for (cpu, active) in self.cpu_active.iter().enumerate() {
+            if let Some(active) = active {
+                let thread = active.thread.smp_field_addresses();
+                words[4 + cpu * 8..12 + cpu * 8].copy_from_slice(&[
+                    thread[0],
+                    thread[1],
+                    core::ptr::from_ref(&active.node.slot) as u64,
+                    core::ptr::from_ref(&active.node.generation) as u64,
+                    core::ptr::from_ref(&active.context.root) as u64,
+                    core::ptr::from_ref(&active.context.rsp) as u64,
+                    core::ptr::from_ref(&active.context.entry) as u64,
+                    core::ptr::from_ref(&active.context.space) as u64,
+                ]);
+            }
+        }
+        words
+    }
+    #[cfg(feature = "smp-scheduler-test")]
+    pub fn smp_node_addresses(&self) -> [u64; 8] {
+        let mut words = [0; 8];
+        for (slot, node) in self.nodes.iter().enumerate() {
+            if let Some(n) = node {
+                words[slot * 4..slot * 4 + 4].copy_from_slice(&[
+                    core::ptr::from_ref(&n.id.slot) as u64,
+                    core::ptr::from_ref(&n.id.generation) as u64,
+                    core::ptr::from_ref(&n.state) as u64,
+                    core::ptr::from_ref(&n.space) as u64,
+                ]);
+            }
+        }
+        words
+    }
+    /// A capability lease may exist only inside the shared kernel transaction;
+    /// even same-Node Threads on different CPUs cannot lease a table twice.
+    pub fn take_authority_on(
+        &mut self,
+        cpu: usize,
+        active: ActiveContext,
+    ) -> Result<crate::capability::Lease> {
+        let t = self.thread(active.thread)?;
+        let n = self.node(active.node)?;
+        if self.active.is_some()
+            || self.cpu_active.get(cpu).copied().flatten() != Some(active)
+            || t.state != ThreadState::Running
+            || t.node != active.node
+            || t.context != active.context
+            || n.state != NodeState::Active
+            || n.space != Some(active.context.space)
+        {
+            return Err(Error::Association);
+        }
+        self.authority(active.node)?;
+        let table = self.tables[active.node.slot].take().ok_or(Error::InUse)?;
+        Ok(crate::capability::Lease::new(active, table))
+    }
+    pub fn restore_authority_on(
+        &mut self,
+        cpu: usize,
+        lease: crate::capability::Lease,
+    ) -> Result<()> {
+        let active = lease.active();
+        if self.active.is_some()
+            || self.cpu_active.get(cpu).copied().flatten() != Some(active)
+            || self.node(active.node)?.state != NodeState::Active
+            || self.tables[active.node.slot].is_some()
+            || lease.table().id().owner() != active.node
+        {
+            return Err(Error::Association);
+        }
+        self.tables[active.node.slot] = Some(lease.into_table());
+        Ok(())
+    }
+    /// Dispatches a Thread whose SavedContext was already installed into its
+    /// statically assigned CPU slot. The legacy single-CPU `active` slot must
+    /// stay empty and one Thread can occupy at most one CPU slot.
+    pub fn start_on(&mut self, cpu: usize, id: ThreadId) -> Result<ActiveContext> {
+        if cpu >= crate::cpu::MAX_CPUS {
+            return Err(Error::Capacity);
+        }
+        let mut t = self.thread(id)?;
+        let mut n = self.node(t.node)?;
+        let active = ActiveContext {
+            node: t.node,
+            thread: id,
+            context: t.context,
+        };
+        if self.active.is_some() || self.cpu_active[cpu].is_some() || self.concurrent_thread(id) {
+            return Err(Error::InUse);
+        }
+        if t.state != ThreadState::Ready
+            || !matches!(n.state, NodeState::Ready | NodeState::Active)
+            || n.space != Some(t.context.space)
+            || t.stack
+                .is_none_or(|stack| t.saved.is_none_or(|saved| !saved.valid(active, stack)))
+        {
+            return Err(Error::State);
+        }
+        n.state = NodeState::Active;
+        t.state = ThreadState::Running;
+        self.nodes[n.id.slot] = Some(n);
+        self.threads[id.slot] = Some(t);
+        self.cpu_active[cpu] = Some(active);
+        Ok(active)
+    }
+    /// Publishes the terminal outcome from the CPU that hosted the Thread. The
+    /// slot is released only after the shared lifecycle transition commits, so
+    /// duplicate or foreign completions observe `Association`.
+    pub fn complete_on(
+        &mut self,
+        cpu: usize,
+        active: ActiveContext,
+        outcome: ExitReason,
+    ) -> Result<()> {
+        if self.cpu_active.get(cpu).copied().flatten() != Some(active) {
+            return Err(Error::Association);
+        }
+        // A Node fault cancels every live sibling Thread, which is only sound
+        // when no sibling is executing on another CPU.
+        if matches!(outcome, ExitReason::UserFault(_))
+            && self
+                .cpu_active
+                .iter()
+                .flatten()
+                .any(|slot| slot.node == active.node && slot.thread != active.thread)
+        {
+            return Err(Error::InUse);
+        }
+        self.complete_active(active, outcome)?;
+        self.cpu_active[cpu] = None;
+        Ok(())
+    }
     pub fn complete(&mut self, active: ActiveContext, outcome: ExitReason) -> Result<()> {
-        if self.active != Some(active) || self.tables[active.node.slot].is_none() {
+        if self.active != Some(active) || self.concurrent() {
+            return Err(Error::Association);
+        }
+        self.complete_active(active, outcome)?;
+        self.active = None;
+        Ok(())
+    }
+    fn complete_active(&mut self, active: ActiveContext, outcome: ExitReason) -> Result<()> {
+        if self.tables[active.node.slot].is_none() {
             return Err(Error::Association);
         }
         let mut t = self.thread(active.thread)?;
@@ -551,7 +907,6 @@ impl Nodes {
                 .terminate();
         }
         self.nodes[n.id.slot] = Some(n);
-        self.active = None;
         Ok(())
     }
     pub fn install_execution(&mut self, id: ThreadId, saved: SavedContext) -> Result<()> {
@@ -562,7 +917,8 @@ impl Nodes {
             thread: id,
             context: t.context,
         };
-        if t.state != ThreadState::Ready
+        if self.concurrent_thread(id)
+            || t.state != ThreadState::Ready
             || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || t.stack.is_some()
             || t.saved.is_some()
@@ -588,6 +944,7 @@ impl Nodes {
         };
         if !matches!(t.state, ThreadState::Ready | ThreadState::Runnable)
             || t.queued
+            || self.concurrent()
             || !matches!(n.state, NodeState::Ready | NodeState::Active)
             || n.space != Some(t.context.space)
             || t.stack
@@ -603,7 +960,7 @@ impl Nodes {
     pub fn dispatch(&mut self, id: ThreadId) -> Result<Dispatch> {
         let mut t = self.thread(id)?;
         let mut n = self.node(t.node)?;
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(Error::InUse);
         }
         let active = ActiveContext {
@@ -667,7 +1024,7 @@ impl Nodes {
     /// Replaces the suspended continuation and makes the Thread admissible.
     /// The caller admits it to the runnable FIFO after the mapping commits.
     pub fn resume_request(&mut self, active: ActiveContext, saved: SavedContext) -> Result<()> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(Error::InUse);
         }
         let mut t = self.thread(active.thread)?;
@@ -691,7 +1048,7 @@ impl Nodes {
     /// Cancels a suspended request. The Thread is exited before its saved
     /// context is dropped, so no later resume or dispatch can succeed.
     pub fn cancel_request(&mut self, active: ActiveContext, outcome: ExitReason) -> Result<()> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.concurrent() {
             return Err(Error::InUse);
         }
         let mut t = self.thread(active.thread)?;
@@ -775,6 +1132,7 @@ impl Nodes {
             || t.queued
             || t.saved.is_none()
             || self.active.is_some()
+            || self.concurrent()
             || n.state != NodeState::Active
         {
             return Err(Error::State);
@@ -788,7 +1146,8 @@ impl Nodes {
     pub fn cancel_blocked(&mut self, id: ThreadId, outcome: ExitReason) -> Result<()> {
         let mut t = self.thread(id)?;
         let n = self.node(t.node)?;
-        if t.state != ThreadState::Blocked || t.queued || self.active.is_some() {
+        if t.state != ThreadState::Blocked || t.queued || self.active.is_some() || self.concurrent()
+        {
             return Err(Error::State);
         }
         t.state = ThreadState::Exited;
@@ -815,6 +1174,7 @@ impl Nodes {
     pub fn quiesce(&mut self, id: NodeId) -> Result<()> {
         let mut n = self.node(id)?;
         if self.active.is_some()
+            || self.concurrent_node(id)
             || n.state != NodeState::Active
             || self.threads.iter().flatten().any(|t| {
                 t.node == id
@@ -864,6 +1224,7 @@ impl Nodes {
             || t.saved.is_some()
             || t.stack != Some(stack)
             || self.active.is_some_and(|a| a.thread == id)
+            || self.concurrent_thread(id)
         {
             return Err(Error::InUse);
         }
@@ -892,6 +1253,7 @@ impl Nodes {
     pub fn release_space(&mut self, id: NodeId, space: SpaceId) -> Result<()> {
         let mut n = self.node(id)?;
         if !matches!(n.state, NodeState::Exited | NodeState::Quiesced)
+            || self.concurrent_node(id)
             || self
                 .threads
                 .iter()
@@ -912,6 +1274,7 @@ impl Nodes {
         if !matches!(n.state, NodeState::Exited | NodeState::Quiesced)
             || n.space.is_some()
             || self.active.is_some_and(|a| a.node == id)
+            || self.concurrent_node(id)
         {
             return Err(Error::InUse);
         }

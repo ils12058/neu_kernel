@@ -5,75 +5,65 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-K9 / Phase 9B adds bounded cross-CPU work with verified coordination. The BSP
-publishes generation-checked commands into fixed per-CPU mailboxes; each AP
-accepts, executes and completes exactly one command with its own logical index,
-APIC ID, sequence, markers and result, while the BSP validates and never writes
-completion state. Wakeup has two verified stages: bounded atomic polling with
-`pause`, and a dedicated xAPIC IPI vector whose handler runs only inside an
-explicit `sti; hlt; cli` idle window after the AP's private IDT, stack and GS
-identity are ready. A two-CPU profile proves true overlap at a synchronized
-two-phase gate, and the four-CPU profile dispatches distinct work to three APs
-without mailbox aliasing. Commands are never overwritten before
-acknowledgement, stale or replayed acknowledgements are rejected, and sequence
-exhaustion and invalid command types fail stop.
+**K9 / Phase 9 (9A–9D) is complete for bounded x86-64/QEMU SMP:** at most
+four CPUs, two Nodes and three Threads. In the scheduled SMP images, every
+CPU runs the same synchronized scheduler with a local FIFO queue, explicit
+Thread ownership and affinity. Same-Node Threads run concurrently through
+one root and capability table with separate guarded stacks. Native syscall
+and calibrated 10 ms LAPIC timer boundaries preserve full integer contexts.
 
-K9 / Phase 9A remains the SMP bootstrap foundation: the pinned Limine 12.9.4
-SMP request discovers the configured 1-, 2- or 4-vCPU topology; the BSP
-publishes a fixed per-CPU array, releases each application processor into a real
-kernel entry stub with its own stack and private GDT/TSS/IDT, and each AP
-validates its CPUID identity, privileged state, tables, GS-base block and
-canaries before switching to the verified owned root and parking with
-interrupts disabled. **Multiple CPUs execute bounded kernel work; the BSP still
-owns kernel state.** Every existing scheduler, capability, paging, Channel,
-frame-allocator, preemption, timer and serial subsystem remains BSP-only.
+Shared lifecycle, capability and Channel transactions use one explicit lock
+with IF=0; IRQ handlers publish CPU-local state without acquiring that lock.
+Queued work migrates with its saved context, and blocked Channel continuations
+wake exactly once through generation-checked IPI/idle transitions. The BSP
+owns allocation, root preparation, final teardown and serial.
 
-K8 / Phase 8C remains the latest Node/capability milestone: a running Node maps
-a received MemoryObject capability at a scheduler safe point. Trusted setup
-creates one two-page object; Node A sends the capability over the existing
-Channel `SEND_CAP`/`RECEIVE_CAP` operations; Node B receives the exact identity
-and rights, issues a bounded `TEST_MAP` request, is suspended with its Ring 3
-context owned by the scheduler, and the kernel installs a new mapping from the
-received handle before resuming it.
+Node faults and unsafe user return frames quiesce running siblings before
+reclamation while an unrelated Node completes. A live write-permission change
+uses an epoch-bound remote TLB protocol: every target executes its actual
+invalidation or root flush before acknowledging. Final teardown restores the
+exact allocator bitmap and original page-table inventory, with zero remaining
+user roots, pins, references, authority or waiters.
 
-**Nodes execute. Capabilities authorize. MemoryObjects share real backing. APs
-bootstrap, execute bounded work and coordinate with verified IPIs.**
+K8 / Phase 8C supplies runtime mapping from a received MemoryObject capability
+at a scheduler safe point. K7 capability movement and Channel behavior retain
+their contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
+[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md);
+[ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md) covers the suspended
+runtime mapping boundary and terminal cancellation.
 
-Current validation is **275 host tests and 163 QEMU scenario executions** (161
-unique: the 154-scenario Phase 9A baseline plus `smp-work-2`, `smp-work-4`,
-`smp-work-overlap`, `smp-work-repeat`, `smp-work-invalid`, `smp-ipi-2` and
-`smp-ipi-4`; `smp-cpu-identity` and `smp-ap-isolation` re-execute the 4-CPU
-path for their named observer checks). The live, transfer and runtime cases and
-every SMP profile require stopped-CPU QMP evidence; serial output alone is
-insufficient. [Implementation status](docs/IMPLEMENTATION_STATUS.md) records
-the evidence and observer corrections.
-[ADR 0027](docs/adr/0027-smp-crosscpu-work-and-coordination.md) covers the
-cross-CPU work protocol, synchronization and IPI coordination;
-[ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md) covers the SMP
-bootstrap and per-CPU foundations; [ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md)
-covers the scheduler safe point, suspended-boundary runtime mapping and
-terminal cancellation; [the SMP QMP protocol](docs/testing/smp-qmp.md) and
+Current validation passes **306 Rust host tests, eight Python observer tests
+and 181 registered QEMU executions**, plus **five focused SMP repeats**.
+Formatting, every-feature/host-library clippy and the default build pass;
+the default kernel image matches the full regression's boot image. Live,
+transfer, runtime and every SMP profile require stopped-CPU QMP evidence.
+[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the accepted
+evidence and preserved observer correction;
+[the K9 completion contract](docs/K9_COMPLETION.md) defines the bounded scope.
+
+[ADR 0029](docs/adr/0029-bounded-scheduled-smp.md) covers scheduled SMP,
+shared transactions, migration, fault quiescence and remote invalidation.
+Earlier contracts remain in [ADR 0028](docs/adr/0028-static-smp-user-execution.md)
+for static Ring 3 placement,
+[ADR 0027](docs/adr/0027-smp-crosscpu-work-and-coordination.md) for work/IPI
+coordination, and
+[ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md) for bootstrap.
+[The SMP QMP protocol](docs/testing/smp-qmp.md) and
 [the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) explain the
 raw production-state checks.
 
-Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md) remain
-the baselines. K7 capability movement and Channel behavior retain their earlier
-contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
-[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md). Public
-MemoryObject syscalls, a public mmap/munmap API, derivation, revocation,
-concurrent Ring 3 scheduling, per-CPU run queues, Thread migration, load
-balancing, AP kernel preemption, remote TLB shootdown, concurrent allocation or
-capability mutation, general kernel preemption, COW and demand paging remain
-future work.
+Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md)
+remain the baselines. The execution model uses fixed metadata pools, guarded
+private Thread stacks, integer execution and non-preemptible kernel
+transactions. **K10 capability derivation/revocation is next.** Work stealing,
+load balancing, general kernel preemption, arbitrary AP allocation, public
+MemoryObject/mapping/Thread-creation APIs, TLS/FPU/SIMD scheduling, physical
+hardware, COW and demand paging remain later work.
 
-The supported execution model is one CPU owning kernel state, user-only LAPIC
-preemption, IF=0 kernel transactions, integer-only execution, fixed metadata
-pools and guarded private Thread stacks. Legacy images boot one vCPU; the SMP
-profiles boot the configured 1, 2 or 4 vCPUs. Phase 9B APs run only the
-isolated work loop and its IPI idle window; they never enter scheduler,
-capability, paging, Channel or serial code. The platform remains QEMU 11.0.0
-TCG/q35, 512 MiB, UEFI/OVMF, Rust 1.95.0 and Limine 12.9.4/base 6 on Apple
-Silicon.
+Default and legacy images boot one vCPU; SMP profiles select 1, 2 or 4.
+Normal profiles use 512 MiB and the longer four-CPU stress profile uses 1 GiB.
+The verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF, Rust 1.95.0 and
+Limine 12.9.4/base 6 on Apple Silicon.
 
 ## Build and run
 
@@ -165,15 +155,39 @@ vector 0xF0 accounting, exactly one EOI per IPI and zero spurious samples.
 Each case fails unless the stopped-VM QMP oracle matches the raw mailbox,
 journal, gate, evidence and live-register state.
 
+Run `python3 tools/neu.py test --case smp-user-2` or
+`--case smp-user-overlap` for the retained static two-CPU Ring 3 contract;
+`--case smp-user-ap-fault` contains a real AP protection fault while its
+peer completes.
+
+Run `python3 tools/neu.py test --case smp-schedule-2` or
+`--case smp-schedule-4` for scheduled Ring 3 execution on two/four CPUs.
+`--case smp-schedule-shared` checks actual concurrent atomic increments;
+`--case smp-schedule-migrate` checks A2's saved context on CPU1 then CPU3.
+`--case smp-schedule-idle` uses four CPUs for blocked-CPU STI/HLT wakeup and
+cross-CPU Channel transactions; `--case smp-schedule-ipc` checks scalar/Flag
+transactions while same-Node Threads run on two CPUs. Use
+`--case smp-schedule-fault` for running-sibling cancellation,
+`--case smp-schedule-reject` for malformed user-return containment, and
+`--case smp-schedule-stress` for longer scheduling/migration with native/IRQ
+probe pauses disabled.
+
+Run `python3 tools/neu.py test --case smp-tlb-2` or `--case smp-tlb-4` for
+actual permission removal, remote invalidation and a denied hardware store.
+`--case smp-tlb-invalid` checks 22 inert mapping/coordinator rejections before
+the real transaction. Every scheduled profile requires independent CPU,
+frame, queue, authority and final allocator/table evidence.
+
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
+- [Accepted K9 completion contract](docs/K9_COMPLETION.md)
 - [Experimental blocking Channel ABI 0.4](docs/abi/experimental-v0.4.md)
 - [Experimental capability-move ABI 0.5](docs/abi/experimental-v0.5.md)
 - [Experimental scalar Channel ABI 0.3](docs/abi/experimental-v0.3.md)
 - [Experimental native ABI 0.2](docs/abi/experimental-v0.2.md)
 - [Architecture Decision Records](docs/adr/README.md)
-- [SMP bootstrap and cross-CPU work QMP evidence](docs/testing/smp-qmp.md)
+- [SMP bootstrap, coordination and scheduling QMP evidence](docs/testing/smp-qmp.md)
 - [MemoryObject QMP evidence](docs/testing/memory-object-qmp.md)
 - [Implementation status, commands, and verification](docs/IMPLEMENTATION_STATUS.md)
 

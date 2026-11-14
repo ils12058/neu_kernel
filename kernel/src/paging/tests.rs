@@ -1,6 +1,127 @@
 use super::*;
 use std::{boxed::Box, collections::BTreeMap, vec::Vec};
 
+#[test]
+fn smp_permission_prevalidation_rejects_foreign_or_amplifying_changes_without_mutation() {
+    use crate::shootdown::Request;
+    let mut memory = Model::new();
+    let tree = PageTree::new(&mut memory, 48).unwrap();
+    let mut registry = Registry::new();
+    let space = registry.create_space().unwrap();
+    registry.bind_root(space, tree.root).unwrap();
+    let frame = registry.insert_for(space, 0x100000).unwrap();
+    registry.initialize(frame).unwrap();
+    map_user_frames_for(
+        &tree,
+        &mut memory,
+        &mut registry,
+        space,
+        0x410000,
+        &[frame],
+        Permissions::RW,
+    )
+    .unwrap();
+    registry.pin_space(space).unwrap();
+    registry.pin_space(space).unwrap();
+    let request = Request {
+        epoch: 1,
+        root: tree.root,
+        address: 0x410000,
+        targets: 3,
+    };
+    let original = registry.mapping_for(space, request.address).unwrap();
+    let translation = tree.translate(&memory, request.address).unwrap();
+    let tables = memory.pages.len();
+    for (bad, permissions, error) in [
+        (
+            Request {
+                root: tree.root + PAGE,
+                ..request
+            },
+            Permissions::R,
+            Error::NotOwned,
+        ),
+        (
+            Request {
+                epoch: 0,
+                ..request
+            },
+            Permissions::R,
+            Error::NotOwned,
+        ),
+        (
+            Request {
+                address: request.address + 1,
+                ..request
+            },
+            Permissions::R,
+            Error::NotOwned,
+        ),
+        (
+            Request {
+                address: request.address + PAGE,
+                ..request
+            },
+            Permissions::R,
+            Error::NotMapped,
+        ),
+        (
+            Request {
+                targets: 0x10,
+                ..request
+            },
+            Permissions::R,
+            Error::NotOwned,
+        ),
+        (request, Permissions::RX, Error::Flags),
+        (request, Permissions::RW, Error::Flags),
+    ] {
+        assert_eq!(
+            registry.validate_downgrade_mapping_for(space, bad, permissions),
+            Err(error)
+        );
+        assert_eq!(
+            registry.downgrade_mapping_for(space, bad, permissions),
+            Err(error)
+        );
+        let current = registry.mapping_for(space, request.address).unwrap();
+        assert_eq!(
+            (current.frame, current.permissions, current.object),
+            (original.frame, original.permissions, original.object)
+        );
+        assert_eq!(
+            tree.translate(&memory, request.address).unwrap(),
+            translation
+        );
+        assert_eq!(memory.pages.len(), tables);
+        assert_eq!(registry.space(space).unwrap().pins, 2);
+    }
+    registry
+        .validate_downgrade_mapping_for(space, request, Permissions::R)
+        .unwrap();
+    assert_eq!(
+        registry
+            .mapping_for(space, request.address)
+            .unwrap()
+            .permissions,
+        Permissions::RW
+    );
+    registry
+        .downgrade_mapping_for(space, request, Permissions::R)
+        .unwrap();
+    assert_eq!(
+        registry
+            .mapping_for(space, request.address)
+            .unwrap()
+            .permissions,
+        Permissions::R
+    );
+    assert_eq!(
+        registry.validate_downgrade_mapping_for(space, request, Permissions::RW),
+        Err(Error::Flags)
+    );
+}
+
 struct Model {
     pages: BTreeMap<u64, (u8, Box<[u64; 512]>, bool)>,
     next: u64,

@@ -426,7 +426,7 @@ impl Channels {
             .sum()
     }
     /// Test-only schema for the independent stopped-CPU observer.
-    #[cfg(feature = "cap-move-test")]
+    #[cfg(any(feature = "cap-move-test", feature = "smp-scheduler-test"))]
     pub fn diagnostic_layout(&self) -> [u64; 32] {
         use core::mem::{offset_of as off, size_of as size};
         [

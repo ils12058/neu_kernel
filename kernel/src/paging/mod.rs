@@ -126,6 +126,22 @@ pub const USER_STACK_STRIDE: u64 = 4 * PAGE;
 pub fn thread_user_stack(slot: usize) -> u64 {
     USER_STACK_BASE + slot as u64 * USER_STACK_STRIDE
 }
+
+// The bounded user fixture layout shared by the legacy single-CPU tests and
+// the Phase 9C-1 per-AddressSpace domains. Every slot is one page apart so a
+// guard or shared barrier page can never alias a mapped object.
+pub const USER_CODE: u64 = USER_BASE;
+pub const USER_CONSTANTS: u64 = USER_BASE + PAGE;
+pub const USER_DATA: u64 = USER_BASE + 2 * PAGE;
+pub const USER_GUARD: u64 = USER_BASE + 3 * PAGE;
+pub const USER_STACK: u64 = USER_BASE + 4 * PAGE;
+pub const USER_UNMAPPED: u64 = USER_BASE + 6 * PAGE;
+pub const USER_BARRIER: u64 = USER_BASE + 7 * PAGE;
+/// Keep every scheduler member's stack guard unmapped, including slot 1's
+/// lower guard at the legacy barrier address.
+pub const SMP_USER_BARRIER: u64 = USER_BASE + 23 * PAGE;
+pub const USER_RSP: u64 = USER_STACK + PAGE - 8;
+const _: () = assert!(USER_STACK == USER_STACK_BASE);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackKind {
     User,
@@ -637,7 +653,11 @@ impl Default for Registry {
 impl Registry {
     /// Test-only schema: bases, strides and offsets point to production fields.
     /// No data values are projected, and no address authorizes a kernel action.
-    #[cfg(any(feature = "memory-object-test", feature = "memory-object-live-test"))]
+    #[cfg(any(
+        feature = "memory-object-test",
+        feature = "memory-object-live-test",
+        feature = "smp-scheduler-test"
+    ))]
     pub fn diagnostic_layout(&self) -> [u64; 39] {
         use core::mem::{offset_of as off, size_of as size};
         [
@@ -1516,6 +1536,58 @@ impl Registry {
             .copied()
             .find(|m| m.live && m.space == space && m.address == address)
             .ok_or(Error::NotMapped)
+    }
+    /// Trusted SMP permission restriction. The architecture adapter owns the
+    /// execution pins and matching in-flight shootdown. This cannot amplify
+    /// permissions, change backing, or target a different space/root/address.
+    pub fn downgrade_mapping_for(
+        &mut self,
+        space: SpaceId,
+        request: crate::shootdown::Request,
+        permissions: Permissions,
+    ) -> Result<()> {
+        let slot = self.downgrade_slot(space, request, permissions)?;
+        self.mappings[slot].permissions = permissions;
+        Ok(())
+    }
+    pub fn validate_downgrade_mapping_for(
+        &self,
+        space: SpaceId,
+        request: crate::shootdown::Request,
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.downgrade_slot(space, request, permissions).map(|_| ())
+    }
+    fn downgrade_slot(
+        &self,
+        space: SpaceId,
+        request: crate::shootdown::Request,
+        permissions: Permissions,
+    ) -> Result<usize> {
+        permissions.validate()?;
+        self.valid_space(space)?;
+        if space == SpaceId::KERNEL
+            || self.root(space)? != request.root
+            || request.epoch == 0
+            || request.targets == 0
+            || request.targets >> crate::cpu::MAX_CPUS != 0
+            || !request.address.is_multiple_of(PAGE)
+        {
+            return Err(Error::NotOwned);
+        }
+        let slot = self
+            .mappings
+            .iter()
+            .position(|m| m.live && m.space == space && m.address == request.address)
+            .ok_or(Error::NotMapped)?;
+        let old = self.mappings[slot].permissions;
+        if (permissions.write && !old.write)
+            || (permissions.execute && !old.execute)
+            || old == permissions
+        {
+            return Err(Error::Flags);
+        }
+        Ok(slot)
     }
     pub fn remove(&mut self, address: u64) -> Result<FrameId> {
         self.remove_for(SpaceId::KERNEL, address)

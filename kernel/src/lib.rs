@@ -24,3 +24,9 @@ pub mod channel;
 pub mod wait;
 
 pub mod smp_work;
+
+pub mod smp_user;
+
+pub mod shootdown;
+pub mod smp_scheduler;
+pub mod sync;

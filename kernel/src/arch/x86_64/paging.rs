@@ -53,6 +53,10 @@ fn image_guard(address: u64) -> bool {
     if super::userspace::kernel_guards().contains(&address) {
         return true;
     }
+    #[cfg(feature = "smp-user-test")]
+    if super::smp_user::guards().contains(&address) {
+        return true;
+    }
     guards().contains(&address)
 }
 fn image_regions() -> [(u64, u64, Permissions); 4] {
@@ -86,6 +90,16 @@ pub fn current_root() -> u64 {
         asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags));
     }
     root & ADDRESS_FIELD
+}
+
+/// Bounds of the executable image region. The SMP user profiles use the first
+/// byte as the supervisor-only target that must fault when written at CPL3.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+pub(super) fn text_range() -> (u64, u64) {
+    (
+        ptr::addr_of!(__text_start) as u64,
+        ptr::addr_of!(__text_end) as u64,
+    )
 }
 fn invalidate(address: u64) {
     // SAFETY: Ring 0, one CPU, IF=0. The memory clobber orders page-table writes
@@ -1005,7 +1019,11 @@ impl<'a, 'm> Paging<'a, 'm> {
 
 // Each root owns private table pages and only its OWN table workspace aliases.
 // All backend mutation/inspection uses the separate, pinned kernel workspace.
-#[cfg(feature = "user-test")]
+#[cfg(any(
+    feature = "user-test",
+    feature = "smp-user-test",
+    feature = "smp-scheduler-test"
+))]
 pub struct UserSpace {
     pub root: u64,
     id: SpaceId,
@@ -1015,16 +1033,25 @@ pub struct UserSpace {
     frames: [Option<FrameId>; 4],
     private: Option<FrameId>,
     user_stack_base: u64,
-    #[cfg(feature = "multi-test")]
+    /// Phase 9C-1: physical identity of the shared barrier page aliased at
+    /// `USER_BARRIER` as user RW. The page itself belongs to the kernel image,
+    /// so it has no registry entry and is never freed with this root.
+    #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+    barrier: Option<u64>,
+    #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
     extra_user: Option<FrameId>,
-    #[cfg(feature = "multi-test")]
+    #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
     user_owners: [Option<neu_kernel::node::ThreadId>; neu_kernel::node::MAX_THREADS],
-    #[cfg(feature = "switch-test")]
+    #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
     stacks: [Option<OwnedStack>; neu_kernel::node::MAX_THREADS],
-    #[cfg(feature = "switch-test")]
+    #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
     stack_tables: [bool; TABLES],
 }
-#[cfg(feature = "user-test")]
+#[cfg(any(
+    feature = "user-test",
+    feature = "smp-user-test",
+    feature = "smp-scheduler-test"
+))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum UserTeardown {
@@ -1032,15 +1059,27 @@ enum UserTeardown {
     Started,
     Finished,
 }
-#[cfg(feature = "user-test")]
+#[cfg(any(
+    feature = "user-test",
+    feature = "smp-user-test",
+    feature = "smp-scheduler-test"
+))]
 impl UserSpace {
-    #[cfg(feature = "node-test")]
+    #[cfg(any(
+        feature = "node-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    ))]
     pub fn id(&self) -> SpaceId {
         self.id
     }
 }
 
-#[cfg(feature = "user-test")]
+#[cfg(any(
+    feature = "user-test",
+    feature = "smp-user-test",
+    feature = "smp-scheduler-test"
+))]
 impl Paging<'_, '_> {
     /// Trusted mapping integration: install new user tables in the owning
     /// token and publish only that root's supervisor workspace aliases.
@@ -1283,7 +1322,7 @@ impl Paging<'_, '_> {
         cleanup.expect("shared unmap inventory cleanup");
         Ok(())
     }
-    #[cfg(not(feature = "switch-test"))]
+    #[cfg(not(any(feature = "switch-test", feature = "smp-scheduler-test")))]
     pub fn prepare_user(
         &mut self,
         bytes: &[u8],
@@ -1300,7 +1339,40 @@ impl Paging<'_, '_> {
         private_value: Option<u64>,
         budget: Option<usize>,
     ) -> Result<UserSpace> {
+        self.prepare_domain_inner(bytes, kind, seed, private_value, budget, None)
+    }
+    /// Phase 9C-1: prepares a private root that also aliases the shared barrier
+    /// page as user RW and publishes the profile constants into `CONSTANTS`.
+    ///
+    /// The barrier leaf lives in the tables this root already owns, so the
+    /// transaction adds no new table pages and no registry entries.
+    #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+    pub fn prepare_domain_shared(
+        &mut self,
+        bytes: &[u8],
+        kind: u64,
+        seed: u64,
+        extras: [u64; 4],
+        budget: Option<usize>,
+    ) -> Result<UserSpace> {
+        self.prepare_domain_inner(bytes, kind, seed, None, budget, Some(extras))
+    }
+    fn prepare_domain_inner(
+        &mut self,
+        bytes: &[u8],
+        kind: u64,
+        seed: u64,
+        private_value: Option<u64>,
+        budget: Option<usize>,
+        extras: Option<[u64; 4]>,
+    ) -> Result<UserSpace> {
+        #[cfg(feature = "user-test")]
         use super::userspace::{CODE, CONSTANTS, DATA, STACK, UNMAPPED};
+        #[cfg(not(feature = "user-test"))]
+        use neu_kernel::paging::{
+            USER_CODE as CODE, USER_CONSTANTS as CONSTANTS, USER_DATA as DATA, USER_STACK as STACK,
+            USER_UNMAPPED as UNMAPPED,
+        };
         if current_root() != self.tree.root || bytes.is_empty() || bytes.len() > PAGE as usize {
             return Err(Error::InUse);
         }
@@ -1317,13 +1389,15 @@ impl Paging<'_, '_> {
             frames: [None; 4],
             private: None,
             user_stack_base: STACK,
-            #[cfg(feature = "multi-test")]
+            #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+            barrier: None,
+            #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
             extra_user: None,
-            #[cfg(feature = "multi-test")]
+            #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
             user_owners: [None; neu_kernel::node::MAX_THREADS],
-            #[cfg(feature = "switch-test")]
+            #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
             stacks: core::array::from_fn(|_| None),
-            #[cfg(feature = "switch-test")]
+            #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
             stack_tables: [false; TABLES],
         };
         self.memory.budget = budget;
@@ -1339,6 +1413,12 @@ impl Paging<'_, '_> {
             self.with_frame_mut(b, |frame| {
                 frame[..8].copy_from_slice(&seed.to_le_bytes());
                 frame[8..16].copy_from_slice(&kind.to_le_bytes());
+                if let Some(words) = extras {
+                    for (index, word) in words.iter().enumerate() {
+                        let offset = 16 + index * 8;
+                        frame[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
             })?;
             self.with_frame_mut(c, |frame| frame[0x100] = 0xc3)?;
             if let Some(value) = private_value {
@@ -1371,6 +1451,11 @@ impl Paging<'_, '_> {
             if let Some((physical, pat)) = super::interrupts::user_device() {
                 tree.map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
             }
+            #[cfg(feature = "smp-scheduler-test")]
+            {
+                let (physical, pat) = super::smp_scheduler::device();
+                tree.map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
+            }
             tree.map(&mut self.memory, WINDOW, tree.root, Permissions::RW)?;
             for (va, frame, permission) in [
                 (CODE, ids[0], Permissions::RX),
@@ -1398,6 +1483,17 @@ impl Paging<'_, '_> {
                     &[frame],
                     Permissions::R,
                 )?;
+            }
+            #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+            if extras.is_some() {
+                let barrier = shared_barrier_physical();
+                tree.map_user(
+                    &mut self.memory,
+                    shared_barrier_virtual(),
+                    barrier,
+                    Permissions::RW,
+                )?;
+                space.barrier = Some(barrier);
             }
             space.tables =
                 core::array::from_fn(|i| !old_tables[i] && self.memory.tables[i].physical != 0);
@@ -1438,7 +1534,13 @@ impl Paging<'_, '_> {
         Ok(space)
     }
     pub fn verify_user(&self, space: &UserSpace) -> Result<()> {
+        #[cfg(feature = "user-test")]
         use super::userspace::{CODE, CONSTANTS, DATA, GUARD, STACK, UNMAPPED};
+        #[cfg(not(feature = "user-test"))]
+        use neu_kernel::paging::{
+            USER_CODE as CODE, USER_CONSTANTS as CONSTANTS, USER_DATA as DATA, USER_GUARD as GUARD,
+            USER_STACK as STACK, USER_UNMAPPED as UNMAPPED,
+        };
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
@@ -1482,7 +1584,7 @@ impl Paging<'_, '_> {
         .into_iter()
         .enumerate()
         {
-            #[cfg(feature = "multi-test")]
+            #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
             if index == 3 && space.frames[index].is_none() {
                 if tree.translate(&self.memory, address)?.is_some() {
                     return Err(Error::Flags);
@@ -1504,7 +1606,7 @@ impl Paging<'_, '_> {
                 return Err(Error::Flags);
             }
         }
-        #[cfg(feature = "multi-test")]
+        #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
         if let Some(frame) = space.extra_user {
             self.verify_user_stack_leaf(space, frame, logic::thread_user_stack(2))?;
         }
@@ -1527,9 +1629,9 @@ impl Paging<'_, '_> {
         }
         for slot in 0..TABLES {
             let actual = tree.translate(&self.memory, WINDOW + slot as u64 * PAGE)?;
-            #[cfg(feature = "switch-test")]
+            #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
             let stack_table = space.stack_tables[slot];
-            #[cfg(not(feature = "switch-test"))]
+            #[cfg(not(any(feature = "switch-test", feature = "smp-scheduler-test")))]
             let stack_table = false;
             if space.tables[slot] && !stack_table {
                 let table = self.memory.tables[slot];
@@ -1560,6 +1662,33 @@ impl Paging<'_, '_> {
         } else if private.is_some() {
             return Err(Error::Flags);
         }
+        #[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+        {
+            // The shared barrier page is image-owned: it must be aliased user RW
+            // at exactly one VA, must not be registry-recorded, and must never
+            // be reachable by the reclamation paths that free space frames.
+            let barrier = space.barrier.ok_or(Error::Corrupt)?;
+            if barrier != shared_barrier_physical() {
+                return Err(Error::NotOwned);
+            }
+            let actual = tree
+                .translate(&self.memory, shared_barrier_virtual())?
+                .ok_or(Error::NotMapped)?;
+            if actual.physical != barrier
+                || !actual.user
+                || actual.permissions != Permissions::RW
+                || actual.page_size != PAGE
+            {
+                return Err(Error::Flags);
+            }
+            if self
+                .registry
+                .mapping_for(space.id, shared_barrier_virtual())
+                .is_ok()
+            {
+                return Err(Error::Flags);
+            }
+        }
         for address in [0, GUARD, STACK + PAGE, SCRATCH] {
             if tree.translate(&self.memory, address)?.is_some() {
                 return Err(Error::Flags);
@@ -1585,7 +1714,7 @@ impl Paging<'_, '_> {
         }
         self.registry.deactivate_space(space.id)
     }
-    #[cfg(not(feature = "switch-test"))]
+    #[cfg(not(any(feature = "switch-test", feature = "smp-scheduler-test")))]
     pub fn user_result(&mut self, space: &UserSpace) -> Result<u64> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -1608,7 +1737,11 @@ impl Paging<'_, '_> {
             })
             .transpose()
     }
-    #[cfg(feature = "node-test")]
+    #[cfg(any(
+        feature = "node-test",
+        feature = "smp-user-test",
+        feature = "smp-scheduler-test"
+    ))]
     pub fn user_physical(&self, space: &UserSpace, address: u64) -> Result<u64> {
         if self.registry.root(space.id)? != space.root {
             return Err(Error::NotOwned);
@@ -1630,7 +1763,10 @@ impl Paging<'_, '_> {
     /// Preflight failures retain the live token for retry. Once teardown
     /// begins, an unexpected error leaves it permanently non-retryable.
     pub fn destroy_user(&mut self, space: &mut UserSpace) -> Result<()> {
-        use super::userspace::{CODE, CONSTANTS, DATA, UNMAPPED};
+        use neu_kernel::paging::{
+            USER_CODE as CODE, USER_CONSTANTS as CONSTANTS, USER_DATA as DATA,
+            USER_UNMAPPED as UNMAPPED,
+        };
         if space.teardown != UserTeardown::Live {
             return Err(Error::NotOwned);
         }
@@ -1641,11 +1777,11 @@ impl Paging<'_, '_> {
         if space.prepared {
             self.verify_user(space)?;
         }
-        #[cfg(feature = "switch-test")]
+        #[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
         if space.stacks.iter().any(Option::is_some) {
             return Err(Error::InUse);
         }
-        #[cfg(feature = "multi-test")]
+        #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
         if space.extra_user.is_some() || space.user_owners.iter().any(Option::is_some) {
             return Err(Error::InUse);
         }
@@ -1706,7 +1842,7 @@ impl Paging<'_, '_> {
                     self.registry.remove_for(space.id, address)?;
                 }
             }
-            #[cfg(feature = "multi-test")]
+            #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
             if self.registry.mapping_for(space.id, 0x410000).is_ok() {
                 self.registry.remove_for(space.id, 0x410000)?;
             }
@@ -1741,16 +1877,18 @@ impl Paging<'_, '_> {
 #[cfg(any(
     feature = "timer-test",
     feature = "preempt-test",
-    feature = "smp-ipi-test"
+    feature = "smp-ipi-test",
+    feature = "smp-scheduler-test"
 ))]
 pub const LAPIC_VIEW: u64 = 0xffff_b000_0000_0000;
 #[cfg(any(
     feature = "timer-test",
     feature = "preempt-test",
-    feature = "smp-ipi-test"
+    feature = "smp-ipi-test",
+    feature = "smp-scheduler-test"
 ))]
 fn interrupts_enabled() -> bool {
-    #[cfg(feature = "smp-ipi-test")]
+    #[cfg(any(feature = "smp-ipi-test", feature = "smp-scheduler-test"))]
     {
         let flags: u64;
         // SAFETY: Read-only flag inspection at Ring 0.
@@ -1759,7 +1897,7 @@ fn interrupts_enabled() -> bool {
         }
         flags & 0x200 != 0
     }
-    #[cfg(not(feature = "smp-ipi-test"))]
+    #[cfg(not(any(feature = "smp-ipi-test", feature = "smp-scheduler-test")))]
     {
         super::interrupts::flags() & 0x200 != 0
     }
@@ -1767,7 +1905,8 @@ fn interrupts_enabled() -> bool {
 #[cfg(any(
     feature = "timer-test",
     feature = "preempt-test",
-    feature = "smp-ipi-test"
+    feature = "smp-ipi-test",
+    feature = "smp-scheduler-test"
 ))]
 impl Paging<'_, '_> {
     pub fn map_lapic_uc(&mut self, physical: u64, pat: u64) -> Result<u64> {
@@ -1821,16 +1960,16 @@ impl Paging<'_, '_> {
     }
 }
 
-#[cfg(feature = "switch-test")]
+#[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
 struct OwnedStack {
     binding: neu_kernel::context::StackBinding,
     frames: [Option<FrameId>; logic::KSTACK_PAGES],
-    #[cfg(feature = "multi-test")]
+    #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
     pinned: bool,
 }
-#[cfg(feature = "switch-test")]
+#[cfg(any(feature = "switch-test", feature = "smp-scheduler-test"))]
 impl Paging<'_, '_> {
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn prepare_thread_stack(
         &mut self,
         space: &mut UserSpace,
@@ -1859,7 +1998,7 @@ impl Paging<'_, '_> {
         let mut stack = OwnedStack {
             binding,
             frames: [None; logic::KSTACK_PAGES],
-            #[cfg(feature = "multi-test")]
+            #[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
             pinned: false,
         };
         let mut remaining = budget;
@@ -1958,7 +2097,7 @@ impl Paging<'_, '_> {
         }
         Ok(())
     }
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn pin_context(&mut self, space: &UserSpace) -> Result<()> {
         let stack = space
             .stacks
@@ -1969,7 +2108,7 @@ impl Paging<'_, '_> {
         self.verify_thread_stack(space, stack.binding)?;
         self.registry.pin_space(space.id)
     }
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn unpin_context(&mut self, space: &UserSpace) -> Result<()> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -1982,7 +2121,7 @@ impl Paging<'_, '_> {
         }
         self.registry.can_allocate(space.id)
     }
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn destroy_thread_stack(
         &mut self,
         space: &mut UserSpace,
@@ -2041,8 +2180,25 @@ impl Paging<'_, '_> {
         }
         Ok(())
     }
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn user_words(&mut self, space: &UserSpace) -> Result<[u64; 3]> {
+        if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
+            return Err(Error::InUse);
+        }
+        self.with_frame(space.frames[2].ok_or(Error::NotOwned)?, |bytes| {
+            core::array::from_fn(|i| {
+                u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+            })
+        })
+    }
+}
+
+/// Phase 9C-1: the published DATA words of one private user root. The frame is
+/// read only while the BSP owns the kernel root, so neither CPU is redeeming
+/// user-mapped storage at this point.
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+impl Paging<'_, '_> {
+    pub fn user_data_words(&mut self, space: &UserSpace) -> Result<[u64; 9]> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
         }
@@ -2056,7 +2212,7 @@ impl Paging<'_, '_> {
 
 #[cfg(feature = "preempt-test")]
 impl Paging<'_, '_> {
-    #[cfg(not(feature = "multi-test"))]
+    #[cfg(not(any(feature = "multi-test", feature = "smp-scheduler-test")))]
     pub fn user_limit(&mut self, space: &UserSpace, limit: u64) -> Result<()> {
         if current_root() != self.tree.root || self.registry.root(space.id)? != space.root {
             return Err(Error::InUse);
@@ -2067,11 +2223,11 @@ impl Paging<'_, '_> {
     }
 }
 
-#[cfg(feature = "multi-test")]
+#[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
 impl Paging<'_, '_> {
     fn member_boundary(&self, space: &UserSpace) -> Result<()> {
         if current_root() != self.tree.root
-            || super::interrupts::flags() & 0x200 != 0
+            || member_flags() & 0x200 != 0
             || self.registry.root(space.id)? != space.root
         {
             return Err(Error::InUse);
@@ -2457,7 +2613,7 @@ impl Paging<'_, '_> {
         })
     }
 }
-#[cfg(feature = "multi-test")]
+#[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
 impl Paging<'_, '_> {
     pub fn member_done_flag(&mut self, space: &UserSpace) -> Result<()> {
         self.member_boundary(space)?;
@@ -2612,3 +2768,239 @@ mod memory_object;
 #[cfg(feature = "memory-object-live-test")]
 #[path = "memory_object_live.rs"]
 pub(crate) mod memory_object_live;
+
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+fn shared_barrier_physical() -> u64 {
+    #[cfg(feature = "smp-scheduler-test")]
+    {
+        super::smp_scheduler::barrier_physical()
+    }
+    #[cfg(not(feature = "smp-scheduler-test"))]
+    {
+        super::smp_user::barrier_physical()
+    }
+}
+#[cfg(any(feature = "smp-user-test", feature = "smp-scheduler-test"))]
+fn shared_barrier_virtual() -> u64 {
+    if cfg!(feature = "smp-scheduler-test") {
+        logic::SMP_USER_BARRIER
+    } else {
+        logic::USER_BARRIER
+    }
+}
+
+#[cfg(feature = "smp-scheduler-test")]
+impl Paging<'_, '_> {
+    pub fn smp_inventory_layout(&self) -> [u64; 64] {
+        use core::mem::{offset_of, size_of};
+        let mut words = [0; 64];
+        words[..39].copy_from_slice(&self.registry.diagnostic_layout());
+        words[40..48].copy_from_slice(&self.memory.frames.diagnostic_layout());
+        words[48..54].copy_from_slice(&[
+            self.memory.tables.as_ptr() as u64,
+            size_of::<TableOwner>() as u64,
+            TABLES as u64,
+            offset_of!(TableOwner, physical) as u64,
+            offset_of!(TableOwner, level) as u64,
+            offset_of!(TableOwner, pinned) as u64,
+        ]);
+        words
+    }
+    pub fn smp_probe_pte(&self, space: &UserSpace) -> Result<(u64, u64)> {
+        if current_root() != self.root() || self.registry.root(space.id)? != space.root {
+            return Err(Error::NotOwned);
+        }
+        let path = logic::indices(0x410000)?;
+        let mut table = space.root;
+        for index in &path[..3] {
+            table = self.memory.read(table, *index)? & ADDRESS_FIELD;
+        }
+        Ok((
+            table + path[3] as u64 * 8,
+            self.memory.read(table, path[3])?,
+        ))
+    }
+    pub fn smp_validate_downgrade(
+        &self,
+        space: &UserSpace,
+        request: neu_kernel::shootdown::Request,
+        permissions: Permissions,
+    ) -> Result<()> {
+        self.registry
+            .validate_downgrade_mapping_for(space.id, request, permissions)
+    }
+    /// Kernel-owned restriction of an existing private alias. Execution pins
+    /// retain backing throughout the published shootdown; failure is terminal.
+    /// Atomic bit removal preserves simultaneous hardware accessed/dirty bits.
+    pub fn smp_downgrade(
+        &mut self,
+        space: &UserSpace,
+        request: neu_kernel::shootdown::Request,
+    ) -> Result<(u64, u64, u64)> {
+        if current_root() != self.root()
+            || request.root != space.root
+            || request.address != 0x410000
+            || request.epoch == 0
+            || request.targets == 0
+        {
+            return Err(Error::NotOwned);
+        }
+        let record = self.registry.mapping_for(space.id, request.address)?;
+        if record.permissions != Permissions::RW {
+            return Err(Error::Flags);
+        }
+        self.registry
+            .validate_downgrade_mapping_for(space.id, request, Permissions::R)?;
+        let tree = PageTree {
+            root: space.root,
+            bits: self.tree.bits,
+        };
+        let actual = tree
+            .translate(&self.memory, request.address)?
+            .ok_or(Error::NotMapped)?;
+        if !actual.user
+            || actual.page_size != PAGE
+            || actual.permissions != Permissions::RW
+            || actual.physical != self.registry.physical(record.frame)?
+        {
+            return Err(Error::Flags);
+        }
+        let path = logic::indices(request.address)?;
+        let mut table = space.root;
+        for index in &path[..3] {
+            table = self.memory.read(table, *index)? & ADDRESS_FIELD;
+        }
+        let pointer = unsafe { self.memory.pointer(table)?.add(path[3]) };
+        // SAFETY: One aligned u64 in this token's owned, pinned leaf table. All
+        // software mutation is exclusive; hardware A/D updates are atomic too.
+        let leaf = unsafe { &*pointer.cast::<core::sync::atomic::AtomicU64>() };
+        let before = leaf.fetch_and(!2, core::sync::atomic::Ordering::AcqRel);
+        self.registry
+            .downgrade_mapping_for(space.id, request, Permissions::R)
+            .expect("validated SMP permission restriction changed during exclusive transaction");
+        Ok((
+            table + path[3] as u64 * 8,
+            before,
+            leaf.load(core::sync::atomic::Ordering::Acquire),
+        ))
+    }
+    pub fn smp_data_physical(&self, space: &UserSpace) -> Result<u64> {
+        self.user_physical(space, logic::USER_DATA)
+    }
+}
+
+#[cfg(any(feature = "multi-test", feature = "smp-scheduler-test"))]
+fn member_flags() -> u64 {
+    #[cfg(feature = "smp-scheduler-test")]
+    {
+        super::smp_scheduler::flags()
+    }
+    #[cfg(not(feature = "smp-scheduler-test"))]
+    {
+        super::interrupts::flags()
+    }
+}
+
+/// An SMP session retains these exact table pages with Thread execution pins
+/// and AddressSpace object references. The shared kernel lock serializes readers
+/// with software PTE changes. All views are removed before pins/root references
+/// are released; no table storage reference is retained in the view.
+#[cfg(feature = "smp-scheduler-test")]
+pub struct SmpInspection {
+    space: SpaceId,
+    root: u64,
+    kernel_root: u64,
+    bits: u8,
+    tables: [(u64, u8, u64); TABLES],
+}
+#[cfg(feature = "smp-scheduler-test")]
+impl SmpInspection {
+    pub fn inspect(
+        &self,
+        active: neu_kernel::node::ActiveContext,
+        owner: neu_kernel::node::NodeId,
+        reference: &logic::SpaceRef,
+        va: u64,
+    ) -> core::result::Result<u64, i64> {
+        if active.node != owner
+            || active.context.space != self.space
+            || active.context.root != self.root
+            || reference.id() != self.space
+            || reference.root() != self.root
+            || current_root() != self.kernel_root
+        {
+            return Err(neu_kernel::capability::Error::Owner as i64);
+        }
+        logic::user_range(va, 1).map_err(|_| neu_kernel::syscall::INVALID_ARGUMENT)?;
+        neu_kernel::inspection::inspect_tables(self.root, self, self.bits, va)
+            .map_err(|_| neu_kernel::syscall::v02::BAD_MAPPING)
+    }
+}
+#[cfg(feature = "smp-scheduler-test")]
+impl TableMemory for SmpInspection {
+    fn allocate(&mut self, _: u8) -> Result<u64> {
+        Err(Error::InUse)
+    }
+    fn release(&mut self, _: u64) -> Result<()> {
+        Err(Error::InUse)
+    }
+    fn owned(&self, pa: u64, level: u8) -> bool {
+        self.tables
+            .iter()
+            .any(|t| pa != 0 && t.0 == pa && t.1 == level)
+    }
+    fn pinned(&self, _: u64) -> bool {
+        true
+    }
+    fn read(&self, pa: u64, index: usize) -> Result<u64> {
+        if current_root() != self.kernel_root || index >= 512 {
+            return Err(Error::InUse);
+        }
+        let (_, _, alias) = self
+            .tables
+            .iter()
+            .find(|t| pa != 0 && t.0 == pa)
+            .ok_or(Error::NotOwned)?;
+        // SAFETY: Published owned table alias, retained for the whole SMP
+        // session; aligned atomic reads coexist with hardware A/D writes.
+        Ok(unsafe {
+            (&*((*alias + index as u64 * 8) as *const core::sync::atomic::AtomicU64))
+                .load(core::sync::atomic::Ordering::Acquire)
+        })
+    }
+    fn write(&mut self, _: u64, _: usize, _: u64) -> Result<()> {
+        Err(Error::InUse)
+    }
+    fn invalidate(&mut self, _: u64) {}
+    fn flush(&mut self) {}
+}
+#[cfg(feature = "smp-scheduler-test")]
+impl Paging<'_, '_> {
+    pub fn smp_inspection(&self, space: &UserSpace) -> Result<SmpInspection> {
+        if current_root() != self.root() || self.registry.root(space.id)? != space.root {
+            return Err(Error::NotOwned);
+        }
+        let mut tables = [(0, 0, 0); TABLES];
+        for (slot, record) in tables.iter_mut().enumerate() {
+            if space.tables[slot] {
+                let t = self.memory.tables[slot];
+                *record = (t.physical, t.level, self.memory.pointer(t.physical)? as u64);
+            }
+        }
+        Ok(SmpInspection {
+            space: space.id,
+            root: space.root,
+            kernel_root: self.root(),
+            bits: self.tree.bits,
+            tables,
+        })
+    }
+    pub fn retain_object_space(&mut self, space: &UserSpace) -> Result<logic::SpaceRef> {
+        self.registry.retain_space(space.id)
+    }
+    pub fn release_object_space(&mut self, reference: logic::SpaceRef) -> Result<()> {
+        self.registry
+            .release_space_ref(reference)
+            .map_err(|(e, _)| e)
+    }
+}

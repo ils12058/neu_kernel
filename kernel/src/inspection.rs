@@ -33,9 +33,19 @@ pub fn inspect(
     va: u64,
 ) -> paging::Result<u64> {
     registry.validate_space_ref(reference)?;
+    inspect_tables(reference.root(), memory, bits, va)
+}
+/// Read-only walk after the caller establishes retained-root ownership. The
+/// SMP adapter validates its CPU slot and SpaceRef under the shared kernel lock.
+pub fn inspect_tables(
+    root: u64,
+    memory: &impl TableMemory,
+    bits: u8,
+    va: u64,
+) -> paging::Result<u64> {
     paging::user_range(va, 1)?;
     let path = paging::indices(va)?;
-    let mut table = reference.root();
+    let mut table = root;
     let (mut user, mut write, mut execute) = (true, true, true);
     for (depth, index) in path.into_iter().enumerate() {
         let level = 4 - depth as u8;
