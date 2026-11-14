@@ -402,3 +402,17 @@ This protocol covers the bounded four-CPU, two-Node, three-Thread integer
 execution model with IRQ-disabled kernel transactions. Work stealing, load
 balancing, general kernel preemption, arbitrary allocation from APs, a public
 mapping ABI and K10 derivation/revocation remain later work.
+
+## K10 successor — 2026-11-14
+
+[The authority QMP protocol](authority-qmp.md) extends this scheduled SMP
+observer for accepted K10 derivation/revocation. It adds a grant/FIFO model,
+tracked mapping ownership, every page/CPU post-instruction invalidation window,
+revoked wait and requester-termination evidence, and ABI 0.5 rejection. The
+shared observer waits for actual RIP entry when a diagnostic flag precedes its
+wait function; mandatory terminal observations remain exact. Baseline/prepared
+inventory acceptance also waits for the actual BSP checkpoint, and a later
+phase cannot replace either missing observation.
+Polling varies before the actual same-Node CPL3 witness to avoid matching
+the two-quantum scheduler cycle, then returns to its existing cadence.
+[K10 completion](../K10_COMPLETION.md) supersedes the earlier K10 deferral above.

@@ -83,6 +83,67 @@ pub mod v05 {
     }
 }
 
+/// K10: explicit derivation/revocation. Only authority-enabled images advertise
+/// these operations; all earlier namespaces and feature masks are retained.
+pub mod v06 {
+    pub const CAP_DERIVE: u64 = 0x19;
+    pub const CAP_REVOKE: u64 = 0x1a;
+    pub const FEATURE_AUTHORITY: u32 = 256;
+    pub const INFO: u64 = super::version(0, 6, 255 | FEATURE_AUTHORITY);
+    pub fn owns(number: u64) -> bool {
+        (CAP_DERIVE..=CAP_REVOKE).contains(&number)
+    }
+    pub fn valid_arguments(number: u64, arguments: [u64; 6]) -> bool {
+        match number {
+            CAP_DERIVE => arguments[2..].iter().all(|v| *v == 0),
+            CAP_REVOKE => arguments[1..].iter().all(|v| *v == 0),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::syscall::{self, Outcome};
+
+        #[test]
+        fn authority_abi_is_explicit_and_legacy_dispatch_rejects_every_new_operation() {
+            assert_eq!(INFO, 0x6000001ff);
+            assert_eq!(syscall::v05::INFO, 0x5000000ff);
+            assert_eq!(syscall::v04::INFO, 0x40000007f);
+            for op in [CAP_DERIVE, CAP_REVOKE] {
+                assert!(owns(op));
+                assert_eq!(
+                    syscall::dispatch(op, [u64::MAX; 6]),
+                    Outcome::Return {
+                        status: syscall::NOT_SUPPORTED,
+                        scalar: 0,
+                    }
+                );
+            }
+            assert!(!owns(CAP_DERIVE - 1));
+            assert!(!owns(CAP_REVOKE + 1));
+        }
+
+        #[test]
+        fn authority_abi_rejects_each_nonzero_reserved_argument_without_narrowing() {
+            assert!(valid_arguments(CAP_DERIVE, [1, 0x3ff, 0, 0, 0, 0]));
+            assert!(valid_arguments(CAP_REVOKE, [1, 0, 0, 0, 0, 0]));
+            for op in [CAP_DERIVE, CAP_REVOKE] {
+                for index in (if op == CAP_DERIVE { 2 } else { 1 })..6 {
+                    for value in [1, 1 << 63, u64::MAX] {
+                        let mut args = [0; 6];
+                        args[0] = 1;
+                        args[index] = value;
+                        assert!(!valid_arguments(op, args));
+                    }
+                }
+            }
+            assert!(!valid_arguments(0x18, [0; 6]));
+        }
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;

@@ -153,7 +153,15 @@ const _: () = assert!(
         + cfg!(feature = "test-smp-schedule-stress") as u8
         + cfg!(feature = "test-smp-tlb-2") as u8
         + cfg!(feature = "test-smp-tlb-4") as u8
-        + cfg!(feature = "test-smp-tlb-invalid") as u8)
+        + cfg!(feature = "test-smp-tlb-invalid") as u8
+        + cfg!(feature = "test-smp-authority-2") as u8
+        + cfg!(feature = "test-smp-authority-4") as u8
+        + cfg!(feature = "test-smp-authority-queued") as u8
+        + cfg!(feature = "test-smp-authority-close") as u8
+        + cfg!(feature = "test-smp-authority-wait") as u8
+        + cfg!(feature = "test-smp-authority-stress") as u8
+        + cfg!(feature = "test-smp-authority-terminate") as u8
+        + cfg!(feature = "test-smp-authority-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

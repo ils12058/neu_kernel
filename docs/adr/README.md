@@ -347,3 +347,19 @@ teardown remain BSP-owned. K10 derivation/revocation, general kernel
 preemption, balancing, public mapping/Thread creation and physical hardware
 validation remain later work. Earlier ADRs retain their original scoped facts.
 
+## K10 record — bounded capability derivation and revocation
+
+| ADR | Status | Related register entries |
+| --- | --- | --- |
+| [0030: Bounded capability derivation and revocation](0030-bounded-capability-derivation-and-revocation.md) | Accepted for bounded K10 completion; exact rights subsets, tracked delegation, wait cancellation, mapping retirement and requester termination verified | NEU-005; NEU-007; NEU-008; NEU-009; NEU-011; NEU-018; NEU-021; NEU-023; NEU-024 |
+
+ADR 0030 adds explicit DERIVE/REVOKE rights, generation-checked lineage and
+strict descendant revocation. Mapping/backing ownership survives handle close
+and pending hardware shootdown; completion requires every target's actual
+invalidation. Experimental ABI 0.6 exposes only local scalar authority calls.
+All 324 host tests pass in both configurations, 29 Python observer tests pass,
+all 189 registered QEMU cases pass, and five authority cases pass again with
+identical images. Formatting, lint, default build and the retained-evidence
+audit pass. The bounded four-CPU/two-Node/three-Thread scope remains in force;
+K11 device primitives are next. [K10 completion](../K10_COMPLETION.md) records
+the accepted evidence. Earlier ADRs retain their historical scope.

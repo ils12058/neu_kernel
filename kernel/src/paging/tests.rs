@@ -1404,7 +1404,17 @@ fn three_thread_stack_arena_has_bounded_distinct_guarded_ranges() {
         stack_range(KSTACK_BASE + 3 * KSTACK_STRIDE + PAGE, 2),
         Err(Error::Address)
     );
-    assert_eq!((DATA_FRAMES, MAPPINGS), (16, 64));
+    assert_eq!(
+        (DATA_FRAMES, MAPPINGS),
+        (
+            if cfg!(feature = "authority-test") {
+                18
+            } else {
+                16
+            },
+            64
+        )
+    );
 }
 
 #[test]
@@ -1932,6 +1942,9 @@ fn memory_object_capacity_rejection_is_atomic() {
             permissions: Permissions::R,
             object: MappingObject::Shared(obj),
             live: true,
+            grant: crate::capability::GrantId::NONE,
+            revoke_epoch: 0,
+            revoke_targets: 0,
         };
     }
     let before = m.pages.len();

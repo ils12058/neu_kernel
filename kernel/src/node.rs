@@ -171,6 +171,23 @@ impl Nodes {
     pub fn concurrent_count(&self) -> usize {
         self.cpu_active.iter().flatten().count()
     }
+    /// The caller holds the shared SMP transaction and has returned all leases.
+    /// Other CPUs may run user code, but cannot mutate a table concurrently.
+    pub fn purge_revoked_authority(
+        &mut self,
+        objects: &mut crate::capability::Objects,
+    ) -> crate::capability::Result<usize> {
+        for (node, table) in self.nodes.iter().zip(&self.tables) {
+            if node.is_some_and(|n| n.state != NodeState::Reclaimed) && table.is_none() {
+                return Err(crate::capability::Error::InUse);
+            }
+        }
+        let mut count = 0;
+        for table in self.tables.iter_mut().flatten() {
+            count += table.purge_revoked(objects)?;
+        }
+        Ok(count)
+    }
     pub fn authority(&self, id: NodeId) -> Result<&crate::capability::Table> {
         if self.node(id)?.state == NodeState::Reclaimed {
             return Err(Error::Identity);

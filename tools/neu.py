@@ -201,7 +201,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_", "neu_authority_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high",
                     "__text_start", "__text_end", "__data_start", "__rodata_start", "__rodata_end",
@@ -1577,7 +1577,7 @@ def observe_ipc_request(qmp,cpu,symbols,record):
             if entry_address:
                 if layout is None:raise Failure('Missing capability table layout descriptor.')
                 slot_size=layout[4];gen_off,live_off,kind_off,target_off,rights_off,movable_off=layout[6:12]
-                if layout[0]!=1 or layout[5]!=8 or not 20<=slot_size<=64 or max(gen_off+4,live_off+1,kind_off+1,target_off+8,rights_off+1,movable_off+1)>slot_size:raise Failure('Capability table layout descriptor is inconsistent.')
+                if layout[0]!=1 or layout[5]!=8 or not 20<=slot_size<=64 or max(gen_off+4,live_off+1,kind_off+1,target_off+8,rights_off+2,movable_off+1)>slot_size:raise Failure('Capability table layout descriptor is inconsistent.')
                 if entry_address!=layout[3]+i*slot_size or generation_address!=entry_address+gen_off:raise Failure('Recipient slot address differs from table layout.')
                 entry=debug_words(qmp,entry_address,(slot_size+7)//8)
                 def field(offset,size):
@@ -1585,7 +1585,7 @@ def observe_ipc_request(qmp,cpu,symbols,record):
                     value=entry[word]>>shift
                     if shift and offset%8+size>8:value|=entry[word+1]<<(64-shift)
                     return value&((1<<(size*8))-1)
-                if field(gen_off,4)!=handle>>32 or field(live_off,1)!=1 or field(kind_off,1)!=obj>>40 or field(target_off,8)!=obj or field(rights_off,1)!=rights or field(movable_off,1)!=movable:raise Failure('Actual typed table entry differs from authority witness.')
+                if field(gen_off,4)!=handle>>32 or field(live_off,1)!=1 or field(kind_off,1)!=obj>>40 or field(target_off,8)!=obj or field(rights_off,2)!=rights or field(movable_off,1)!=movable:raise Failure('Actual typed table entry differs from authority witness.')
         if evidence[132]:
             raw=qmp.call('human-monitor-command',{'command-line':f'x /1bx {evidence[132]:#x}'})
             values=re.findall(r'0x[0-9a-fA-F]+',raw)
@@ -1610,6 +1610,25 @@ def observe_ipc_request(qmp,cpu,symbols,record):
             result['terminal_state']={'queue':ids,'token':debug_words(qmp,pointers[7],1)[0],
                                       'state':byte(pointers[8]),'pinned':byte(pointers[9])}
     return result
+
+
+def check_wait_tick_accounting(events, drains, ticks, eois, user, drain, captures,
+                               kernel_root, deadlock=False):
+    for before, after, acknowledged, root in drains:
+        if after != before + 1 or after != acknowledged or root != kernel_root:
+            raise Failure('Deferred kernel drain changed scheduling or violated acknowledgment.')
+    if ticks != eois or user != len(events) or ticks != user + drain or not len(drains) <= drain <= len(drains) + 1:
+        raise Failure('User IRQs, safe drains, EOIs and selections were conflated.')
+    # A blocked native call can leave its one-shot timer pending. Draining it
+    # on the common kernel stack does not execute or preempt a blocked Thread.
+    if deadlock and (user != 0 or captures != {1: 0, 2: 0, 3: 0}):
+        raise Failure('No-runnable quiescence fabricated user timer progress.')
+    if deadlock and drain > len(captures):
+        raise Failure('No-runnable quiescence exceeded one pending timer per blocked call.')
+    observed_ticks = {e['tick'] for e in events} | {row[1] for row in drains}
+    if observed_ticks != set(range(1, ticks + 1)) and not (
+            drain == len(drains) + 1 and observed_ticks == set(range(1, ticks))):
+        raise Failure('Missing hardware event accounting between user and kernel windows.')
 
 
 def check_wait_multi(case,text,symbols,observations,kernel_root,qmp):
@@ -1781,18 +1800,14 @@ def check_wait_multi(case,text,symbols,observations,kernel_root,qmp):
         if quiesced or no_runnable:raise Failure('A completing wait scenario claimed deadlock quiescence.')
         if fifo or set(outcomes)!={1,2,3} or retired!={1,2,3} or blocked:raise Failure('Missing terminal/empty completion of all wait members.')
         if len(re.findall(r'Multi Node reclaimed:',text))!=2:raise Failure('Both Node roots were not reclaimed after their last Threads.')
-    drains=re.findall(r'Preempt deferred drained: before=(\d+) after=(\d+) eois=(\d+) root=(0x[0-9a-f]+) IF=0 kernel_switch=false',text)
-    for before,after,eois,root in drains:
-        if int(after)!=int(before)+1 or after!=eois or int(root,16)!=kernel_root:raise Failure('Deferred kernel drain changed scheduling or violated acknowledgment.')
+    drains=[tuple(int(value,0) for value in row) for row in re.findall(r'Preempt deferred drained: before=(\d+) after=(\d+) eois=(\d+) root=(0x[0-9a-f]+) IF=0 kernel_switch=false',text)]
     stopped=re.search(r'Preempt timer stopped: ticks=(\d+) eois=(\d+) user=(\d+) drain=(\d+) ISR=0 IRR=0 initial=0 current=0 SVR=disabled IF=0',text)
     done=re.search(r'Multiple Thread test passed: dispatches=(\d+) captures=(\d+) queue=empty running=none IF=0',text)
     baseline=re.search(r'Multi baseline: allocated=(\d+) free=(\d+) tables=(\d+) root=(0x[0-9a-f]+)',text);restored=re.search(r'Multi accounting restored: allocated=(\d+) free=(\d+) tables=(\d+)',text)
     if not stopped or not done or not baseline or not restored or baseline.groups()[:3]!=restored.groups() or int(baseline[4],16)!=kernel_root:raise Failure('Missing exact final shared-root accounting.')
     ticks,eois,user,drain=map(int,stopped.groups())
-    if ticks!=eois or user!=len(events) or ticks!=user+drain or not len(drains)<=drain<=len(drains)+1 or tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('User IRQs, safe drains, EOIs and selections were conflated.')
-    if deadlock and (ticks!=0 or captures!={1:0,2:0,3:0}):raise Failure('No-runnable quiescence fabricated timer progress.')
-    observed_ticks={e['tick'] for e in events}|{int(row[1]) for row in drains}
-    if observed_ticks!={*range(1,ticks+1)} and not (drain==len(drains)+1 and observed_ticks==set(range(1,ticks))):raise Failure('Missing hardware event accounting between user and kernel windows.')
+    if tuple(map(int,done.groups()))!=(len(selected),len(events)):raise Failure('User IRQs, safe drains, EOIs and selections were conflated.')
+    check_wait_tick_accounting(events,drains,ticks,eois,user,drain,captures,kernel_root,deadlock)
     final=qmp.call('human-monitor-command',{'command-line':'info lapic'})
     if not re.search(r'LVTT\s+0x00010030.*masked',final) or 'APIC disabled' not in final or 'TPR 0xff' not in final or not re.search(r'ISR\s+\(none\)',final) or not re.search(r'IRR\s+\(none\)',final) or not re.search(r'initial_count = 0 current_count = 0',final):raise Failure('Three-Thread timer did not quiesce before the controlled halt.')
     for name in ('neu_native_busy','neu_native_selected_top','neu_native_saved_user_rsp','neu_user_saved_rsp'):
@@ -3541,6 +3556,7 @@ def main():
         build()
     elif args.action == "check":
         command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
+        command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
         command([require("cargo"), "fmt", "--all", "--", "--check"])
         for feature in FEATURES.values():
             arguments = [require("cargo"), "clippy", "--locked", "--target", TARGET]
@@ -3563,6 +3579,7 @@ def main():
                           ovmf_code_sha256=sha256(code), ovmf_vars_template_sha256=sha256(variables))
             if not args.case:
                 command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
+                command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
                 report["observer_tests"] = {"passed": True}
             if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer", "switch"):
                 target = host_target()

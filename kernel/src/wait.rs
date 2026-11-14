@@ -166,6 +166,7 @@ pub struct Waiter {
     /// live endpoint to recheck. The pin is released at the same instant.
     pub terminal: Option<Error>,
     pub pinned: bool,
+    pub grant: crate::capability::GrantId,
 }
 impl Waiter {
     pub fn thread(self) -> ThreadId {
@@ -198,6 +199,14 @@ impl Default for Waits {
     }
 }
 impl Waits {
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn authority_grants(&self) -> [u64; WAITERS] {
+        core::array::from_fn(|index| {
+            self.slots[index]
+                .as_ref()
+                .map_or(0, |w| core::ptr::from_ref(&w.grant) as u64)
+        })
+    }
     #[cfg(feature = "smp-scheduler-test")]
     pub fn smp_field_addresses(&self) -> [u64; WAITERS * 8] {
         let mut words = [0; WAITERS * 8];
@@ -349,11 +358,21 @@ impl Waits {
             token: self.token,
             terminal: None,
             pinned: true,
+            grant: crate::capability::GrantId::NONE,
         };
         self.slots[slot] = Some(waiter);
         #[cfg(feature = "channel-wait-test")]
         self.witness(witness::REGISTER, Some(waiter), 0);
         Ok(waiter.token)
+    }
+    pub(crate) fn bind_grant(&mut self, token: u64, grant: crate::capability::GrantId) {
+        let waiter = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|w| w.token == token)
+            .expect("newly registered wait");
+        waiter.grant = grant;
     }
     /// Restores a Ready/Queued waiter after a lost-wakeup recheck. The caller
     /// keeps its original pin; no second pin is taken.

@@ -29,6 +29,9 @@ use neu_kernel::{
     syscall::{self as abi, Frame, Outcome},
 };
 global_asm!(include_str!("smp_scheduler.S"));
+#[cfg(feature = "authority-test")]
+#[path = "smp_authority.rs"]
+mod authority;
 const MAGIC: u64 = 0x4e45_555f_5343_4831;
 const WORDS: usize = 64;
 const TRACE_LIMIT: usize = 256;
@@ -253,6 +256,8 @@ struct State {
     concurrent: bool,
     released: bool,
     tlb: Shootdown,
+    #[cfg(feature = "authority-test")]
+    authority: authority::Controller,
 }
 impl State {
     const fn new() -> Self {
@@ -272,9 +277,13 @@ impl State {
             concurrent: false,
             released: false,
             tlb: Shootdown::new(),
+            #[cfg(feature = "authority-test")]
+            authority: authority::Controller::new(),
         }
     }
     fn snapshot(&self) {
+        #[cfg(feature = "authority-test")]
+        authority::snapshot(self);
         publish(&neu_smp_sched_queues, self.scheduler.diagnostic_layout());
         publish(&neu_smp_sched_contexts, self.nodes.smp_cpu_addresses());
         let mut tlb = [0; 16];
@@ -829,6 +838,10 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
 }
 fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outcome {
     let number = f.registers.rax;
+    #[cfg(feature = "authority-test")]
+    if abi::v06::owns(number) {
+        return authority::operation(s, cpu, active, f);
+    }
     if number == abi::THREAD_EXIT {
         return abi::dispatch(number, f.registers.arguments());
     }
@@ -845,7 +858,13 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
     let handle = Handle::from_raw(f.registers.rdi);
     let result = (|| -> cap::Result<Outcome> {
         let scalar = match number {
-            abi::ABI_QUERY => abi::v05::INFO,
+            abi::ABI_QUERY => {
+                if cfg!(feature = "authority-test") {
+                    abi::v06::INFO
+                } else {
+                    abi::v05::INFO
+                }
+            }
             abi::v02::BOOTSTRAP_CAP_GET => lease
                 .table()
                 .bootstrap_get(&s.objects, active.node, f.registers.rdi)?
@@ -945,6 +964,8 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
     s.nodes
         .restore_authority_on(cpu, lease)
         .expect("SMP capability lease restoration");
+    #[cfg(feature = "authority-test")]
+    authority::record(s, cpu, active, f, result, 0);
     result
 }
 fn enter(cpu: usize, dispatch: &Dispatch) {
@@ -1183,10 +1204,26 @@ fn handle(cpu: usize, dispatch: Dispatch) {
     });
     notify(cpu, wakes);
 }
-fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, &UserSpace)>) {
+fn authority_pending(cpu: usize) -> bool {
+    #[cfg(feature = "authority-test")]
+    {
+        with_state(cpu, |s| s.authority.pending())
+    }
+    #[cfg(not(feature = "authority-test"))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, [&UserSpace; 2])>) {
     enable_cpu(cpu);
-    while !DONE.load(Ordering::Acquire) {
+    while !DONE.load(Ordering::Acquire) || authority_pending(cpu) {
         if cpu == 0 {
+            #[cfg(feature = "authority-test")]
+            {
+                let (paging, spaces) = bsp_paging.as_mut().expect("authority BSP paging");
+                authority::service(paging, *spaces);
+            }
             let marker = with_state(cpu, |s| {
                 if !s.concurrent
                     && neu_smp_sched_cpus[0].get(field::TICKS) >= 4
@@ -1216,8 +1253,8 @@ fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, &UserSpace)>
             });
             if release {
                 if TLB_PROFILE {
-                    let (paging, space) = bsp_paging.as_mut().expect("SMP TLB BSP transaction");
-                    shootdown(paging, space);
+                    let (paging, spaces) = bsp_paging.as_mut().expect("SMP TLB BSP transaction");
+                    shootdown(paging, spaces[0]);
                 }
                 barrier_word(0).store(1, Ordering::Release);
             }
@@ -1253,7 +1290,7 @@ fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, &UserSpace)>
             enter(cpu, &dispatch);
             handle(cpu, dispatch);
         } else {
-            if DONE.load(Ordering::Acquire) {
+            if DONE.load(Ordering::Acquire) && !authority_pending(cpu) {
                 break;
             }
             let local = &neu_smp_sched_cpus[cpu];
@@ -1716,6 +1753,9 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
             )
             .map_err(|_| "SMP sibling Thread")?;
         s.threads[2] = Some(extra);
+        #[cfg(feature = "authority-test")]
+        authority::bootstrap(paging, s, [&a, &b])?;
+        #[cfg(not(feature = "authority-test"))]
         for (index, space) in [&a, &b].into_iter().enumerate() {
             let node = nodes[index].unwrap();
             let retained = paging
@@ -1752,9 +1792,24 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
             .map_err(|_| "SMP Channel bootstrap")?;
         for id in nodes.into_iter().flatten() {
             let table = s.nodes.authority_mut(id).map_err(|_| "SMP manifest")?;
+            #[cfg(not(feature = "authority-test"))]
             table.configure_moves().map_err(|_| "SMP move authority")?;
+            #[cfg(feature = "authority-test")]
+            {
+                table
+                    .configure_memory_object_moves()
+                    .map_err(|_| "authority move rights")?;
+                if cfg!(feature = "test-smp-authority-wait") && id == nodes[0].unwrap() {
+                    let endpoint = Handle::from_raw((1u64 << 32) | 5);
+                    table
+                        .configure_delegation(&mut s.objects, endpoint)
+                        .map_err(|_| "authority endpoint grant")?;
+                }
+            }
             table.seal_bootstrap();
         }
+        #[cfg(feature = "authority-test")]
+        authority::prepare_mappings(paging, s, [&mut a, &mut b])?;
         Ok(())
     });
     kernel_pins?;
@@ -1770,7 +1825,11 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
                 .bootstrap_get(&s.objects, t.node, 4)
                 .map_err(|_| "SMP endpoint handle")?
                 .raw();
-            let action = if slot != 1 && cfg!(feature = "test-smp-schedule-shared") {
+            let action = if cfg!(feature = "authority-test") {
+                20
+            } else if cfg!(feature = "test-smp-authority-disabled") {
+                19
+            } else if slot != 1 && cfg!(feature = "test-smp-schedule-shared") {
                 8
             } else if slot == 2 && REJECT_PROFILE {
                 10
@@ -1893,7 +1952,7 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     .map_err(|_| "SMP prepared serial")?;
     probe_wait();
     RELEASE.store(true, Ordering::Release);
-    runtime(0, Some((paging, &a)));
+    runtime(0, Some((paging, [&a, &b])));
     for (cpu, local) in neu_smp_sched_cpus
         .iter()
         .enumerate()
@@ -1943,6 +2002,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
                 .release_object_space(reference)
                 .map_err(|_| "SMP root reference release")?;
         }
+        #[cfg(feature = "authority-test")]
+        authority::cleanup(paging, s, [&mut a, &mut b])?;
         for (index, space) in [&mut a, &mut b].into_iter().enumerate() {
             let id = s.node_ids[index].unwrap();
             s.nodes

@@ -353,6 +353,8 @@ neu_smp_sched_query_resume:
     test rax, rax
     jne neu_smp_sched_bad
     mov [rbp + 16], rdx
+    cmp qword ptr [rbp + 40], 20
+    jae neu_authority_prepare
     # The two same-Node Threads inspect distinct grants while another CPU
     # may transact against their shared authority table.
     xor edi, edi
@@ -413,6 +415,10 @@ neu_smp_sched_user_loop_begin:
     cmp qword ptr [r15], 1
     jne neu_smp_sched_user_loop_begin
 neu_smp_sched_user_loop_end:
+    cmp qword ptr [rbp + 40], 19
+    je neu_authority_disabled
+    cmp qword ptr [rbp + 40], 20
+    jae neu_authority_action
     cmp qword ptr [rbp + 40], 1
     je neu_smp_sched_user_fault_wait
     cmp qword ptr [rbp + 40], 4
@@ -484,6 +490,8 @@ neu_smp_sched_receive_cap_loop:
     jne neu_smp_sched_bad
     mov qword ptr [r15 + 40], 1
 2:
+.global neu_smp_sched_user_done
+neu_smp_sched_user_done:
     # Internal yield uses the same full saved context and validated native exit.
     mov rax, -256
     syscall
@@ -537,4 +545,281 @@ neu_smp_sched_bad:
     mov edi, 255
     syscall
     ud2
+
+# K10 operations share the same native/timer bridge and full context checks.
+# Upper argument registers are explicitly zero for the versioned authority ABI.
+.macro AUTH_ZERO
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    xor r9d, r9d
+.endm
+.global neu_authority_prepare, neu_authority_action
+neu_authority_prepare:
+    mov eax, 0x10
+    mov edi, 3
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov [rbp + 56], rdx
+    cmp r12, 2
+    je neu_authority_warm_b
+    cmp r12, 3
+    jne neu_authority_warm_a
+    test qword ptr [r15 + 96], 4
+    jz neu_authority_warm_a
+    mov rdi, [rbp + 48]
+    mov esi, 64
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov [rbp + 96], rdx
+neu_authority_warm_a:
+    mov rax, [0x410000]
+    mov [rbp + 64], rax
+    mov rax, [0x411000]
+    mov [rbp + 72], rax
+    jmp neu_authority_loop
+neu_authority_warm_b:
+    mov rax, [0x420000]
+    mov [rbp + 64], rax
+    mov rax, [0x421000]
+    mov [rbp + 72], rax
+    mov [0x430008], r13
+    mov [0x431008], r13
+neu_authority_loop:
+    movabs r8, 0x1122334455667788
+    xor ebx, ebx
+    jmp neu_smp_sched_user_loop_begin
+neu_authority_action:
+    cmp r12, 2
+    je neu_authority_receiver
+    cmp r12, 3
+    je neu_authority_sibling
+    test qword ptr [r15 + 96], 4
+    jz neu_authority_derive
+neu_authority_wait_registered:
+    cmp qword ptr [r15 + 80], 2
+    jne neu_authority_wait_registered
+    mov rdi, [rbp + 48]
+    xor esi, esi
+    AUTH_ZERO
+    mov eax, 0x1a
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    cmp rdx, 1
+    jne neu_smp_sched_bad
+    mov [rbp + 112], rdx
+neu_authority_derive:
+    mov rdi, [rbp + 56]
+    mov esi, 0x105            # READ | MAP | DERIVE
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov [rbp + 96], rdx
+    mov rdi, rdx
+    mov esi, 2                # WRITE amplification must fail
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    cmp rax, -18
+    jne neu_smp_sched_bad
+    test rdx, rdx
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    mov rdi, [rbp + 96]
+    mov esi, 1
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov [rbp + 120], rdx
+    mov rdi, rdx              # no DERIVE on this descendant
+    mov esi, 1
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    cmp rax, -18
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    mov rdi, [rbp + 120]
+    mov eax, 0x11
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov rdi, [rbp + 96]
+    mov eax, 0x11
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov rdi, [rbp + 56]
+    mov esi, 0x400            # unknown authority bit
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    cmp rax, -18
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    mov rdi, [rbp + 56]
+    mov esi, 1
+    AUTH_ZERO
+    mov r9d, 1               # reserved ABI input
+    mov eax, 0x19
+    syscall
+    cmp rax, -2
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    test qword ptr [r15 + 96], 1
+    jz neu_authority_revoke
+    mov rdi, [rbp + 56]
+    mov esi, 13               # READ | MAP | TRANSFER
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov rsi, rdx
+    mov rdi, [rbp + 48]
+    mov eax, 0x17
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+neu_authority_revoke:
+    mov rdi, [rbp + 56]
+    xor esi, esi
+    AUTH_ZERO
+    mov eax, 0x1a
+    syscall
+.global neu_authority_revoke_resume
+neu_authority_revoke_resume:
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov [rbp + 88], rdx
+    mov ecx, 1
+    test qword ptr [r15 + 96], 8
+    jz neu_authority_rederive_count
+    mov ecx, 16
+neu_authority_rederive_count:
+    mov [rbp + 96], rcx
+neu_authority_rederive:
+    mov rdi, [rbp + 56]
+    mov esi, 5
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov rdi, rdx
+    mov eax, 0x11
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    dec qword ptr [rbp + 96]
+    jnz neu_authority_rederive
+    mov qword ptr [r15 + 64], 1
+    test qword ptr [r15 + 96], 2
+    jnz neu_smp_sched_user_done
+    mov qword ptr [r15 + 16], 1
+    jmp neu_smp_sched_user_sibling_loop
+neu_authority_sibling:
+    test qword ptr [r15 + 96], 16
+    jnz neu_authority_pending_fault_wait
+    test qword ptr [r15 + 96], 4
+    jz neu_authority_sibling_wait
+    mov rdi, [rbp + 96]
+    mov eax, 0x16
+    syscall
+    cmp rax, -38
+    jne neu_smp_sched_bad
+    test rdx, rdx
+    jne neu_smp_sched_bad
+    mov [rbp + 88], rax
+neu_authority_sibling_wait:
+    cmp qword ptr [r15 + 64], 1
+    jne neu_authority_sibling_wait
+    test qword ptr [r15 + 96], 2
+    jnz neu_smp_sched_user_done
+    mov eax, 0x410010
+.global neu_authority_fault_site
+neu_authority_fault_site:
+    mov qword ptr [rax], 255   # a completed revoke must cause user #PF, error 6
+    jmp neu_smp_sched_bad
+neu_authority_receiver:
+    cmp qword ptr [r15 + 64], 1
+    jne neu_authority_receiver
+    movabs rdi, 0x200000002  # delivered descendant was purged from Node B
+    mov esi, 1
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    cmp rax, -17
+    jne neu_smp_sched_bad
+    mov [rbp + 88], rax
+    mov rax, [0x430008]
+    cmp rax, r13
+    jne neu_smp_sched_bad
+    mov rax, [0x431008]
+    cmp rax, r13
+    jne neu_smp_sched_bad
+    mov [rbp + 80], rax
+    mov rdi, [rbp + 56]
+    mov esi, 5
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    mov rdi, rdx
+    mov eax, 0x11
+    syscall
+    test rax, rax
+    jne neu_smp_sched_bad
+    test qword ptr [r15 + 96], 1
+    jz neu_authority_receiver_done
+    mov rdi, [rbp + 48]
+    mov eax, 0x18
+    syscall
+    cmp rax, -32
+    jne neu_smp_sched_bad
+    mov [rbp + 112], rax
+neu_authority_receiver_done:
+    test qword ptr [r15 + 96], 2
+    jnz neu_smp_sched_user_done
+    jmp neu_smp_sched_user_survivor_wait
+neu_authority_pending_fault_wait:
+    cmp qword ptr [r15 + 112], 1
+    jne neu_authority_pending_fault_wait
+    mov eax, 0x440000
+.global neu_authority_pending_fault_site
+neu_authority_pending_fault_site:
+    mov qword ptr [rax], 255   # cancels requester while its revoke is pending
+    jmp neu_smp_sched_bad
+neu_authority_disabled:
+    mov rdi, [rbp + 56]
+    mov esi, 1
+    AUTH_ZERO
+    mov eax, 0x19
+    syscall
+    cmp rax, -1
+    jne neu_smp_sched_bad
+    test rdx, rdx
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    mov rdi, [rbp + 56]
+    xor esi, esi
+    AUTH_ZERO
+    mov eax, 0x1a
+    syscall
+    cmp rax, -1
+    jne neu_smp_sched_bad
+    test rdx, rdx
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    jmp neu_smp_sched_user_done
 neu_smp_sched_payload_end:

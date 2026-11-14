@@ -71,3 +71,10 @@ The first full attempt and its failed preemption capture remain preserved.
 [Implementation status](IMPLEMENTATION_STATUS.md#execution-profiles-and-independent-acceptance)
 records the strictly bounded user/kernel timer-accounting correction and the
 successful replacement run. K10 derivation/revocation is the next milestone.
+
+## Successor — 2026-11-14
+
+[K10 advanced authority](K10_COMPLETION.md) is now complete for its bounded
+x86-64/QEMU scope, extending K9 with explicit derivation, strict descendant
+revocation and tracked mapping retirement. This document retains K9's original
+acceptance counts and ABI 0.5 scope. K11 device primitives are now next.

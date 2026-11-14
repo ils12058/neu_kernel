@@ -26,11 +26,17 @@ CASES = {
     "smp-tlb-2": 2,
     "smp-tlb-4": 4,
     "smp-tlb-invalid": 2,
+    "smp-authority-disabled": 2,
 }
+AUTHORITY = {"smp-authority-2": 2, "smp-authority-4": 4, "smp-authority-queued": 4,
+             "smp-authority-close": 2, "smp-authority-wait": 4, "smp-authority-stress": 4,
+             "smp-authority-terminate": 4}
+CASES.update(AUTHORITY)
+AUTHORITY_FAULT = {"smp-authority-2", "smp-authority-4", "smp-authority-queued", "smp-authority-terminate"}
 MIGRATE = {"smp-schedule-migrate", "smp-schedule-stress"}
 IPC = {"smp-schedule-idle", "smp-schedule-ipc"}
 TLB = {"smp-tlb-2", "smp-tlb-4", "smp-tlb-invalid"}
-CPU_FAULT = TLB | {"smp-schedule-fault"}
+CPU_FAULT = TLB | {"smp-schedule-fault"} | AUTHORITY_FAULT
 FAULT = CPU_FAULT | {"smp-schedule-reject"}
 MAGIC = 0x4E45555F53434831
 LAYOUT = [MAGIC, 4, 64, 832, 512, 672, 256, 32, 256]
@@ -120,6 +126,10 @@ class Observer:
         self.concurrent = self.blocked = self.migrated = self.quiesced = False
         self.negatives = False
         self.runtime_checks = 0
+        self.authority_extension = None
+        if case in AUTHORITY:
+            from authority_qmp import Extension
+            self.authority_extension = Extension(self)
 
     def require(self, condition, message):
         if not condition:
@@ -151,7 +161,7 @@ class Observer:
 
     def inventory(self, memory, physical, descriptor):
         d = descriptor
-        self.require(d[0] == 1 and d[3] == 16 and d[11] == 64 and d[20] == 4
+        self.require(d[0] == 1 and d[3] == (18 if self.authority_extension else 16) and d[11] == 64 and d[20] == 4
                      and d[28] == 2 and d[34:38] == [16, 16, 24, 24], "unknown paging schema")
         frames = []
         for index in range(d[3]):
@@ -161,6 +171,7 @@ class Observer:
                                "generation": raw64(row, d[5]), "initialized": row[d[7]],
                                "owner_kind": raw64(row, d[8]), "owner": space_raw(row, d[8] + 8)})
         mappings = []
+        authority_offsets = self.authority_extension.mapping_offsets(memory) if self.authority_extension else None
         for index in range(d[11]):
             row = memory.read(d[9] + index * d[10], d[10])
             if row[d[17]]:
@@ -168,14 +179,23 @@ class Observer:
                                  "address": raw64(row, d[13]), "frame": list(struct.unpack_from("<QQ", row, d[14])),
                                  "write": row[d[15]], "execute": row[d[15] + 1],
                                  "object": raw64(row, d[16])})
+                if authority_offsets is not None:
+                    mappings[-1].update({"object_id": space_raw(row, d[16] + 8),
+                                         "grant": raw64(row, authority_offsets[0]),
+                                         "revoke_epoch": raw64(row, authority_offsets[1]),
+                                         "revoke_targets": raw64(row, authority_offsets[2])})
         spaces = []
         for index in range(d[28]):
             row = memory.read(d[26] + index * d[27], d[27])
             spaces.append({"slot": index, "generation": raw64(row, d[29]), "live": row[d[30]],
                            "root": raw64(row, d[31]), "pins": row[d[32]], "refs": row[d[33]]})
-        for index in range(d[20]):
-            row = memory.read(d[18] + index * d[19], d[19])
-            self.require(not row[d[22]] and not row[d[23]] and not row[d[38]], "unexpected MemoryObject lifetime")
+        memory_objects = []
+        if self.authority_extension:
+            memory_objects = self.authority_extension.memory_objects(memory, d)
+        else:
+            for index in range(d[20]):
+                row = memory.read(d[18] + index * d[19], d[19])
+                self.require(not row[d[22]] and not row[d[23]] and not row[d[38]], "unexpected MemoryObject lifetime")
         allocator = d[40:48]
         total, free = memory.u64(allocator[0]), memory.u64(allocator[1])
         bitmap = memory.read(allocator[2], ((total + 63) // 64) * 8)
@@ -215,20 +235,28 @@ class Observer:
         self.require(len(set(addresses)) == len(addresses) and all(allocated(a) for a in addresses),
                      "duplicate or unallocated frame/table ownership")
         self.require(total - free == len(addresses), "allocated page has no raw frame/table owner")
-        self.require(all(f["initialized"] == 1 and f["owner_kind"] == 0 for f in frames),
+        self.require(all(f["initialized"] == 1 and (f["owner_kind"] == 0 or
+                         self.authority_extension and f["owner_kind"] == 1 and
+                         any(o["id"] == f["owner"] for o in memory_objects)) for f in frames),
                      "uninitialized or foreign private frame")
         for mapping in mappings:
             owner = next((f for f in frames if f["slot"] == mapping["frame"][0]
                           and f["generation"] == mapping["frame"][1]), None)
-            self.require(owner is not None and owner["owner"] == mapping["space"] and mapping["object"] == 0,
+            private = owner is not None and owner["owner_kind"] == 0 and owner["owner"] == mapping["space"] and mapping["object"] == 0
+            shared = self.authority_extension and owner is not None and owner["owner_kind"] == 1 and mapping["object"] == 1 and owner["owner"] == mapping["object_id"]
+            self.require(private or shared,
                          "mapping refers to stale or foreign backing")
             root = spaces[(mapping["space"] & 0xFF) - 1]["root"]
             flags = P | (W if mapping["write"] else 0) | (0 if mapping["execute"] else NX)
             walk = self.leaf(physical, root, mapping["address"])
-            self.require(walk["present"] and walk["leaf"] & PA == owner["physical"]
-                         and walk["leaf"] & (P | W | NX) == flags, "registry mapping disagrees with the actual PTE")
+            if mapping.get("revoke_epoch"):
+                self.require(shared and mapping["grant"] and mapping["revoke_targets"] == (1 << self.cpus) - 1
+                             and not walk["present"], "pending revocation does not retain a removed mapping")
+            else:
+                self.require(walk["present"] and walk["leaf"] & PA == owner["physical"]
+                             and walk["leaf"] & (P | W | NX) == flags, "registry mapping disagrees with the actual PTE")
         for frame in frames:
-            self.require(any(m["frame"] == [frame["slot"], frame["generation"]] for m in mappings),
+            self.require(frame["owner_kind"] == 1 or any(m["frame"] == [frame["slot"], frame["generation"]] for m in mappings),
                          "live private frame has no mapping owner")
         table_by_address = {t["physical"]: t for t in tables}
         reachable = set()
@@ -252,7 +280,8 @@ class Observer:
         self.require(reachable == set(table_by_address), "allocated page-table inventory is not reachable from owned roots")
         return {"total": total, "free": free, "allocated": total - free,
                 "bitmap": bitmap.hex(), "bitmap_sha256": hashlib.sha256(bitmap).hexdigest(),
-                "frames": frames, "mappings": mappings, "spaces": spaces, "tables": tables}
+                "frames": frames, "mappings": mappings, "spaces": spaces, "tables": tables,
+                "memory_objects": memory_objects}
 
     def frame_valid(self, frame, slot, interrupted=False):
         self.require(len(frame) == 20 and CODE <= frame[15] < CODE + 4096
@@ -407,8 +436,10 @@ class Observer:
                 "counters": counters, "stop": queues[56:62]}
 
     def authority(self, memory, scheduler, phase):
+        if self.authority_extension:
+            return self.authority_extension.authority(memory, scheduler, phase)
         d = self.array(memory, "neu_smp_sched_authority", 128)
-        self.require(d[0] == 1 and d[3] == 6 and d[13:17] == [8, 8, 1, 1], "unknown capability object schema")
+        self.require(d[0] == 1 and d[3] == 6 and d[13:17] == [8, 8, 1, 2], "unknown capability object schema")
         objects = []
         for slot in range(6):
             row = memory.read(d[4] + slot * d[5], d[5])
@@ -426,7 +457,7 @@ class Observer:
                 if row[table[7]]:
                     entries.append({"slot": slot, "generation": raw32(row, table[6]),
                                     "kind": row[table[8]], "target": raw64(row, table[9]),
-                                    "rights": row[table[10]], "transferable": row[table[11]]})
+                                    "rights": int.from_bytes(row[table[10]:table[10]+2], "little"), "transferable": row[table[11]]})
             handles.append(entries)
             node_fields = d[120 + index * 4:124 + index * 4]
             raw_id = (memory.u32(node_fields[1]) << 32) | (memory.u64(node_fields[0]) + 1)
@@ -456,7 +487,7 @@ class Observer:
                 transfer = base + channel[17] + slot * channel[18]
                 is_live = memory.byte(transfer + channel[19])
                 target = memory.u64(transfer + channel[20])
-                rights = memory.byte(transfer + channel[21])
+                rights = int.from_bytes(memory.read(transfer + channel[21], 2), "little")
                 owned = memory.byte(transfer + channel[22])
                 if is_live:
                     self.require((slot + 2 - head) % 2 < length and target and owned,
@@ -571,6 +602,8 @@ class Observer:
             expected_leaves = {0, 1, 2, 23} | {(USTACK[slot] - CODE) // 4096 for slot in members}
             if index == 0 and self.case in TLB:
                 expected_leaves.add(16)
+            if self.authority_extension:
+                expected_leaves |= {16, 17} if index == 0 else {32, 33, 48, 49}
             self.require({i for i, e in enumerate(leaves) if e & P} == expected_leaves,
                          "user root contains an unregistered page or extra alias")
             device = self.leaf(physical, root, 0xFFFFB00000000000)
@@ -588,7 +621,7 @@ class Observer:
                              and not self.leaf(physical, root, USTACK[slot] + 4096)["present"]
                              and not self.leaf(physical, root, KSTACK[slot] - 4096)["present"]
                              and not self.leaf(physical, root, KSTACK[slot] + 8192)["present"], "Thread stack guard is mapped")
-            self.require(not self.leaf(physical, root, 0x420000)["present"], "unmapped user probe is present")
+            self.require(not self.leaf(physical, root, 0x440000 if self.authority_extension else 0x420000)["present"], "unmapped user probe is present")
             kernel_text = self.leaf(physical, root, self.symbol("__text_start"))
             self.require(kernel_text["present"] and all(not raw & U for _, _, raw in kernel_text["chain"]), "kernel image exposed to Ring 3")
         self.require(data_pages[0] != data_pages[1], "unrelated Nodes share private DATA backing")
@@ -608,6 +641,11 @@ class Observer:
                 if local[probe] != 1 or cpu in dest:
                     continue
                 regs = live[cpu]
+                # Publication precedes the call by a few instructions. Only
+                # accept the real wait window; terminal acceptance still
+                # requires every mandatory hardware-frame observation.
+                if not self.symbol("neu_smp_sched_probe_begin") <= regs["rip"] < self.symbol("neu_smp_sched_probe_end"):
+                    continue
                 self.require(self.symbol("neu_smp_sched_probe_begin") <= regs["rip"] < self.symbol("neu_smp_sched_probe_end")
                              and regs["cpl"] == 0 and not regs["rfl"] & 0x600
                              and regs["cr3"] == local[7] and regs["gs"] == 0,
@@ -647,13 +685,16 @@ class Observer:
         if self.case in FAULT:
             for cpu in range(self.cpus):
                 if cpu_words[cpu][53] == 2 and not self.quiesced:
+                    if not self.symbol("neu_smp_sched_probe_begin") <= live[cpu]["rip"] < self.symbol("neu_smp_sched_probe_end"):
+                        continue
                     self.require(self.symbol("neu_smp_sched_probe_begin") <= live[cpu]["rip"] < self.symbol("neu_smp_sched_probe_end"),
                                  "quiescence checkpoint is not at the pre-commit fault wait")
                     origin = THREADS[2]
                     active = scheduler["active"]
                     self.require(any(a["thread"] == origin and a["cpu"] == cpu for a in active)
                                  and all(a["thread"] != THREADS[0] for a in active)
-                                 and scheduler["threads"][0]["state"] == 5 and scheduler["threads"][2]["state"] == 3,
+                                 and scheduler["threads"][0]["state"] == (4 if self.case == "smp-authority-terminate" else 5)
+                                 and scheduler["threads"][2]["state"] == 3,
                                  "fault commits while a sibling still owns an execution slot")
                     self.quiesced = True
                     self.output.append({"stage": "fault-quiesced", "registers": live, "scheduler": scheduler})
@@ -662,8 +703,10 @@ class Observer:
         return CODE + self.symbol(name) - self.symbol("neu_smp_sched_payload")
 
     def terminal(self, memory, physical, live, cpu_words, scheduler, authority, inventory, evidence):
+        if self.authority_extension:
+            self.authority_extension.terminal(memory, physical, cpu_words, scheduler, authority, inventory, evidence)
         self.require(scheduler["counters"][0] >= 40 and scheduler["counters"][1] >= 40
-                     and scheduler["counters"][5] == 3 and not scheduler["active"]
+                     and scheduler["counters"][5] == (2 if self.case == "smp-authority-terminate" else 3) and not scheduler["active"]
                      and all(not q for q in scheduler["queues"]), "scheduler did not preempt and terminate three Threads")
         probes_required = self.case != "smp-schedule-stress"
         self.require((not probes_required or set(self.native) == set(self.irq) == {0, 1}) and self.concurrent,
@@ -676,16 +719,21 @@ class Observer:
             self.require(authority["counters"]["sent"] == [2, 0] and authority["counters"]["received"] == [0, 2]
                          and authority["counters"]["discarded"] == [0, 0], "scalar/capability messages were lost or duplicated")
         if self.case in FAULT:
-            self.require(self.quiesced and evidence[56] != 0 and evidence[57:59] == [THREADS[2], 1], "missing cross-CPU fault containment")
+            self.require(self.quiesced and (evidence[56] == 0 if self.case == "smp-authority-terminate" else evidence[56] != 0)
+                         and evidence[57:59] == [THREADS[2], 1], "missing cross-CPU fault containment")
         data = [physical.words(self.prepared["data"][0 if slot != 1 else 1] + slot * 128, 16) for slot in range(3)]
         self.require([s["pins"] for s in inventory["spaces"]] == [2, 1]
                      and [s["refs"] for s in inventory["spaces"]] == [1, 1],
                      "terminal observation lost execution pins before all CPUs were stopped")
         for slot, row in enumerate(data):
-            self.require(row[0] > 0 and row[1] == 0x1122334455667788 and row[2] == 0x5000000FF
-                         and row[10] == 11 and row[7] != 0, "Thread lost progress/register canary/ABI/inspection result")
+            self.require(row[0] > 0 and row[1] == 0x1122334455667788
+                         and row[2] == (0x6000001FF if self.authority_extension else 0x5000000FF)
+                         and (self.authority_extension or row[10] == 11) and row[7] != 0,
+                         "Thread lost progress/register canary/ABI/inspection result")
             if self.case not in FAULT or slot == 1:
                 self.require(row[4] == slot + 1 and scheduler["threads"][slot]["words"][7:9] == [1, 128], "wrong normal Thread outcome")
+        if self.case == "smp-authority-disabled":
+            self.require(all(row[13] == 2 for row in data), "legacy ABI did not reject both authority operations on every Thread")
         if self.case == "smp-schedule-shared":
             shared = physical.word(self.prepared["data"][0] + 0x300)
             self.require(data[0][5] == data[2][5] == 8 and shared == data[0][0] + data[2][0],
@@ -770,17 +818,19 @@ class Observer:
                                      "rejection trace differs from the actual malformed normalized frame")
                         rejected.append({"cpu": cpu, "address": address, "normalized": normalized, "trace": row})
                 else:
+                    wanted_error = 6 if self.authority_extension else 7
+                    wanted_address = 0x440000 if self.case == "smp-authority-terminate" else (0x410010 if self.authority_extension else (0x410210 if self.case in TLB else self.symbol("__text_start")))
+                    wanted_site = "neu_authority_pending_fault_site" if self.case == "smp-authority-terminate" else ("neu_authority_fault_site" if self.authority_extension else ("neu_smp_sched_tlb_fault_site" if self.case in TLB else "neu_smp_sched_fault_site"))
                     self.require(self.case in CPU_FAULT and slot == 2 and row[4] == 14
-                                 and row[9] == 7
-                                 and row[5] == (0x410210 if self.case in TLB else self.symbol("__text_start"))
-                                 and row[25] == self.site("neu_smp_sched_tlb_fault_site" if self.case in TLB else "neu_smp_sched_fault_site"),
+                                 and row[9] == wanted_error and row[5] == wanted_address
+                                 and row[25] == self.site(wanted_site),
                                  "fault vector/error/CR2/site differs from the actual denied user access")
                     address = KSTACK[slot] + 8192 - 176
                     walked = self.leaf(physical, row[3], address)
                     self.require(walked["present"], "terminal fault's actual stack frame was reclaimed early")
                     normalized = physical.words((walked["leaf"] & PA) + (address & 4095), 22)
                     self.require(normalized[:15] + normalized[17:] == row[10:30]
-                                 and normalized[15:17] == [14, 7]
+                                 and normalized[15:17] == [14, wanted_error]
                                  and KSTACK[slot] <= row[6] < address,
                                  "fault trace differs from its actual normalized hardware frame")
                     self.frame_valid(row[10:30], slot, True)
@@ -805,7 +855,7 @@ class Observer:
                                  "full saved/resumed context changed outside ABI result registers")
                     self.require(entry[5] == int(previous[4] != 128), "resumed context lost IRQ/native mode")
                     if previous[4] == 128:
-                        self.native_result(previous[10:30], entry[10:30], slot)
+                        self.native_result(previous[10:30], entry[10:30], slot, cpu, previous[0])
                 boundaries = [row for row in traces[cpu] if row[0] == entry[0] and row[1] == thread]
                 self.require(boundaries, "entered user context has no actual boundary")
                 previous = boundaries[-1]
@@ -815,7 +865,9 @@ class Observer:
                             "rejected_returns": rejected,
                             "inventory": inventory, "evidence": evidence})
 
-    def native_result(self, before, after, slot):
+    def native_result(self, before, after, slot, cpu=None, entry=None):
+        if self.authority_extension:
+            return self.authority_extension.native_result(before, after, slot, cpu, entry)
         operation = before[14]
         status, value = after[14], after[11]
         if operation == 1:
@@ -831,6 +883,8 @@ class Observer:
         elif operation == 0x10 or operation == 0x18 and status == 0:
             self.require(status == 0 and value != 0, "bootstrap/received capability did not return a live handle")
             return
+        elif operation in (0x19, 0x1a) and self.case == "smp-authority-disabled":
+            wanted = ((-1 & MASK64), 0)
         elif operation == 0x18:
             wanted = ((-32 & MASK64), 0)
         else:
@@ -849,11 +903,22 @@ class Observer:
             return None
         self.require(owner == 0, "unlocked scheduler retained a lock owner")
         phase = evidence[1]
+        if phase != 0:
+            self.require(self.baseline is not None, "user execution began before an independent baseline")
+        if phase in (2, 3, 4):
+            self.require(self.prepared is not None, "execution passed an unobserved prepared checkpoint")
         if phase == 0 and self.baseline is not None:
             return phase
         if phase == 3 and any(item["stage"] == "terminal" for item in self.output):
             return phase
         live = [_user_registers(self.qmp, cpu, self.failure) for cpu in range(self.cpus)]
+        # The controller publishes baseline/prepared state before serial output
+        # and the wait call. Observe the actual boundary before reading its
+        # inventory; a later phase still fails if this checkpoint was missed.
+        if (phase == 0 or phase == 1 and self.prepared is None) and not (
+                self.symbol("neu_smp_sched_probe_begin") <= live[0]["rip"] <
+                self.symbol("neu_smp_sched_probe_end")):
+            return None
         cpu_words = [memory.words(self.symbol("neu_smp_sched_cpus") + cpu * 832, 64) for cpu in range(self.cpus)]
         blocks = [memory.words(self.symbol("neu_smp_cpus") + cpu * 384, 48) for cpu in range(self.cpus)]
         self.require(all(b[1] == cpu and b[3] == self.apics[cpu] for cpu, b in enumerate(blocks)), "actual CPU blocks disagree with QEMU APIC identities")
@@ -873,6 +938,8 @@ class Observer:
         self.require(self.baseline is not None, "user execution began before an independent baseline")
         scheduler = self.scheduler(memory, cpu_words, live, phase)
         authority = self.authority(memory, scheduler, phase)
+        if self.authority_extension:
+            self.authority_extension.observe(memory, physical, live, cpu_words, scheduler, authority, phase, evidence)
         self.runtime_checks += 1
         if phase == 1 and self.prepared is None:
             self.require(self.symbol("neu_smp_sched_probe_begin") <= live[0]["rip"] < self.symbol("neu_smp_sched_probe_end"), "prepared resources missed the checkpoint")
@@ -963,6 +1030,7 @@ class Observer:
         self.require(len(fast) == self.cpus and set(identities.values()) == set(range(self.cpus)), "wrong QEMU CPU topology")
         self.apics = {cpu: apic for apic, cpu in identities.items()}
         self.require(self.qmp.call("query-status")["running"], "QEMU was not running before observation")
+        attempts = 0
         while time.monotonic() < self.deadline:
             self.qmp.call("stop")
             self.require(not self.qmp.call("query-status")["running"], "QMP did not stop every CPU")
@@ -976,8 +1044,17 @@ class Observer:
                         "negative_checks": 22 if self.negatives else 0,
                         "baseline_bitmap_sha256": self.baseline["inventory"]["bitmap_sha256"],
                         "checkpoints": self.output}
-            time.sleep(0.02)
+            time.sleep(observation_delay(attempts, self.concurrent))
+            attempts += 1
         raise self.failure("SMP scheduler QMP exceeded the unchanged guest test deadline")
+
+
+def observation_delay(attempt, concurrent_seen):
+    # CPU0 alternates two runnable Threads on 10 ms quanta. A fixed 20 ms
+    # sampling interval can repeatedly stop the unrelated Thread and miss
+    # actual same-Node overlap. Vary the phase until both CPL3 owners are seen;
+    # the required witness and the overall guest deadline remain unchanged.
+    return 0.02 if concurrent_seen else (0.003, 0.007, 0.011)[attempt % 3]
 
 
 def observe(qmp, case, symbols, deadline, failure, output):

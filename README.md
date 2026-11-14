@@ -5,65 +5,59 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-**K9 / Phase 9 (9A–9D) is complete for bounded x86-64/QEMU SMP:** at most
-four CPUs, two Nodes and three Threads. In the scheduled SMP images, every
-CPU runs the same synchronized scheduler with a local FIFO queue, explicit
-Thread ownership and affinity. Same-Node Threads run concurrently through
-one root and capability table with separate guarded stacks. Native syscall
-and calibrated 10 ms LAPIC timer boundaries preserve full integer contexts.
+**K10 / Advanced authority is complete for bounded x86-64/QEMU:** at most
+four CPUs, two Nodes and three Threads. Explicit DERIVE/REVOKE rights support
+fresh Node-local handles with exact rights subsets and revocation of strict
+descendants. The source, outside branches and independently granted authority
+survive. Cross-Node delegation uses the existing atomic Channel move.
 
-Shared lifecycle, capability and Channel transactions use one explicit lock
-with IF=0; IRQ handlers publish CPU-local state without acquiring that lock.
-Queued work migrates with its saved context, and blocked Channel continuations
-wake exactly once through generation-checked IPI/idle transitions. The BSP
-owns allocation, root preparation, final teardown and serial.
+Revocation purges affected handles and queued transfers, cancels blocked
+operations and removes affected MemoryObject mappings. Mapping provenance and
+backing survive handle close and remain owned until every online CPU completes
+its actual TLB invalidation. A cancelled requester cannot abandon pending
+reclamation. Independent mappings and their data remain usable.
 
-Node faults and unsafe user return frames quiesce running siblings before
-reclamation while an unrelated Node completes. A live write-permission change
-uses an epoch-bound remote TLB protocol: every target executes its actual
-invalidation or root flush before acknowledging. Final teardown restores the
-exact allocator bitmap and original page-table inventory, with zero remaining
-user roots, pins, references, authority or waiters.
+K9 supplies synchronized per-CPU FIFO scheduling, concurrent same-Node Threads,
+saved-context migration, native/timer entry, idle/IPI wakeups and Node-fault
+quiescence. Shared authority, Channel and lifecycle transactions run under one
+explicit lock with IF=0; IRQ handlers publish CPU-local state without taking
+that lock. Allocation, root preparation and final teardown remain BSP-owned.
+K8 supplies shared MemoryObjects and suspended runtime mapping at safe points.
 
-K8 / Phase 8C supplies runtime mapping from a received MemoryObject capability
-at a scheduler safe point. K7 capability movement and Channel behavior retain
-their contracts in [ADR 0020](docs/adr/0020-atomic-capability-moves.md) and
-[ADR 0021](docs/adr/0021-capability-transfer-lifecycle-hardening.md);
-[ADR 0025](docs/adr/0025-runtime-memoryobject-mapping.md) covers the suspended
-runtime mapping boundary and terminal cancellation.
+Current validation passes **324 Rust host tests in both default and authority
+configurations, 29 Python observer tests and 189 registered QEMU executions**,
+plus **five focused authority repeats using identical kernel images**.
+Formatting, all profile/host-library clippy checks and the default build pass.
+All tested image hashes match their manifests. Every scheduled profile restores
+the exact allocator bitmap and original table inventory, with zero final user
+roots, references, pins, authority, mappings or waits.
 
-Current validation passes **306 Rust host tests, eight Python observer tests
-and 181 registered QEMU executions**, plus **five focused SMP repeats**.
-Formatting, every-feature/host-library clippy and the default build pass;
-the default kernel image matches the full regression's boot image. Live,
-transfer, runtime and every SMP profile require stopped-CPU QMP evidence.
-[Implementation status](docs/IMPLEMENTATION_STATUS.md) records the accepted
-evidence and preserved observer correction;
-[the K9 completion contract](docs/K9_COMPLETION.md) defines the bounded scope.
+[The K10 completion contract](docs/K10_COMPLETION.md) records the accepted
+scope, evidence hashes and preserved validation corrections.
+[Implementation status](docs/IMPLEMENTATION_STATUS.md),
+[ADR 0030](docs/adr/0030-bounded-capability-derivation-and-revocation.md) and
+[the authority QMP protocol](docs/testing/authority-qmp.md) cover lineage,
+mapping retirement and independent hardware observations.
+[ADR 0029](docs/adr/0029-bounded-scheduled-smp.md) and
+[the SMP QMP protocol](docs/testing/smp-qmp.md) retain K9's execution contract;
+[the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) covers K8.
 
-[ADR 0029](docs/adr/0029-bounded-scheduled-smp.md) covers scheduled SMP,
-shared transactions, migration, fault quiescence and remote invalidation.
-Earlier contracts remain in [ADR 0028](docs/adr/0028-static-smp-user-execution.md)
-for static Ring 3 placement,
-[ADR 0027](docs/adr/0027-smp-crosscpu-work-and-coordination.md) for work/IPI
-coordination, and
-[ADR 0026](docs/adr/0026-smp-bootstrap-and-percpu-foundations.md) for bootstrap.
-[The SMP QMP protocol](docs/testing/smp-qmp.md) and
-[the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) explain the
-raw production-state checks.
-
-Architecture v0.2 and [experimental ABI 0.5](docs/abi/experimental-v0.5.md)
-remain the baselines. The execution model uses fixed metadata pools, guarded
-private Thread stacks, integer execution and non-preemptible kernel
-transactions. **K10 capability derivation/revocation is next.** Work stealing,
-load balancing, general kernel preemption, arbitrary AP allocation, public
-MemoryObject/mapping/Thread-creation APIs, TLS/FPU/SIMD scheduling, physical
-hardware, COW and demand paging remain later work.
+Architecture v0.2 remains the baseline. Authority profiles implement
+[experimental ABI 0.6](docs/abi/experimental-v0.6.md); earlier profiles retain
+their existing versions and reject the new operations. The execution model
+uses fixed metadata pools, guarded private Thread stacks, integer execution
+and non-preemptible kernel transactions. **K11 device primitives are next:**
+selected userspace driver support with authorized MMIO/IRQ access. Untrusted
+DMA requires suitable isolation. General object/mapping/Thread factories,
+work stealing, load balancing, kernel preemption, arbitrary AP allocation,
+TLS/FPU/SIMD scheduling, physical hardware, COW and demand paging remain later
+work.
 
 Default and legacy images boot one vCPU; SMP profiles select 1, 2 or 4.
-Normal profiles use 512 MiB and the longer four-CPU stress profile uses 1 GiB.
-The verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF, Rust 1.95.0 and
-Limine 12.9.4/base 6 on Apple Silicon.
+Normal profiles use 512 MiB and the longer K9 four-CPU scheduling stress profile
+uses 1 GiB. The verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF,
+Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon. Validation is local;
+physical hardware and hosted CI have not been exercised.
 
 ## Build and run
 
@@ -177,6 +171,17 @@ actual permission removal, remote invalidation and a denied hardware store.
 `--case smp-tlb-invalid` checks 22 inert mapping/coordinator rejections before
 the real transaction. Every scheduled profile requires independent CPU,
 frame, queue, authority and final allocator/table evidence.
+
+Run `python3 tools/neu.py test --case smp-authority-2` or `--case smp-authority-4`
+for Ring 3 derivation/revocation, four mapping retirements and denied stale
+hardware access. `--case smp-authority-queued` checks discarded delegation;
+`--case smp-authority-close` checks mappings that outlive their handle;
+`--case smp-authority-wait` checks revoked blocked operations; and
+`--case smp-authority-stress` repeats derivation after revoke.
+`--case smp-authority-terminate` cancels the blocked requester through a real
+sibling fault and requires reclamation to finish. `--case smp-authority-disabled`
+checks ABI 0.5 rejection. Every page/CPU invalidation requires an actual
+post-instruction, pre-ACK observation, followed by exact final conservation.
 
 ## Documentation
 

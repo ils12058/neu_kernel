@@ -48,6 +48,7 @@ struct TransferSlot {
     live: bool,
     object: crate::capability::ObjectId,
     rights: crate::capability::Rights,
+    grant: crate::capability::GrantId,
     owned: Option<OwnedTransfer>,
 }
 impl TransferSlot {
@@ -55,6 +56,7 @@ impl TransferSlot {
         live: false,
         object: crate::capability::ObjectId::EMPTY,
         rights: crate::capability::Rights::NONE,
+        grant: crate::capability::GrantId::NONE,
         owned: None,
     };
 }
@@ -90,12 +92,17 @@ impl Fifo {
                     || self.values[slot] != 0
                     || transfer.owned.is_none()
                     || transfer.object == crate::capability::ObjectId::EMPTY
+                    || transfer.owned.as_ref().is_some_and(|t| {
+                        t.grant != transfer.grant
+                            || t.description() != (transfer.object, transfer.rights)
+                    })
                 {
                     return Err(Error::Terminal);
                 }
             } else if transfer.owned.is_some()
                 || transfer.object != crate::capability::ObjectId::EMPTY
                 || transfer.rights != crate::capability::Rights::NONE
+                || transfer.grant != crate::capability::GrantId::NONE
             {
                 return Err(Error::Terminal);
             }
@@ -306,6 +313,7 @@ impl Channels {
             live: true,
             object,
             rights,
+            grant: transfer.grant,
             owned: Some(transfer),
         };
         q.values[slot] = 0;
@@ -392,6 +400,58 @@ impl Channels {
             self.live = false;
         }
         Ok(transfers.map(|mut slot| slot.owned.take()))
+    }
+    pub(crate) fn preflight_discard(&self) -> Result<()> {
+        for (side, q) in self.queues.iter().enumerate() {
+            q.validate()?;
+            self.discarded[side]
+                .checked_add(q.len)
+                .ok_or(Error::Capacity)?;
+        }
+        Ok(())
+    }
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn grant_offset() -> u64 {
+        core::mem::offset_of!(TransferSlot, grant) as u64
+    }
+    /// Remove selected authority without reordering surviving FIFO messages.
+    pub(crate) fn discard_revoked(
+        &mut self,
+        revoked: impl Fn(crate::capability::GrantId) -> bool,
+    ) -> Result<[Option<OwnedTransfer>; MESSAGES * 2]> {
+        self.preflight_discard()?;
+        let mut result = [const { None }; MESSAGES * 2];
+        let mut count = 0;
+        for side in 0..2 {
+            let q = &self.queues[side];
+            if !q
+                .transfers
+                .iter()
+                .any(|s| s.owned.as_ref().is_some_and(|t| revoked(t.grant)))
+            {
+                continue;
+            }
+            let mut old = core::mem::replace(&mut self.queues[side], Fifo::EMPTY);
+            let q = &mut self.queues[side];
+            q.head = old.head;
+            q.tail = old.head;
+            for offset in 0..old.len as usize {
+                let source = (old.head as usize + offset) % MESSAGES;
+                let entry = core::mem::replace(&mut old.transfers[source], TransferSlot::EMPTY);
+                if entry.owned.as_ref().is_some_and(|t| revoked(t.grant)) {
+                    result[count] = entry.owned;
+                    count += 1;
+                    self.discarded[side] += 1;
+                } else {
+                    let destination = q.tail as usize;
+                    q.values[destination] = old.values[source];
+                    q.transfers[destination] = entry;
+                    q.tail = (q.tail + 1) % MESSAGES as u64;
+                    q.len += 1;
+                }
+            }
+        }
+        Ok(result)
     }
     #[cfg(test)]
     fn retire(&mut self, reference: EndpointRef) -> Result<()> {

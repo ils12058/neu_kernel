@@ -2,6 +2,11 @@
 //! reference accounting stay in this kernel-owned registry. No public factory.
 use crate::node::{ActiveContext, NodeId};
 use crate::wait::{Kind, WAITERS, Waiter, Waits};
+mod authority;
+mod mapping;
+pub use authority::{GRANTS, GrantId, Revocation};
+use authority::{Lineage, Use};
+pub use mapping::{MapPermit, MapRequest, MappingBinding, TrackedMapAuthority};
 pub const HANDLES: usize = 8;
 pub const OBJECTS: usize = 4;
 pub const CHANNEL_OBJECTS: usize = 6;
@@ -30,7 +35,7 @@ impl ObjectType {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Rights(u8);
+pub struct Rights(u16);
 impl Rights {
     pub const READ: Self = Self(1);
     pub const WRITE: Self = Self(2);
@@ -43,25 +48,42 @@ impl Rights {
     pub const RECEIVE: Self = Self(64);
     pub const SEND_RECEIVE: Self = Self(96);
     pub const SEND_CAPS: Self = Self(128);
+    pub const DERIVE: Self = Self(256);
+    pub const REVOKE: Self = Self(512);
     pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
         if bits == 0 || bits & !0x7f != 0 {
             Err(Error::Rights)
         } else {
-            Ok(Self(bits as u8))
+            Ok(Self(bits as u16))
         }
+    }
+    /// The authority ABI has its own decoder; legacy rights decoding is kept.
+    pub fn from_authority_bits(bits: u64) -> Result<Self> {
+        if bits == 0 || bits & !0x3ff != 0 {
+            Err(Error::Rights)
+        } else {
+            Ok(Self(bits as u16))
+        }
+    }
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
     pub fn bits(self) -> u64 {
         self.0 as u64
     }
     fn valid(self, kind: ObjectType) -> bool {
+        if self.0 & !0x3ff != 0 {
+            return false;
+        }
+        let access = self.0 & 0xff;
         match kind {
             ObjectType::None => false,
-            ObjectType::Counter => self.0 != 0 && self.0 & !3 == 0,
-            ObjectType::Flag => self.0 == 1,
-            ObjectType::AddressSpace => self.0 & !16 == 0,
-            ObjectType::ChannelEndpoint => self.0 != 0 && self.0 & !224 == 0,
-            ObjectType::MemoryObject => self.0 != 0 && self.0 & !0x0f == 0,
+            ObjectType::Counter => access != 0 && access & !3 == 0,
+            ObjectType::Flag => access == 1,
+            ObjectType::AddressSpace => access & !16 == 0,
+            ObjectType::ChannelEndpoint => access != 0 && access & !224 == 0,
+            ObjectType::MemoryObject => access != 0 && access & !0x0f == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -138,6 +160,7 @@ pub enum Error {
     Terminal = -35,
     MessageKind = -36,
     Transfer = -37,
+    Revoked = -38,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +241,7 @@ pub struct ObjectRef {
 pub(crate) struct OwnedTransfer {
     reference: ObjectRef,
     rights: Rights,
+    pub(crate) grant: GrantId,
 }
 impl OwnedTransfer {
     pub(crate) fn description(&self) -> (ObjectId, Rights) {
@@ -251,6 +275,8 @@ pub struct Objects {
     /// never grow without limit; a full pending array leaves the dead slot
     /// occupied until the next architecture reap.
     pending: [Option<crate::paging::MemoryObjectRef>; CHANNEL_OBJECTS],
+    lineage: Lineage,
+    mappings: [MappingBinding; crate::paging::MAPPINGS],
 }
 impl Default for Objects {
     fn default() -> Self {
@@ -265,6 +291,8 @@ impl Objects {
             channels: crate::channel::Channels::new(),
             waits: Waits::new(),
             pending: [const { None }; CHANNEL_OBJECTS],
+            lineage: Lineage::new(),
+            mappings: [MappingBinding::EMPTY; crate::paging::MAPPINGS],
         }
     }
     pub const fn with_channels() -> Self {
@@ -335,6 +363,49 @@ impl Objects {
     }
     pub fn queued_references(&self) -> u32 {
         self.channels.queued_capabilities()
+    }
+    pub fn live_grants(&self) -> usize {
+        self.lineage.live()
+    }
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn authority_wait_grants(&self) -> [u64; WAITERS] {
+        self.waits.authority_grants()
+    }
+    pub fn finish_revoke(&mut self, ticket: &Revocation) -> Result<usize> {
+        self.lineage.finish(ticket)
+    }
+    pub fn revoke_selects(&self, ticket: &Revocation, grant: GrantId) -> Result<bool> {
+        self.lineage.selected(ticket, grant)
+    }
+    pub fn purge_revoked_operations(&mut self) -> Result<usize> {
+        let mut count = 0;
+        for token in self.waits.tokens().into_iter().flatten() {
+            let waiter = self.waits.by_token(token).expect("live wait token");
+            if waiter.pinned && self.lineage.revoked(waiter.grant) {
+                self.waits.mark_terminal(token, Error::Revoked);
+                if self.waits.release_pin(token) {
+                    self.release_wait_pin(waiter);
+                    count += 1;
+                }
+            }
+        }
+        let lineage = &self.lineage;
+        let discarded = self.channels.discard_revoked(|id| lineage.revoked(id))?;
+        for transfer in discarded.into_iter().flatten() {
+            self.lineage.release(transfer.grant, Use::Transfer)?;
+            self.release(transfer.reference)?;
+            count += 1;
+        }
+        if count != 0 {
+            for token in self.waits.tokens().into_iter().flatten() {
+                self.waits.mark_ready(token);
+            }
+        }
+        Ok(count)
+    }
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn authority_layout(&self) -> [u64; 14] {
+        self.lineage.diagnostic_layout()
     }
     #[cfg(feature = "cap-move-test")]
     pub fn move_objects(&self) -> [u64; 18] {
@@ -431,6 +502,7 @@ impl Objects {
         self.waits
             .wake(info.channel, 1 - info.side, Kind::Send, false);
     }
+    #[allow(clippy::too_many_arguments)]
     fn begin_wait(
         &mut self,
         active: ActiveContext,
@@ -438,6 +510,7 @@ impl Objects {
         info: crate::channel::EndpointInfo,
         kind: Kind,
         payload: u64,
+        grant: GrantId,
     ) -> Result<u64> {
         if !self.waits.can_register(active.thread) {
             return Err(if self.waits.by_thread(active.thread).is_some() {
@@ -446,6 +519,7 @@ impl Objects {
                 Error::Capacity
             });
         }
+        self.lineage.can_retain(grant, Use::Wait, 1)?;
         self.pin(object)?;
         match self.waits.register(
             active,
@@ -457,12 +531,24 @@ impl Objects {
             kind,
             payload,
         ) {
-            Ok(token) => Ok(token),
+            Ok(token) => {
+                self.lineage
+                    .retain(grant, Use::Wait, 1)
+                    .expect("preflighted wait lineage");
+                self.waits.bind_grant(token, grant);
+                Ok(token)
+            }
             Err(error) => {
                 self.unpin(object);
                 Err(error)
             }
         }
+    }
+    fn release_wait_pin(&mut self, waiter: Waiter) {
+        self.lineage
+            .release(waiter.grant, Use::Wait)
+            .expect("owned wait lineage");
+        self.unpin(waiter.object);
     }
     /// Rechecks and commits one woken operation inside the same exclusive
     /// transaction that owns handle lookup. Retry keeps the original pin.
@@ -476,9 +562,14 @@ impl Objects {
         let Some(waiter) = self.waits.remove(waiter.token) else {
             return Settle::Failed(Error::Object);
         };
-        if let Some(error) = waiter.terminal {
+        // Recheck provenance at the commit point even when a wake was queued
+        // before revocation and the supervisor sweep has not run yet.
+        let terminal = waiter
+            .terminal
+            .or_else(|| self.lineage.revoked(waiter.grant).then_some(Error::Revoked));
+        if let Some(error) = terminal {
             if waiter.pinned {
-                self.unpin(waiter.object);
+                self.release_wait_pin(waiter);
             }
             #[cfg(feature = "channel-wait-test")]
             self.wait_event(
@@ -499,7 +590,7 @@ impl Objects {
         match outcome {
             Ok(value) => {
                 if waiter.pinned {
-                    self.unpin(waiter.object);
+                    self.release_wait_pin(waiter);
                 }
                 let info = self
                     .endpoint_of(waiter.object)
@@ -553,7 +644,7 @@ impl Objects {
             }
             Err(error) => {
                 if waiter.pinned {
-                    self.unpin(waiter.object);
+                    self.release_wait_pin(waiter);
                 }
                 #[cfg(feature = "channel-wait-test")]
                 self.wait_event(
@@ -579,7 +670,7 @@ impl Objects {
             }
             self.waits.remove(token);
             if waiter.pinned {
-                self.unpin(waiter.object);
+                self.release_wait_pin(waiter);
             }
             #[cfg(feature = "channel-wait-test")]
             self.wait_event(
@@ -606,6 +697,9 @@ impl Objects {
                 {
                     self.slots[object.slot()].pins =
                         self.slots[object.slot()].pins.saturating_sub(1);
+                    self.lineage
+                        .release(waiter.grant, Use::Wait)
+                        .expect("terminal wait lineage");
                 }
             } else if waiter.channel == info.channel {
                 self.waits.mark_ready(token);
@@ -847,6 +941,9 @@ impl Objects {
                     .retire_owned(reference)
                     .expect("last unpinned endpoint reference");
                 for transfer in discarded.into_iter().flatten() {
+                    self.lineage
+                        .release(transfer.grant, Use::Transfer)
+                        .expect("discarded transfer lineage");
                     self.release(transfer.reference)
                         .expect("queued reference ownership");
                 }
@@ -904,6 +1001,7 @@ struct Slot {
     target: ObjectId,
     rights: Rights,
     transferable: bool,
+    grant: GrantId,
 }
 impl Slot {
     const EMPTY: Self = Self {
@@ -913,6 +1011,7 @@ impl Slot {
         target: ObjectId::EMPTY,
         rights: Rights::NONE,
         transferable: false,
+        grant: GrantId::NONE,
     };
     fn free(&self) -> bool {
         !self.live && self.generation != u32::MAX
@@ -928,6 +1027,98 @@ pub struct Table {
     sealed: bool,
 }
 impl Table {
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn grant_offset() -> u64 {
+        core::mem::offset_of!(Slot, grant) as u64
+    }
+    pub fn grant_id(&self, objects: &Objects, caller: NodeId, handle: Handle) -> Result<GrantId> {
+        if !self.live {
+            return Err(Error::Owner);
+        }
+        let entry = self.entry(caller, handle)?;
+        objects
+            .lineage
+            .validate(entry.grant, entry.target, entry.rights)?;
+        Ok(entry.grant)
+    }
+    pub fn derive(
+        &mut self,
+        objects: &mut Objects,
+        caller: NodeId,
+        source: Handle,
+        rights: Rights,
+    ) -> Result<Handle> {
+        if !self.live {
+            return Err(Error::Owner);
+        }
+        let e = self.entry(caller, source)?;
+        let object = objects.object(e.target)?;
+        objects.lineage.validate(e.grant, e.target, e.rights)?;
+        if e.grant == GrantId::NONE
+            || !e.rights.contains(Rights::DERIVE)
+            || rights == Rights::NONE
+            || !rights.valid(e.kind)
+            || !e.rights.contains(rights)
+        {
+            return Err(Error::Rights);
+        }
+        if object.references == u32::MAX {
+            return Err(Error::Capacity);
+        }
+        let target = e.target;
+        let transferable = e.transferable;
+        let parent = e.grant;
+        let slot = self
+            .slots
+            .iter()
+            .position(Slot::free)
+            .ok_or(Error::Capacity)?;
+        let generation = self.slots[slot].generation + 1;
+        let grant = objects.lineage.derive(parent, rights)?;
+        objects
+            .retain(target)
+            .expect("preflighted derived reference");
+        self.slots[slot] = Slot {
+            generation,
+            live: true,
+            kind: target.kind(),
+            target,
+            rights,
+            transferable,
+            grant,
+        };
+        Ok(Handle::new(slot, generation))
+    }
+    pub fn begin_revoke(
+        &self,
+        objects: &mut Objects,
+        caller: NodeId,
+        source: Handle,
+    ) -> Result<Revocation> {
+        if !self.live {
+            return Err(Error::Owner);
+        }
+        let e = self.entry(caller, source)?;
+        objects.object(e.target)?;
+        objects.lineage.validate(e.grant, e.target, e.rights)?;
+        if e.grant == GrantId::NONE || !e.rights.contains(Rights::REVOKE) {
+            return Err(Error::Rights);
+        }
+        objects.channels.preflight_discard()?;
+        objects.lineage.begin(e.grant)
+    }
+    /// Supervisor sweep of invalid authority, including terminating Nodes.
+    pub fn purge_revoked(&mut self, objects: &mut Objects) -> Result<usize> {
+        let mut count = 0;
+        for slot in 0..HANDLES {
+            let e = &self.slots[slot];
+            if e.live && objects.lineage.revoked(e.grant) {
+                self.close(objects, self.id.owner(), Handle::new(slot, e.generation))?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
     #[cfg(feature = "cap-move-test")]
     pub fn move_slots(&self) -> [u64; 32] {
         let mut words = [0; 32];
@@ -1053,7 +1244,19 @@ impl Table {
             .position(Slot::free)
             .ok_or(Error::Capacity)?;
         let generation = self.slots[slot].generation + 1;
+        let tracked = rights.0 & (Rights::DERIVE.0 | Rights::REVOKE.0) != 0;
+        if tracked {
+            objects.lineage.can_create()?;
+        }
         objects.retain(id)?;
+        let grant = if tracked {
+            objects
+                .lineage
+                .root(id, rights)
+                .expect("preflighted independent grant")
+        } else {
+            GrantId::NONE
+        };
         self.slots[slot] = Slot {
             generation,
             live: true,
@@ -1061,6 +1264,7 @@ impl Table {
             target: id,
             rights,
             transferable: false,
+            grant,
         };
         Ok(Handle::new(slot, generation))
     }
@@ -1135,10 +1339,28 @@ impl Table {
         self.slots[endpoint.parts()?.0].rights = Rights(224);
         Ok(())
     }
+    /// Explicit trusted bootstrap grant of authority-management rights. Sealed
+    /// tables cannot acquire these rights except by a rights-subset derivation.
+    pub fn configure_delegation(&mut self, objects: &mut Objects, handle: Handle) -> Result<()> {
+        if self.sealed || !self.live {
+            return Err(Error::InUse);
+        }
+        let e = self.entry(self.id.owner(), handle)?;
+        if e.grant != GrantId::NONE {
+            return Err(Error::InUse);
+        }
+        objects.object(e.target)?;
+        let rights = e.rights.union(Rights::DERIVE).union(Rights::REVOKE);
+        let grant = objects.lineage.root(e.target, rights)?;
+        let slot = handle.parts()?.0;
+        self.slots[slot].rights = rights;
+        self.slots[slot].grant = grant;
+        Ok(())
+    }
     /// K8B bootstrap: index 3 is a MemoryObject capability, not a Flag. The
     /// capability must itself carry TRANSFER; only the endpoint rights are
     /// widened to SEND|RECEIVE|SEND_CAPS.
-    #[cfg(any(feature = "cap-move-test", test))]
+    #[cfg(any(feature = "cap-move-test", feature = "authority-test", test))]
     pub fn configure_memory_object_moves(&mut self) -> Result<()> {
         if self.sealed || !self.live {
             return Err(Error::InUse);
@@ -1171,6 +1393,9 @@ impl Table {
             return Err(Error::Owner);
         }
         let entry = self.entry(caller, handle)?;
+        objects
+            .lineage
+            .validate(entry.grant, entry.target, entry.rights)?;
         let object = objects.object(entry.target)?;
         if object.references == 0 {
             return Err(Error::Object);
@@ -1202,6 +1427,9 @@ impl Table {
         let info = self.move_endpoint(objects, caller, endpoint, Rights::SEND_CAPS)?;
         let source_slot = source.parts()?.0;
         let entry = self.entry(caller, source)?;
+        objects
+            .lineage
+            .validate(entry.grant, entry.target, entry.rights)?;
         if objects.object(entry.target)?.references == 0 {
             return Err(Error::Object);
         }
@@ -1225,14 +1453,20 @@ impl Table {
         objects.channels.can_send(info.id, caller)?;
         let target = entry.target;
         let rights = entry.rights;
+        let grant = entry.grant;
+        objects
+            .lineage
+            .transfer(grant, Use::Handle, Use::Transfer)?;
         self.slots[source_slot].live = false;
         self.slots[source_slot].kind = ObjectType::None;
         self.slots[source_slot].target = ObjectId::EMPTY;
         self.slots[source_slot].rights = Rights::NONE;
         self.slots[source_slot].transferable = false;
+        self.slots[source_slot].grant = GrantId::NONE;
         let transfer = OwnedTransfer {
             reference: ObjectRef { id: target },
             rights,
+            grant,
         };
         objects.channels.send_transfer(info.id, caller, transfer);
         objects.wake_receive(info);
@@ -1251,6 +1485,9 @@ impl Table {
             .channels
             .peek_transfer(info.id, caller)?
             .description();
+        let grant = objects.channels.peek_transfer(info.id, caller)?.grant;
+        objects.lineage.validate(grant, id, rights)?;
+        objects.lineage.can_retain(grant, Use::Handle, 1)?;
         objects.object(id)?;
         if !rights.valid(id.kind()) {
             return Err(Error::Rights);
@@ -1264,7 +1501,12 @@ impl Table {
         let OwnedTransfer {
             reference: ObjectRef { id },
             rights,
+            grant,
         } = objects.channels.receive_transfer(info.id, caller)?;
+        objects
+            .lineage
+            .transfer(grant, Use::Transfer, Use::Handle)
+            .expect("preflighted received lineage");
         self.slots[slot] = Slot {
             generation,
             live: true,
@@ -1272,6 +1514,7 @@ impl Table {
             target: id,
             rights,
             transferable: true,
+            grant,
         };
         // The consumed token's reference is now owned by the installed entry.
         objects.wake_send(info);
@@ -1292,6 +1535,9 @@ impl Table {
         }
         let h = self.bootstrap[index as usize].ok_or(Error::Handle)?;
         let entry = self.entry(caller, h)?;
+        objects
+            .lineage
+            .validate(entry.grant, entry.target, entry.rights)?;
         objects.object(entry.target)?;
         Ok(h)
     }
@@ -1312,6 +1558,7 @@ impl Table {
         }
         let e = self.entry(caller, handle)?;
         objects.object(e.target)?;
+        objects.lineage.validate(e.grant, e.target, e.rights)?;
         if e.kind != kind || e.target.kind() != kind {
             return Err(Error::Type);
         }
@@ -1325,18 +1572,23 @@ impl Table {
             caller,
             requested: required,
             actual: e.rights,
+            grant: e.grant,
         })
     }
     pub fn close(&mut self, objects: &mut Objects, caller: NodeId, handle: Handle) -> Result<()> {
-        let id = self.entry(caller, handle)?.target;
+        let entry = self.entry(caller, handle)?;
+        let id = entry.target;
+        let grant = entry.grant;
         objects.object(id)?;
         objects.release_id(id)?;
+        objects.lineage.release(grant, Use::Handle)?;
         let (slot, _) = handle.parts()?;
         self.slots[slot].live = false;
         self.slots[slot].kind = ObjectType::None;
         self.slots[slot].target = ObjectId::EMPTY;
         self.slots[slot].rights = Rights::NONE;
         self.slots[slot].transferable = false;
+        self.slots[slot].grant = GrantId::NONE;
         Ok(())
     }
     pub fn drain(&mut self, objects: &mut Objects, owner: NodeId) -> Result<usize> {
@@ -1367,6 +1619,7 @@ pub struct Guard<'a> {
     /// Rights actually held by the table entry. MemoryObject mapping authority
     /// is derived from this, never from the request.
     actual: Rights,
+    grant: GrantId,
 }
 impl Guard<'_> {
     #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
@@ -1404,10 +1657,14 @@ impl Guard<'_> {
     /// the lookup request. A read-only capability can never authorize a
     /// writable mapping, and MAP alone authorizes no data access.
     pub fn memory_object(&self, writable: bool) -> Result<&crate::paging::MemoryObjectRef> {
+        // Derived mappings must pass through the provenance-preserving path.
+        if self.grant != GrantId::NONE {
+            return Err(Error::Rights);
+        }
         let required = if writable {
-            Rights(Rights::MAP.bits() as u8 | Rights::READ_WRITE.bits() as u8)
+            Rights::MAP.union(Rights::READ_WRITE)
         } else {
-            Rights(Rights::MAP.bits() as u8 | Rights::READ.bits() as u8)
+            Rights::MAP.union(Rights::READ)
         };
         if !self.actual.contains(required) {
             return Err(Error::Rights);
@@ -1444,6 +1701,9 @@ impl Guard<'_> {
     /// Commits immediately when possible; otherwise registers the Thread's one
     /// pending operation and returns `Blocked` without touching the queue count.
     pub fn channel_send_wait(&mut self, active: ActiveContext, payload: u64) -> Result<WaitStart> {
+        if active.node != self.caller {
+            return Err(Error::Owner);
+        }
         if !self.requested.contains(Rights::SEND) {
             return Err(Error::Rights);
         }
@@ -1455,12 +1715,15 @@ impl Guard<'_> {
             }
             Err(Error::Full) => self
                 .objects
-                .begin_wait(active, self.id, info, Kind::Send, payload)
+                .begin_wait(active, self.id, info, Kind::Send, payload, self.grant)
                 .map(|_| WaitStart::Blocked),
             Err(error) => Err(error),
         }
     }
     pub fn channel_receive_wait(&mut self, active: ActiveContext) -> Result<WaitStart> {
+        if active.node != self.caller {
+            return Err(Error::Owner);
+        }
         if !self.requested.contains(Rights::RECEIVE) {
             return Err(Error::Rights);
         }
@@ -1472,7 +1735,7 @@ impl Guard<'_> {
             }
             Err(Error::Empty) => self
                 .objects
-                .begin_wait(active, self.id, info, Kind::Receive, 0)
+                .begin_wait(active, self.id, info, Kind::Receive, 0, self.grant)
                 .map(|_| WaitStart::Blocked),
             Err(error) => Err(error),
         }
@@ -1547,6 +1810,8 @@ impl Lease {
     }
 }
 
+#[cfg(test)]
+mod authority_tests;
 #[cfg(test)]
 mod moves_tests;
 #[cfg(test)]

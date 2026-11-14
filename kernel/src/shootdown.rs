@@ -21,6 +21,16 @@ pub struct Request {
     pub address: u64,
     pub targets: u64,
 }
+/// Minted only by a complete generation-bound shootdown. The architecture must
+/// acknowledge actual CPU invalidations before asking the coordinator for it.
+pub struct Completion {
+    request: Request,
+}
+impl Completion {
+    pub fn request(&self) -> Request {
+        self.request
+    }
+}
 pub struct Shootdown {
     request: Request,
     acknowledged: u64,
@@ -121,6 +131,9 @@ impl Shootdown {
         ]
     }
     pub fn commit(&mut self, epoch: u64) -> Result<(), Error> {
+        self.complete(epoch).map(|_| ())
+    }
+    pub fn complete(&mut self, epoch: u64) -> Result<Completion, Error> {
         if self.failed {
             return Err(Error::Failed);
         }
@@ -131,7 +144,9 @@ impl Shootdown {
             return Err(Error::Pending);
         }
         self.busy = false;
-        Ok(())
+        Ok(Completion {
+            request: self.request,
+        })
     }
     pub fn fail(&mut self) {
         self.failed = true;

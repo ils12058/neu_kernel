@@ -489,6 +489,11 @@ impl PageTree {
     }
 }
 
+// K10 adds a two-page shared object to the complete K9 three-Thread fixture.
+// Keep the legacy pool bound unchanged for all earlier profiles.
+#[cfg(feature = "authority-test")]
+pub const DATA_FRAMES: usize = 18;
+#[cfg(not(feature = "authority-test"))]
 pub const DATA_FRAMES: usize = 16;
 pub const MAPPINGS: usize = 64;
 pub const USER_SPACES: usize = 2;
@@ -592,6 +597,8 @@ pub struct MemoryMapAuthority {
     space: SpaceId,
     writable: bool,
     capability: bool,
+    pub(crate) grant: crate::capability::GrantId,
+    pub(crate) bounds: Option<(usize, u64, usize, Permissions)>,
 }
 
 #[derive(Clone, Copy)]
@@ -613,6 +620,9 @@ pub struct Mapping {
     pub permissions: Permissions,
     pub object: MappingObject,
     live: bool,
+    pub grant: crate::capability::GrantId,
+    revoke_epoch: u64,
+    revoke_targets: u64,
 }
 /// Explicit provenance also gives the test-only debugger a defined raw layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -722,6 +732,9 @@ impl Registry {
                 permissions: Permissions::R,
                 object: MappingObject::Private,
                 live: false,
+                grant: crate::capability::GrantId::NONE,
+                revoke_epoch: 0,
+                revoke_targets: 0,
             }; MAPPINGS],
             objects: [MemoryObject {
                 generation: 0,
@@ -1196,6 +1209,8 @@ impl Registry {
             space,
             writable,
             capability: false,
+            grant: crate::capability::GrantId::NONE,
+            bounds: None,
         })
     }
     /// Trusted setup retains one paging reference per capability object. The
@@ -1243,6 +1258,8 @@ impl Registry {
             space,
             writable,
             capability: true,
+            grant: crate::capability::GrantId::NONE,
+            bounds: None,
         })
     }
     pub fn memory_object_capability_refs(&self, id: MemoryObjectId) -> Result<u8> {
@@ -1522,12 +1539,106 @@ impl Registry {
                 permissions,
                 object: MappingObject::Private,
                 live: true,
+                grant: crate::capability::GrantId::NONE,
+                revoke_epoch: 0,
+                revoke_targets: 0,
             };
         }
         Ok(())
     }
     pub fn mapping(&self, address: u64) -> Result<Mapping> {
         self.mapping_for(SpaceId::KERNEL, address)
+    }
+    pub fn validate_mapping_revoke(
+        &self,
+        space: SpaceId,
+        grant: crate::capability::GrantId,
+        request: crate::shootdown::Request,
+    ) -> Result<()> {
+        if request.epoch == 0
+            || request.targets == 0
+            || request.root != self.root(space)?
+            || grant == crate::capability::GrantId::NONE
+        {
+            return Err(Error::NotOwned);
+        }
+        let mapping = self.mapping_for(space, request.address)?;
+        if mapping.grant != grant
+            || mapping.revoke_epoch != 0
+            || mapping.permissions.execute
+            || !matches!(mapping.object, MappingObject::Shared(_))
+        {
+            return Err(Error::NotOwned);
+        }
+        self.frame(mapping.frame)?;
+        Ok(())
+    }
+    /// Called only after the adapter has atomically removed this exact PTE.
+    /// The live record continues to retain backing until a complete shootdown.
+    pub fn mark_mapping_revoke(
+        &mut self,
+        space: SpaceId,
+        grant: crate::capability::GrantId,
+        request: crate::shootdown::Request,
+    ) -> Result<()> {
+        self.validate_mapping_revoke(space, grant, request)?;
+        let mapping = self
+            .mappings
+            .iter_mut()
+            .find(|m| m.live && m.space == space && m.address == request.address)
+            .ok_or(Error::NotMapped)?;
+        mapping.revoke_epoch = request.epoch;
+        mapping.revoke_targets = request.targets;
+        Ok(())
+    }
+    pub fn validate_revoked_mapping_completion(
+        &self,
+        receipt: &crate::shootdown::Completion,
+    ) -> Result<()> {
+        let request = receipt.request();
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|m| {
+                m.live
+                    && m.address == request.address
+                    && self.root(m.space).ok() == Some(request.root)
+            })
+            .ok_or(Error::NotMapped)?;
+        if mapping.revoke_epoch != request.epoch
+            || mapping.revoke_targets != request.targets
+            || mapping.grant == crate::capability::GrantId::NONE
+        {
+            return Err(Error::NotOwned);
+        }
+        Ok(())
+    }
+    pub(crate) fn finish_revoked_mapping(
+        &mut self,
+        receipt: &crate::shootdown::Completion,
+    ) -> Result<()> {
+        self.validate_revoked_mapping_completion(receipt)?;
+        let request = receipt.request();
+        let slot = self
+            .mappings
+            .iter()
+            .position(|m| {
+                m.live
+                    && m.address == request.address
+                    && self.root(m.space).ok() == Some(request.root)
+            })
+            .ok_or(Error::NotMapped)?;
+        self.mappings[slot].live = false;
+        Ok(())
+    }
+    #[cfg(any(feature = "authority-test", test))]
+    pub fn authority_mapping_layout(&self) -> [u64; 3] {
+        use core::mem::offset_of as off;
+        [
+            off!(Mapping, grant) as u64,
+            off!(Mapping, revoke_epoch) as u64,
+            off!(Mapping, revoke_targets) as u64,
+        ]
     }
     pub fn mapping_for(&self, space: SpaceId, address: u64) -> Result<Mapping> {
         self.valid_space(space)?;
@@ -1840,6 +1951,11 @@ fn map_memory_object_at(
     permissions: Permissions,
     boundary: Boundary,
 ) -> Result<()> {
+    if authority.grant != crate::capability::GrantId::NONE
+        && authority.bounds != Some((offset, base, pages, permissions))
+    {
+        return Err(Error::NotOwned);
+    }
     let object = *registry.object(authority.object)?;
     if authority.capability {
         if object.capability_refs == 0 {
@@ -1915,6 +2031,9 @@ fn map_memory_object_at(
             permissions,
             object: MappingObject::Shared(authority.object),
             live: true,
+            grant: authority.grant,
+            revoke_epoch: 0,
+            revoke_targets: 0,
         };
     }
     Ok(())

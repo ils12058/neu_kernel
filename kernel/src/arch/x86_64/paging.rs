@@ -689,14 +689,14 @@ impl<'a, 'm> Paging<'a, 'm> {
     }
     /// Trusted setup retains one paging reference per capability object. The
     /// reference is non-copyable and independent of handle counts.
-    #[cfg(feature = "abi-02")]
+    #[cfg(any(feature = "abi-02", feature = "authority-test"))]
     pub fn retain_capability_reference(
         &mut self,
         object: MemoryObjectId,
     ) -> Result<logic::MemoryObjectRef> {
         self.registry.retain_memory_object(object)
     }
-    #[cfg(feature = "abi-02")]
+    #[cfg(any(feature = "abi-02", feature = "authority-test"))]
     pub fn release_capability_reference(
         &mut self,
         reference: logic::MemoryObjectRef,
@@ -2762,6 +2762,9 @@ impl Paging<'_, '_> {
     }
 }
 
+#[cfg(feature = "authority-test")]
+#[path = "authority_paging.rs"]
+mod authority_paging;
 #[cfg(feature = "memory-object-test")]
 #[path = "memory_object.rs"]
 mod memory_object;

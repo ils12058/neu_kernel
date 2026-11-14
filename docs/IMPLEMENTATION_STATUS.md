@@ -1,5 +1,117 @@
 # Neu Kernel implementation status
 
+## K10 / Advanced authority — complete for bounded x86-64/QEMU (2026-11-14)
+
+K10 started from completed K9 commit
+`c3ced96c31a14420964f73bc0e6e7cbffeafe1d8` on
+`codex/k10-advanced-authority`. The complete acceptance contract is now
+**accepted** in [K10 completion](K10_COMPLETION.md).
+[ADR 0030](adr/0030-bounded-capability-derivation-and-revocation.md) defines
+the implementation, and [experimental ABI 0.6](abi/experimental-v0.6.md)
+defines CAP_DERIVE (`0x19`), CAP_REVOKE (`0x1a`) and the authority feature bit.
+Architecture v0.2 remains the baseline. Earlier ABI profiles keep their exact
+versions and feature masks.
+
+### Derived authority and operation lifetime
+
+DERIVE (`0x100`) and REVOKE (`0x200`) are independent rights. Derivation
+creates a fresh local handle containing an exact object-valid subset; movement
+preserves its grant identity through the existing atomic Channel transaction.
+A generation-checked 64-entry forest accounts separately for handles, queued
+transfers, pending operations and mapping owners. Closed ancestors remain
+structural until their descendants disappear.
+
+Revoke withdraws strict descendants, preserving the source, outside branches
+and independent roots. The initial transaction blocks affected use, purges
+handles and queued transfers, and cancels waits with Revoked (`-38`). Wait
+settlement rechecks lineage before consuming a message, including when readiness
+preceded the sweep. Counter/capacity failures reject before publication;
+noncopyable epoch tickets prevent stale or duplicate completion. A surviving
+source can derive again after successful revoke.
+
+### Concurrent mappings and requester termination
+
+The guarded mapping adapter binds source lineage, space/root, exact range and
+permissions. Each mapped page retains one authority owner and object pin.
+Closing a handle preserves existing mappings. Revocation atomically clears
+the actual owned PTE, then keeps both mapping registries and backing alive
+until a matching root/address/epoch/target receipt proves hardware completion.
+Every online CPU executes INVLPG or reloads its actual CR3 before ACK.
+
+The requesting Thread blocks while the BSP services the mappings. Controller
+ownership survives requester cancellation and Node closure; a cancelled Thread
+is never resumed. The termination profile forces a real sibling fault before
+PTE retirement and still requires every invalidation to finish. Missing ACKs
+fail stop with backing retained. Independent B mappings and their data survive.
+The authority fixture uses 18 data-frame slots; legacy profiles retain 16.
+
+### K10 acceptance and retained evidence
+
+Eight new QEMU profiles cover two/four CPUs, queued delegation, close-preserved
+mapping lifetime, revoked waits, repeated derivation, requester termination
+and ABI 0.5 rejection. [The authority QMP protocol](testing/authority-qmp.md)
+documents actual syscall-frame reconstruction, an independent grant/FIFO
+model, raw mapping/lineage ownership, per-page per-CPU post-instruction
+observations and exact final conservation. All 20 scheduled SMP profiles
+restore their original allocator bitmap and page-table inventory with zero
+final roots, pins, references, grants, mappings, handles, queued authority or waits.
+
+| Validation | Accepted result | Retained artifact |
+| --- | --- | --- |
+| Rust host tests | 324/324 in each of default and authority-feature configurations | `build/k10-full-test.log`, `build/k10-host-authority-feature.log` |
+| Python observers | 29/29 regressions: eight preemption, four blocked-wait, two cadence, three checkpoint and twelve authority cases | `build/k10-check.log`, `build/k10-full-test.log` |
+| Complete QEMU matrix | 189/189 registered cases; unchanged 30-second deadline | `build/k10-full-test-results.json`, `build/k10-full-test-evidence/` |
+| Focused authority repeats | Five passes using identical images; 80 additional required CPU/page invalidation windows | `build/k10-repeat-results.json`, `build/k10-repeat-evidence/` |
+| Formatting and lint | All 189 profile selections and host-library clippy pass | `build/k10-check.log` |
+| Toolchain and default build | Doctor/build pass; default kernel equals the full-run boot image | `build/k10-doctor.log`, `build/k10-build.log` |
+| Source/image/conservation audit | All 88 frozen sources, 189 image hashes, 20 scheduled profiles and five repeated captures verified | `build/k10-validation-summary.json` |
+
+The source aggregate SHA-256 is
+`05a608549d8bb608f0d73bb7002af2e110837b217416f43c35e6579aa45fd3fe`.
+The default kernel SHA-256 is
+`fa38f2f5be6a8e74af7ffee87ac72dc08d087a7920442ceece286c87ed6c65ec`.
+Full-run evidence is preserved separately before the repeats; the summary
+records individual capture, image and log hashes plus process cleanup.
+
+The first full attempt's 66 passing cases and failing legacy capability capture
+remain in `build/k10-development/full-regression-attempt-1/`. Two schema checks
+still expected a one-byte Rights representation; correcting them to the actual
+two-byte field required no kernel or timeout change. Both affected observer
+paths pass. The second full attempt stopped after 128 passes because the
+all-blocked checker counted a documented common-root timer drain as user
+progress. It now keeps user IRQ/capture counts distinct from the exact
+tick/EOI/drain ledger. Four new regressions reject fabricated progress and
+invalid accounting; all affected QEMU rechecks and the complete replacement
+matrix pass. A third attempt stopped after 178 passes when fixed 20 ms polling
+missed direct same-Node CPL3 overlap in `smp-tlb-2`. Variable 3/7/11 ms sampling
+before the witness avoids matching the two-quantum cycle; all required
+observations remain mandatory. Two cadence regressions and thirteen focused
+SMP rechecks pass. A fourth attempt stopped after 188 passes when the prepared
+marker was observed before the BSP's wait call. The observer now waits for
+actual baseline/prepared RIP entry and rejects advancing past a missing
+checkpoint. Three regressions and six focused unchanged-image runs pass.
+A fifth unchanged-source attempt stopped after 184 passes when queued-authority
+timer calibration rejected its sample consistency before scheduler startup.
+Seven same-image rechecks and the replacement full matrix pass with the same
+thresholds and deadline. The rejected samples were not captured; no specific
+host-scheduling cause is claimed. All five failed runs, earlier diagnostic-window
+and pool-assertion corrections are retained and explained in
+[K10 completion](K10_COMPLETION.md#validation-corrections-retained-with-the-evidence).
+
+### Scope after K10
+
+This accepts the four-CPU, two-Node, three-Thread x86-64/QEMU model with fixed
+pools, integer contexts and IRQ-disabled kernel transactions. Allocation,
+initial mappings and final teardown remain controlled by the BSP. Public
+object/mapping/Thread factories, arbitrary AP allocation, balancing, general
+kernel preemption, FPU/SIMD, physical hardware, COW and demand paging remain
+later work. **K11 device primitives are next:** authorized MMIO/IRQ access for
+selected userspace drivers; untrusted DMA requires suitable isolation.
+Validation is local Rust/Python/QEMU evidence; hosted CI and hardware were not run.
+
+The dated K9 and earlier sections below retain their historical scope and
+acceptance counts; this section supersedes their statements that K10 is next.
+
 ## K9 / Phases 9C-2, 9C-3 and 9D — complete for bounded SMP (2026-11-14)
 
 This completion started from `46ef2214788cbb9f561af1394391654848ea7976`

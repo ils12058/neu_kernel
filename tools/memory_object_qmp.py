@@ -964,7 +964,7 @@ def observe_cap(qmp, path, symbols, deadline, words, register, failure, output,
                                        'pages': u64(row, layout[25]), 'cap_refs': row[layout[38]]})
             cap_layout = d[96:114]
             require(cap_layout[0] == 1 and cap_layout[3] == 6 and cap_layout[13] == 8
-                    and cap_layout[14] == 8 and cap_layout[15] == 1 and cap_layout[16] == 1,
+                    and cap_layout[14] == 8 and cap_layout[15] == 1 and cap_layout[16] == 2,
                     'invalid capability registry layout')
             cap_objects = []
             for slot in range(cap_layout[3]):
@@ -1027,7 +1027,7 @@ def observe_cap(qmp, path, symbols, deadline, words, register, failure, output,
                     row = read(layout_words[3] + index * layout_words[4], layout_words[4])
                     slots.append({'slot': index, 'generation': u32(row, layout_words[6]),
                                   'live': row[layout_words[7]] != 0, 'kind': row[layout_words[8]],
-                                  'target': u64(row, layout_words[9]), 'rights': row[layout_words[10]],
+                                  'target': u64(row, layout_words[9]), 'rights': int.from_bytes(row[layout_words[10]:layout_words[10]+2], 'little'),
                                   'transferable': row[layout_words[11]] != 0})
                 bootstrap = []
                 for index in range(8):
@@ -1064,7 +1064,7 @@ def observe_cap(qmp, path, symbols, deadline, words, register, failure, output,
                     transfer = fifo + channel[17] + slot * channel[18]
                     transfers.append({'live': read(transfer + channel[19], 1)[0] != 0,
                                       'object': u64(read(transfer + channel[20], 8)),
-                                      'rights': read(transfer + channel[21], 1)[0]})
+                                      'rights': int.from_bytes(read(transfer + channel[21], 2), 'little')})
                 queues.append({'head': head, 'tail': tail, 'len': length,
                                'values': values, 'transfers': transfers})
             for side, queue in enumerate(queues):
@@ -1871,7 +1871,7 @@ def observe_runtime(qmp, path, symbols, deadline, words, register, failure, outp
 
             cap_layout = d[95:113]
             require(cap_layout[0] == 1 and cap_layout[3] == 6 and cap_layout[13] == 8
-                    and cap_layout[14] == 8 and cap_layout[15] == 1 and cap_layout[16] == 1,
+                    and cap_layout[14] == 8 and cap_layout[15] == 1 and cap_layout[16] == 2,
                     'invalid capability registry layout')
             cap_objects = []
             for slot in range(cap_layout[3]):
@@ -1933,7 +1933,7 @@ def observe_runtime(qmp, path, symbols, deadline, words, register, failure, outp
                     row = read(layout_words[3] + index * layout_words[4], layout_words[4])
                     slots.append({'slot': index, 'generation': u32(row, layout_words[6]),
                                   'live': row[layout_words[7]] != 0, 'kind': row[layout_words[8]],
-                                  'target': u64(row, layout_words[9]), 'rights': row[layout_words[10]],
+                                  'target': u64(row, layout_words[9]), 'rights': int.from_bytes(row[layout_words[10]:layout_words[10]+2], 'little'),
                                   'transferable': row[layout_words[11]] != 0})
                 bootstrap = []
                 for index in range(8):
@@ -1973,7 +1973,7 @@ def observe_runtime(qmp, path, symbols, deadline, words, register, failure, outp
                     transfer = fifo + channel[17] + slot * channel[18]
                     transfers.append({'live': read(transfer + channel[19], 1)[0] != 0,
                                       'object': u64(read(transfer + channel[20], 8)),
-                                      'rights': read(transfer + channel[21], 1)[0]})
+                                      'rights': int.from_bytes(read(transfer + channel[21], 2), 'little')})
                 require(head < 2 and tail < 2 and length <= 2 and (head + length) % 2 == tail,
                         'invalid FIFO indices')
                 require(all(value == 0 for value in values), 'unexpected scalar message in capability queue')
