@@ -1,5 +1,67 @@
 # Neu Kernel implementation status
 
+## K11 / Device primitives — complete for bounded x86-64/QEMU (2026-11-14)
+
+K11 starts from completed K10 commit
+`40df53f2f20ad9aa85b1b20334dec464933f7985` on
+`codex/k11-device-primitives`. [K11 completion](K11_COMPLETION.md) is accepted;
+[ADR 0031](adr/0031-bounded-userspace-device-primitives.md),
+[ABI 0.7](abi/experimental-v0.7.md) and the
+[device QMP protocol](testing/device-qmp.md) define the exact interface and proof.
+Architecture v0.2 and earlier ABI versions remain unchanged.
+
+One QEMU EDU at PCI 00:05.0 is exclusively claimed through DeviceResource.
+The claim atomically publishes generation-bound MmioRegion/Interrupt handles.
+Rights may be attenuated; device authority cannot move between Nodes. Seven
+scalar syscalls support inspection, claims, controlled register access and
+blocking interrupt delivery/acknowledgement. Raw writable MMIO, DMA, arbitrary
+PCI configuration and interrupt routing are not userspace authority.
+
+The backend validates Q35/ICH9 and the unshared GSI-21 route. EDU and I/O APIC
+views are supervisor RW/NX/UC in all relevant roots; bus mastering and MSI remain
+disabled. Hard IRQ masks before EOI and publishes a bounded event without taking
+the scheduler lock. The BSP consumes it, wakes one waiter or retains a pending
+sequence. ACK is receiver/sequence-bound. Claim/ACK/quarantine work wakes an
+idle BSP through the existing generation-checked IPI protocol.
+
+Close, selected descendant revocation, Node fault, an 80-BSP-tick watchdog and
+a 64-register-operation budget quarantine the old claim. A pending command and
+the neutral factorial(0) reset must complete their actual interrupt raise before
+cleanup can release authority. Masked reset completions are independently
+observed for both generations; liveness/factorial data, status, remote IRR,
+LAPIC pending state and the mailbox are retired before reassignment. B1 then
+calculates factorial(5)=120 through its own generation.
+
+Nine K11 profiles cover two/four CPUs, factorial(6)=720, all seven native
+operations, actual pending and blocked delivery, close/revoke cancellation,
+driver fault/in-flight fault, watchdog, budget and legacy rejection. Every
+hardware IRQ and returning syscall is reconciled with actual frames and the
+independent authority/register model. Device profiles retain 512 entry/IRQ rows
+per CPU for the added probe windows; legacy profiles retain 256. All 29
+scheduled profiles restore exact allocator/page-table inventory and zero final
+user roots, references, pins, grants, mappings, handles and waits.
+
+| Validation | Accepted result | Artifact |
+| --- | --- | --- |
+| Rust host tests | 339/339 in each of default, authority and device configurations | `build/k11-full-test.log`, `build/k11-host-authority-test.log`, `build/k11-host-device-test.log` |
+| Python observers | 42/42 regressions, including 13 device tests | `build/k11-check.log`, `build/k11-full-test.log` |
+| Full QEMU matrix | 198/198 profiles at the unchanged 30-second deadline | `build/k11-full-test-results.json`, `build/k11-full-test-evidence/` |
+| Same-image repeats | All nine K11 profiles pass again | `build/k11-repeat-results.json`, `build/k11-repeat-evidence/` |
+| Formatting/lint, doctor and default build | All 198 profiles plus host-library lint; default image matches full-run boot | `build/k11-check.log`, `build/k11-doctor.log`, `build/k11-build.log` |
+| Frozen evidence audit | 94 inputs, all image hashes, 29 scheduled profiles and device/reset/frame conservation verified | `build/k11-validation-summary.json` |
+
+Source aggregate: `55ead8fc0a45a71c3f2e0d7a4fddc9a5f524f7f87df82837c4bbd72953d66ba8`. Default kernel:
+`522c2dc9622b34e04ee5bb5513f1d7c428092e57c281beac1741bced43f74964`. [The completion record](K11_COMPLETION.md) retains the deliberate
+full-run review stop, observed development failures and their corrections;
+none is represented as a passing run.
+
+This completes the roadmap's selected-device milestone within the fixed
+four-CPU/two-Node/three-Thread QEMU model. General PCI, DMA/IOMMU, MSI/MSI-X,
+driver loading, public factories, balancing, kernel preemption and wider CPU
+state remain future work. Local validation does not cover physical hardware or
+hosted CI. The dated sections below retain historical acceptance counts and
+scope; this section supersedes their statements that K11 is next.
+
 ## K10 / Advanced authority — complete for bounded x86-64/QEMU (2026-11-14)
 
 K10 started from completed K9 commit

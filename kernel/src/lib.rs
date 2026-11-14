@@ -27,6 +27,7 @@ pub mod smp_work;
 
 pub mod smp_user;
 
+pub mod device;
 pub mod shootdown;
 pub mod smp_scheduler;
 pub mod sync;

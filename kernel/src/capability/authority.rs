@@ -348,7 +348,7 @@ impl Lineage {
     pub fn live(&self) -> usize {
         self.grants.iter().filter(|g| g.live).count()
     }
-    #[cfg(any(feature = "authority-test", test))]
+    #[cfg(any(feature = "authority-test", feature = "device-test", test))]
     pub fn diagnostic_layout(&self) -> [u64; 14] {
         use core::mem::{offset_of as off, size_of as size};
         [

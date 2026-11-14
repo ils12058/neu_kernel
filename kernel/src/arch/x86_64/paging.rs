@@ -1455,6 +1455,16 @@ impl Paging<'_, '_> {
             {
                 let (physical, pat) = super::smp_scheduler::device();
                 tree.map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
+                #[cfg(feature = "device-test")]
+                {
+                    tree.map_device_uc(
+                        &mut self.memory,
+                        LAPIC_VIEW + PAGE,
+                        super::smp_scheduler::peripheral(),
+                        pat,
+                    )?;
+                    tree.map_device_uc(&mut self.memory, LAPIC_VIEW + 2 * PAGE, 0xfec0_0000, pat)?;
+                }
             }
             tree.map(&mut self.memory, WINDOW, tree.root, Permissions::RW)?;
             for (va, frame, permission) in [
@@ -1910,6 +1920,9 @@ fn interrupts_enabled() -> bool {
 ))]
 impl Paging<'_, '_> {
     pub fn map_lapic_uc(&mut self, physical: u64, pat: u64) -> Result<u64> {
+        self.map_peripheral_uc(LAPIC_VIEW, physical, pat)
+    }
+    fn map_peripheral_uc(&mut self, address: u64, physical: u64, pat: u64) -> Result<u64> {
         if current_root() != self.tree.root || interrupts_enabled() {
             return Err(Error::InUse);
         }
@@ -1927,16 +1940,16 @@ impl Paging<'_, '_> {
             return Err(Error::NotOwned);
         }
         self.tree
-            .map_device_uc(&mut self.memory, LAPIC_VIEW, physical, pat)?;
+            .map_device_uc(&mut self.memory, address, physical, pat)?;
         let mut table = self.tree.root;
-        let path = logic::indices(LAPIC_VIEW)?;
+        let path = logic::indices(address)?;
         for index in &path[..3] {
             table = self.memory.read(table, *index)? & ADDRESS_FIELD;
         }
         let leaf = self.memory.read(table, path[3])?;
         let view = self
             .tree
-            .translate(&self.memory, LAPIC_VIEW)?
+            .translate(&self.memory, address)?
             .ok_or(Error::NotMapped)?;
         if leaf & (0x9f | logic::NX) != (0x1b | logic::NX)
             || view.physical != physical
@@ -1946,6 +1959,32 @@ impl Paging<'_, '_> {
             return Err(Error::Flags);
         }
         Ok(leaf)
+    }
+    #[cfg(feature = "device-test")]
+    pub fn map_edu(&mut self, physical: u64, pat: u64) -> Result<()> {
+        if self.memory.boot.map.regions().iter().any(|r| {
+            r.kind != 1
+                && physical < r.base + r.length
+                && physical + neu_kernel::device::BAR_SIZE > r.base
+        }) {
+            return Err(Error::NotOwned);
+        }
+        self.map_peripheral_uc(LAPIC_VIEW + PAGE, physical, pat)?;
+        self.map_peripheral_uc(LAPIC_VIEW + 2 * PAGE, 0xfec0_0000, pat)?;
+        Ok(())
+    }
+    #[cfg(feature = "device-test")]
+    pub fn unmap_edu(&mut self) -> Result<()> {
+        if current_root() != self.tree.root || interrupts_enabled() {
+            return Err(Error::InUse);
+        }
+        for address in [LAPIC_VIEW + PAGE, LAPIC_VIEW + 2 * PAGE] {
+            self.tree.unmap(&mut self.memory, address)?;
+            if self.tree.translate(&self.memory, address)?.is_some() {
+                return Err(Error::Corrupt);
+            }
+        }
+        self.verify()
     }
     #[cfg_attr(feature = "smp-ipi-test", allow(dead_code))]
     pub fn unmap_lapic(&mut self) -> Result<()> {

@@ -28,13 +28,24 @@ use neu_kernel::{
     sync::SpinLock,
     syscall::{self as abi, Frame, Outcome},
 };
-global_asm!(include_str!("smp_scheduler.S"));
+global_asm!(".set NEU_DEVICE, {device}", include_str!("smp_scheduler.S"), device = const cfg!(feature = "device-test") as u8);
+#[cfg(feature = "device-test")]
+global_asm!(include_str!("smp_device.S"));
 #[cfg(feature = "authority-test")]
 #[path = "smp_authority.rs"]
 mod authority;
+#[cfg(feature = "device-test")]
+#[path = "smp_device.rs"]
+mod devices;
 const MAGIC: u64 = 0x4e45_555f_5343_4831;
 const WORDS: usize = 64;
-const TRACE_LIMIT: usize = 256;
+// K11 retains every AP continuation while the BSP observes device IRQ/reset
+// windows and the 80-tick watchdog. Earlier fixtures keep their original bound.
+const TRACE_LIMIT: usize = if cfg!(feature = "device-test") {
+    512
+} else {
+    256
+};
 const TIMER: u8 = neu_kernel::timer::SMP_TIMER_VECTOR;
 const IPI: u8 = 241;
 const WAIT_LIMIT: usize = 100_000_000;
@@ -258,13 +269,24 @@ struct State {
     tlb: Shootdown,
     #[cfg(feature = "authority-test")]
     authority: authority::Controller,
+    #[cfg(feature = "device-test")]
+    device: devices::Controller,
 }
 impl State {
     const fn new() -> Self {
         Self {
             nodes: Nodes::new(),
             scheduler: Scheduler::empty(),
-            objects: Objects::with_channels(),
+            objects: {
+                #[cfg(feature = "device-test")]
+                {
+                    Objects::with_devices()
+                }
+                #[cfg(not(feature = "device-test"))]
+                {
+                    Objects::with_channels()
+                }
+            },
             threads: [None; 3],
             node_ids: [None; 2],
             inspections: [const { None }; 2],
@@ -279,9 +301,13 @@ impl State {
             tlb: Shootdown::new(),
             #[cfg(feature = "authority-test")]
             authority: authority::Controller::new(),
+            #[cfg(feature = "device-test")]
+            device: devices::Controller::new(),
         }
     }
     fn snapshot(&self) {
+        #[cfg(feature = "device-test")]
+        devices::snapshot(self);
         #[cfg(feature = "authority-test")]
         authority::snapshot(self);
         publish(&neu_smp_sched_queues, self.scheduler.diagnostic_layout());
@@ -373,6 +399,10 @@ impl State {
     }
     fn ready_waits(&mut self) -> u64 {
         let mut mask = 0;
+        #[cfg(feature = "device-test")]
+        {
+            mask |= devices::take_wakes(self);
+        }
         for waiter in self.objects.take_ready_waits().into_iter().flatten() {
             let (status, value) = match self.objects.settle_wait(waiter.active.thread) {
                 Settle::Committed(value) => (0, value),
@@ -406,6 +436,8 @@ impl State {
         self.scheduler
             .finish(&mut self.nodes, cpu, active, outcome)?;
         if self.nodes.node(active.node)?.state == node::NodeState::Exited {
+            #[cfg(feature = "device-test")]
+            devices::node_exit(self, active.node);
             self.objects.cancel_node_waits(active.node);
             self.nodes
                 .close_authority_smp(active.node, &mut self.objects)?;
@@ -509,6 +541,10 @@ fn barrier_word(index: usize) -> &'static AtomicU64 {
 }
 pub(super) fn barrier_physical() -> u64 {
     BAR_PA.load(Ordering::Acquire)
+}
+#[cfg(feature = "device-test")]
+pub(super) fn peripheral() -> u64 {
+    devices::physical()
 }
 pub(super) fn device() -> (u64, u64) {
     (
@@ -798,6 +834,11 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
         local.inc(50);
         return;
     }
+    #[cfg(feature = "device-test")]
+    if f.vector == neu_kernel::device::VECTOR as u64 {
+        devices::irq(f, address);
+        return;
+    }
     if !matches!(f.vector, 224 | 241) || !bitmap(0x100, f.vector as u8) {
         reject(cpu, 12);
     }
@@ -818,6 +859,8 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
         return;
     }
     local.inc(field::TIMER_EOIS);
+    #[cfg(feature = "device-test")]
+    devices::tick(cpu);
     if f.cs != abi::USER_CS {
         local.inc(field::DRAIN);
         return;
@@ -838,6 +881,10 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
 }
 fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outcome {
     let number = f.registers.rax;
+    #[cfg(feature = "device-test")]
+    if abi::v07::owns(number) || abi::v06::owns(number) || number == abi::v02::CAP_CLOSE {
+        return devices::operation(s, cpu, active, f);
+    }
     #[cfg(feature = "authority-test")]
     if abi::v06::owns(number) {
         return authority::operation(s, cpu, active, f);
@@ -859,7 +906,9 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
     let result = (|| -> cap::Result<Outcome> {
         let scalar = match number {
             abi::ABI_QUERY => {
-                if cfg!(feature = "authority-test") {
+                if cfg!(feature = "device-test") {
+                    abi::v07::INFO
+                } else if cfg!(feature = "authority-test") {
                     abi::v06::INFO
                 } else {
                     abi::v05::INFO
@@ -1074,6 +1123,8 @@ fn finish_fault(
                 ),
             );
         }
+        #[cfg(feature = "device-test")]
+        devices::stop_node(s, active.node);
         let peers = s
             .scheduler
             .begin_fault(&s.nodes, cpu, active)
@@ -1125,7 +1176,7 @@ fn handle(cpu: usize, dispatch: Dispatch) {
     let local = &neu_smp_sched_cpus[cpu];
     let f = unsafe { ptr::read(local.frame.get()) };
     let vector = local.get(field::VECTOR);
-    if !matches!(vector, 128 | 224 | 241) {
+    if !(matches!(vector, 128 | 224 | 241) || cfg!(feature = "device-test") && vector == 240) {
         finish_fault(
             cpu,
             dispatch.active,
@@ -1167,7 +1218,10 @@ fn handle(cpu: usize, dispatch: Dispatch) {
                 .expect("SMP stopped sibling");
         }
         if vector == 128 {
-            match operation(s, cpu, dispatch.active, f) {
+            let result = operation(s, cpu, dispatch.active, f);
+            #[cfg(feature = "device-test")]
+            devices::record(s, cpu, dispatch.active, f, result);
+            match result {
                 Outcome::Exit(code) => s
                     .finish(cpu, dispatch.active, ExitReason::Normal(code))
                     .expect("SMP normal completion"),
@@ -1205,11 +1259,22 @@ fn handle(cpu: usize, dispatch: Dispatch) {
     notify(cpu, wakes);
 }
 fn authority_pending(cpu: usize) -> bool {
-    #[cfg(feature = "authority-test")]
+    #[cfg(any(feature = "authority-test", feature = "device-test"))]
     {
-        with_state(cpu, |s| s.authority.pending())
+        with_state(cpu, |s| {
+            let mut pending = false;
+            #[cfg(feature = "authority-test")]
+            {
+                pending |= s.authority.pending();
+            }
+            #[cfg(feature = "device-test")]
+            {
+                pending |= devices::pending(s);
+            }
+            pending
+        })
     }
-    #[cfg(not(feature = "authority-test"))]
+    #[cfg(not(any(feature = "authority-test", feature = "device-test")))]
     {
         let _ = cpu;
         false
@@ -1219,6 +1284,8 @@ fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, [&UserSpace;
     enable_cpu(cpu);
     while !DONE.load(Ordering::Acquire) || authority_pending(cpu) {
         if cpu == 0 {
+            #[cfg(feature = "device-test")]
+            devices::service();
             #[cfg(feature = "authority-test")]
             {
                 let (paging, spaces) = bsp_paging.as_mut().expect("authority BSP paging");
@@ -1299,12 +1366,16 @@ fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, [&UserSpace;
             if work {
                 continue;
             }
+            #[cfg(feature = "device-test")]
+            devices::idle_timer(cpu, authority_pending(cpu));
             local.set(field::PHASE, IDLE);
             local.inc(field::IDLES);
             unsafe {
                 neu_smp_sched_idle(ptr::from_ref(&local.words[field::GENERATION]), generation);
             }
             local.set(field::PHASE, KERNEL);
+            #[cfg(feature = "device-test")]
+            devices::idle_timer(cpu, false);
         }
         if DONE.load(Ordering::Acquire) {
             notify(cpu, (1 << smp::cpu_count()) - 1);
@@ -1699,6 +1770,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     ))
     .map_err(|_| "SMP baseline serial")?;
     probe_wait();
+    #[cfg(feature = "device-test")]
+    devices::init(paging)?;
     let barrier = paging
         .translate(ptr::addr_of!(neu_smp_sched_barrier) as u64)
         .map_err(|_| "SMP barrier translation")?
@@ -1790,6 +1863,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         s.nodes
             .bootstrap_channel(&mut s.objects, nodes[0].unwrap(), nodes[1].unwrap())
             .map_err(|_| "SMP Channel bootstrap")?;
+        #[cfg(feature = "device-test")]
+        devices::bootstrap(s)?;
         for id in nodes.into_iter().flatten() {
             let table = s.nodes.authority_mut(id).map_err(|_| "SMP manifest")?;
             #[cfg(not(feature = "authority-test"))]
@@ -1825,7 +1900,11 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
                 .bootstrap_get(&s.objects, t.node, 4)
                 .map_err(|_| "SMP endpoint handle")?
                 .raw();
-            let action = if cfg!(feature = "authority-test") {
+            let action = if cfg!(feature = "device-test") {
+                30
+            } else if cfg!(feature = "test-smp-device-disabled") {
+                18
+            } else if cfg!(feature = "authority-test") {
                 20
             } else if cfg!(feature = "test-smp-authority-disabled") {
                 19
@@ -2017,6 +2096,8 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         }
         Ok(())
     })?;
+    #[cfg(feature = "device-test")]
+    devices::cleanup(paging)?;
     if paging.stats() != before || paging.table_count() != tables || paging::current_root() != root
     {
         return Err("SMP final allocator/table mismatch");

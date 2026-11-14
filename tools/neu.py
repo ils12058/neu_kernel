@@ -201,7 +201,7 @@ def elf_info(path):
         for offset in range(section[4], section[4] + section[5], section[9]):
             name, _, _, _, value, _ = struct.unpack_from("<IBBHQQ", data, offset)
             label = names[name:names.find(b"\0", name)].decode("ascii")
-            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_", "neu_authority_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
+            if label.startswith(("neu_test_", "neu_user_", "__user_kernel_", "neu_native_", "__native_", "neu_abi_", "neu_node_", "neu_irq_", "neu_timer_", "neu_switch_", "neu_context_", "neu_preempt_", "neu_multi_", "neu_cap_", "neu_as_", "neu_ipc_", "neu_wait_", "neu_move_", "neu_memory_", "neu_smp_", "neu_authority_", "neu_device_")) or label in ("neu_halt_begin", "neu_halt_end", "__stack_bottom", "__stack_top",
                     "__df_stack_bottom", "__df_stack_top", "__kernel_start", "__kernel_end", "NEU_PF_PROBE", "NEU_LIVE_FAULT",
                     "__stack_guard_low", "__stack_guard_high", "__df_guard_low", "__df_guard_high",
                     "__text_start", "__text_end", "__data_start", "__rodata_start", "__rodata_end",
@@ -3253,6 +3253,8 @@ def run_case(case, esp, timeout):
         endpoint = temporary / "qmp.sock"
         arguments = qemu_command(esp, temporary, f"file:{serial}", endpoint,
                                  SMP_SCHEDULE.get(case, smp_qmp.CPUS.get(case, 1)))
+        if case in smp_scheduler_qmp.DEVICE:
+            arguments += ["-device", "edu,id=edu0,addr=05.0"]
         if case == "smp-schedule-stress":
             arguments[arguments.index("-m") + 1] = "1024M"
         if case in ("timer-xapic","preempt-xapic","threads-xapic","capabilities-xapic","address-space-xapic","channels-xapic","channels-wait-xapic","cap-moves-xapic","cap-moves-sender-fault-xapic","cap-moves-receiver-fault-after-xapic","cap-moves-backpressure-wait-xapic","memory-object-user-xapic"):
@@ -3557,6 +3559,7 @@ def main():
     elif args.action == "check":
         command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
         command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
+        command([require("python3"), str(ROOT / "tools/test_device_qmp.py")])
         command([require("cargo"), "fmt", "--all", "--", "--check"])
         for feature in FEATURES.values():
             arguments = [require("cargo"), "clippy", "--locked", "--target", TARGET]
@@ -3580,6 +3583,7 @@ def main():
             if not args.case:
                 command([require("python3"), str(ROOT / "tools/test_preempt_accounting.py")])
                 command([require("python3"), str(ROOT / "tools/test_authority_qmp.py")])
+                command([require("python3"), str(ROOT / "tools/test_device_qmp.py")])
                 report["observer_tests"] = {"passed": True}
             if not args.case or args.case in ("memory", "paging", "user", "native", "nodes", "timer", "switch"):
                 target = host_target()

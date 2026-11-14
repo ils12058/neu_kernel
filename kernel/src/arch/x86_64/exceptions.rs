@@ -680,6 +680,16 @@ pub(super) unsafe fn install_smp_scheduler_gates(idt: *mut u8) -> Result<(), &'s
             ptr::write(idt.cast::<Gate>().add(vector), Gate::new(handler, 0));
         }
     }
+    #[cfg(feature = "device-test")]
+    unsafe {
+        unsafe extern "C" {
+            fn neu_smp_sched_device();
+        }
+        ptr::write(
+            idt.cast::<Gate>().add(240),
+            Gate::new(neu_smp_sched_device as *const () as u64, 0),
+        );
+    }
     Ok(())
 }
 

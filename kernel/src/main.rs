@@ -161,7 +161,16 @@ const _: () = assert!(
         + cfg!(feature = "test-smp-authority-wait") as u8
         + cfg!(feature = "test-smp-authority-stress") as u8
         + cfg!(feature = "test-smp-authority-terminate") as u8
-        + cfg!(feature = "test-smp-authority-disabled") as u8)
+        + cfg!(feature = "test-smp-authority-disabled") as u8
+        + cfg!(feature = "test-smp-device-2") as u8
+        + cfg!(feature = "test-smp-device-4") as u8
+        + cfg!(feature = "test-smp-device-fault") as u8
+        + cfg!(feature = "test-smp-device-flight-fault") as u8
+        + cfg!(feature = "test-smp-device-close") as u8
+        + cfg!(feature = "test-smp-device-revoke") as u8
+        + cfg!(feature = "test-smp-device-timeout") as u8
+        + cfg!(feature = "test-smp-device-budget") as u8
+        + cfg!(feature = "test-smp-device-disabled") as u8)
         <= 1,
     "build one fault-injection image at a time"
 );

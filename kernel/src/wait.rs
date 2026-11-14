@@ -199,7 +199,7 @@ impl Default for Waits {
     }
 }
 impl Waits {
-    #[cfg(any(feature = "authority-test", test))]
+    #[cfg(any(feature = "authority-test", feature = "device-test", test))]
     pub fn authority_grants(&self) -> [u64; WAITERS] {
         core::array::from_fn(|index| {
             self.slots[index]

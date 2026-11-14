@@ -10,6 +10,11 @@ pub use mapping::{MapPermit, MapRequest, MappingBinding, TrackedMapAuthority};
 pub const HANDLES: usize = 8;
 pub const OBJECTS: usize = 4;
 pub const CHANNEL_OBJECTS: usize = 6;
+const STORAGE_OBJECTS: usize = if cfg!(any(feature = "device-test", test)) {
+    9
+} else {
+    CHANNEL_OBJECTS
+};
 pub const BOOTSTRAP: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -20,6 +25,9 @@ pub enum ObjectType {
     AddressSpace = 3,
     ChannelEndpoint = 4,
     MemoryObject = 5,
+    DeviceResource = 6,
+    MmioRegion = 7,
+    Interrupt = 8,
 }
 impl ObjectType {
     fn from_raw(value: u8) -> Self {
@@ -29,6 +37,9 @@ impl ObjectType {
             3 => Self::AddressSpace,
             4 => Self::ChannelEndpoint,
             5 => Self::MemoryObject,
+            6 => Self::DeviceResource,
+            7 => Self::MmioRegion,
+            8 => Self::Interrupt,
             _ => Self::None,
         }
     }
@@ -50,6 +61,10 @@ impl Rights {
     pub const SEND_CAPS: Self = Self(128);
     pub const DERIVE: Self = Self(256);
     pub const REVOKE: Self = Self(512);
+    // Object-specific meanings; no new bits in the legacy rights decoder.
+    pub const CLAIM: Self = Self(4);
+    pub const WAIT: Self = Self(1);
+    pub const ACKNOWLEDGE: Self = Self(2);
     pub const NONE: Self = Self(0);
     pub fn from_bits(bits: u64) -> Result<Self> {
         if bits == 0 || bits & !0x7f != 0 {
@@ -84,6 +99,8 @@ impl Rights {
             ObjectType::AddressSpace => access & !16 == 0,
             ObjectType::ChannelEndpoint => access != 0 && access & !224 == 0,
             ObjectType::MemoryObject => access != 0 && access & !0x0f == 0,
+            ObjectType::DeviceResource => access != 0 && access & !0x14 == 0,
+            ObjectType::MmioRegion | ObjectType::Interrupt => access != 0 && access & !3 == 0,
         }
     }
     fn contains(self, required: Self) -> bool {
@@ -184,6 +201,10 @@ enum Value {
         reference: crate::paging::SpaceRef,
     },
     MemoryObject(crate::paging::MemoryObjectRef),
+    Device {
+        kind: ObjectType,
+        generation: u64,
+    },
 }
 impl Value {
     fn kind(&self) -> ObjectType {
@@ -194,6 +215,7 @@ impl Value {
             Self::Flag(_) => ObjectType::Flag,
             Self::AddressSpace { .. } => ObjectType::AddressSpace,
             Self::MemoryObject(_) => ObjectType::MemoryObject,
+            Self::Device { kind, .. } => *kind,
         }
     }
     fn target(&self) -> u64 {
@@ -201,6 +223,7 @@ impl Value {
             Self::Endpoint(reference) => reference.id().raw(),
             Self::AddressSpace { reference, .. } => reference.id().raw(),
             Self::MemoryObject(reference) => reference.id().raw(),
+            Self::Device { generation, .. } => *generation,
             Self::None | Self::Counter(_) | Self::Flag(_) => 0,
         }
     }
@@ -266,7 +289,7 @@ pub struct ObjectInfo {
     pub pins: u32,
 }
 pub struct Objects {
-    slots: [Object; CHANNEL_OBJECTS],
+    slots: [Object; STORAGE_OBJECTS],
     limit: usize,
     channels: crate::channel::Channels,
     waits: Waits,
@@ -274,7 +297,7 @@ pub struct Objects {
     /// released without the architecture registry. Bounded so collection can
     /// never grow without limit; a full pending array leaves the dead slot
     /// occupied until the next architecture reap.
-    pending: [Option<crate::paging::MemoryObjectRef>; CHANNEL_OBJECTS],
+    pending: [Option<crate::paging::MemoryObjectRef>; STORAGE_OBJECTS],
     lineage: Lineage,
     mappings: [MappingBinding; crate::paging::MAPPINGS],
 }
@@ -286,11 +309,11 @@ impl Default for Objects {
 impl Objects {
     pub const fn new() -> Self {
         Self {
-            slots: [const { Object::EMPTY }; CHANNEL_OBJECTS],
+            slots: [const { Object::EMPTY }; STORAGE_OBJECTS],
             limit: OBJECTS,
             channels: crate::channel::Channels::new(),
             waits: Waits::new(),
-            pending: [const { None }; CHANNEL_OBJECTS],
+            pending: [const { None }; STORAGE_OBJECTS],
             lineage: Lineage::new(),
             mappings: [MappingBinding::EMPTY; crate::paging::MAPPINGS],
         }
@@ -298,6 +321,13 @@ impl Objects {
     pub const fn with_channels() -> Self {
         Self {
             limit: CHANNEL_OBJECTS,
+            ..Self::new()
+        }
+    }
+    #[cfg(any(feature = "device-test", test))]
+    pub const fn with_devices() -> Self {
+        Self {
+            limit: STORAGE_OBJECTS,
             ..Self::new()
         }
     }
@@ -310,7 +340,7 @@ impl Objects {
             1,
             self as *const Self as u64,
             size::<Self>() as u64,
-            CHANNEL_OBJECTS as u64,
+            STORAGE_OBJECTS as u64,
             self.slots.as_ptr() as u64,
             size::<Object>() as u64,
             off!(Object, generation) as u64,
@@ -367,7 +397,7 @@ impl Objects {
     pub fn live_grants(&self) -> usize {
         self.lineage.live()
     }
-    #[cfg(any(feature = "authority-test", test))]
+    #[cfg(any(feature = "authority-test", feature = "device-test", test))]
     pub fn authority_wait_grants(&self) -> [u64; WAITERS] {
         self.waits.authority_grants()
     }
@@ -403,7 +433,7 @@ impl Objects {
         }
         Ok(count)
     }
-    #[cfg(any(feature = "authority-test", test))]
+    #[cfg(any(feature = "authority-test", feature = "device-test", test))]
     pub fn authority_layout(&self) -> [u64; 14] {
         self.lineage.diagnostic_layout()
     }
@@ -712,6 +742,63 @@ impl Objects {
     pub fn flag(&mut self, value: bool) -> Result<ObjectRef> {
         self.create(Value::Flag(value))
     }
+    /// Trusted device manager only. No syscall accepts a raw device object ID.
+    pub fn device_resource(&mut self) -> Result<ObjectRef> {
+        self.create(Value::Device {
+            kind: ObjectType::DeviceResource,
+            generation: 0,
+        })
+    }
+    /// Publish both typed handles atomically under the shared transaction. Every
+    /// failure releases all provisional object/lineage references.
+    pub fn install_device_lease(
+        &mut self,
+        table: &mut Table,
+        generation: u64,
+    ) -> Result<(Handle, Handle)> {
+        if generation == 0 {
+            return Err(Error::Object);
+        }
+        if self
+            .slots
+            .iter()
+            .take(self.limit)
+            .filter(|s| s.free())
+            .count()
+            < 2
+            || table.slots.iter().filter(|s| s.free()).count() < 2
+        {
+            return Err(Error::Capacity);
+        }
+        let mmio = self.create(Value::Device {
+            kind: ObjectType::MmioRegion,
+            generation,
+        })?;
+        let irq = self
+            .create(Value::Device {
+                kind: ObjectType::Interrupt,
+                generation,
+            })
+            .expect("device object capacity preflight");
+        let rights = Rights::READ_WRITE
+            .union(Rights::DERIVE)
+            .union(Rights::REVOKE);
+        let result = match table.grant(self, &mmio, rights) {
+            Err(error) => Err(error),
+            Ok(m) => match table.grant(self, &irq, rights) {
+                Ok(i) => Ok((m, i)),
+                Err(error) => {
+                    table
+                        .close(self, table.id.owner(), m)
+                        .expect("provisional device handle");
+                    Err(error)
+                }
+            },
+        };
+        self.release(mmio).expect("device creator reference");
+        self.release(irq).expect("interrupt creator reference");
+        result
+    }
     fn free_slot(&self) -> Result<usize> {
         self.slots
             .iter()
@@ -768,7 +855,7 @@ impl Objects {
     /// checks precede mutation. The exclusive transaction makes commit infallible;
     /// no userspace or IRQ can observe a half-published pair.
     pub fn install_channel(&mut self, a: &mut Table, b: &mut Table) -> Result<()> {
-        if self.limit != CHANNEL_OBJECTS {
+        if self.limit < CHANNEL_OBJECTS {
             return Err(Error::Capacity);
         }
         for t in [&*a, &*b] {
@@ -878,9 +965,10 @@ impl Objects {
         match &self.object(id)?.value {
             Value::Counter(v) => Ok(*v),
             Value::Flag(v) => Ok(*v as u64),
-            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
-                Err(Error::Type)
-            }
+            Value::AddressSpace { .. }
+            | Value::Endpoint(_)
+            | Value::MemoryObject(_)
+            | Value::Device { .. } => Err(Error::Type),
             Value::None => Err(Error::Object),
         }
     }
@@ -890,9 +978,10 @@ impl Objects {
         match &self.object(id)?.value {
             Value::Counter(value) => Ok(value as *const u64 as u64),
             Value::Flag(value) => Ok(value as *const bool as u64),
-            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
-                Err(Error::Type)
-            }
+            Value::AddressSpace { .. }
+            | Value::Endpoint(_)
+            | Value::MemoryObject(_)
+            | Value::Device { .. } => Err(Error::Type),
             Value::None => Err(Error::Object),
         }
     }
@@ -956,7 +1045,11 @@ impl Objects {
                     .expect("pending capacity preflight");
                 self.pending[index] = Some(reference);
             }
-            Value::None | Value::Counter(_) | Value::Flag(_) | Value::AddressSpace { .. } => {}
+            Value::None
+            | Value::Counter(_)
+            | Value::Flag(_)
+            | Value::AddressSpace { .. }
+            | Value::Device { .. } => {}
         }
     }
     fn release_id(&mut self, id: ObjectId) -> Result<()> {
@@ -1027,7 +1120,7 @@ pub struct Table {
     sealed: bool,
 }
 impl Table {
-    #[cfg(any(feature = "authority-test", test))]
+    #[cfg(any(feature = "authority-test", feature = "device-test", test))]
     pub fn grant_offset() -> u64 {
         core::mem::offset_of!(Slot, grant) as u64
     }
@@ -1339,6 +1432,28 @@ impl Table {
         self.slots[endpoint.parts()?.0].rights = Rights(224);
         Ok(())
     }
+    #[cfg(any(feature = "device-test", test))]
+    pub fn configure_devices(&mut self, objects: &mut Objects, resource: &ObjectRef) -> Result<()> {
+        if self.sealed || !self.live || resource.id.kind() != ObjectType::DeviceResource {
+            return Err(Error::InUse);
+        }
+        for index in [1, 2, 5, 6, 7] {
+            if let Some(handle) = self.bootstrap[index].take() {
+                self.close(objects, self.id.owner(), handle)?;
+            }
+        }
+        self.bootstrap_limit = BOOTSTRAP;
+        self.install_bootstrap(
+            objects,
+            resource,
+            Rights::INSPECT
+                .union(Rights::CLAIM)
+                .union(Rights::DERIVE)
+                .union(Rights::REVOKE),
+            5,
+        )?;
+        Ok(())
+    }
     /// Explicit trusted bootstrap grant of authority-management rights. Sealed
     /// tables cannot acquire these rights except by a rights-subset derivation.
     pub fn configure_delegation(&mut self, objects: &mut Objects, handle: Handle) -> Result<()> {
@@ -1591,6 +1706,26 @@ impl Table {
         self.slots[slot].grant = GrantId::NONE;
         Ok(())
     }
+    /// Called only after operations on this device generation have been denied.
+    /// This does not remove the independent DeviceResource authority.
+    pub fn retire_device_lease(&mut self, objects: &mut Objects, generation: u64) -> Result<usize> {
+        let mut count = 0;
+        for slot in 0..HANDLES {
+            let entry = &self.slots[slot];
+            if entry.live
+                && matches!(entry.kind, ObjectType::MmioRegion | ObjectType::Interrupt)
+                && matches!(objects.object(entry.target)?.value, Value::Device { generation: g, .. } if g == generation)
+            {
+                self.close(
+                    objects,
+                    self.id.owner(),
+                    Handle::new(slot, entry.generation),
+                )?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
     pub fn drain(&mut self, objects: &mut Objects, owner: NodeId) -> Result<usize> {
         self.owner(owner)?;
         let mut released = 0;
@@ -1622,6 +1757,13 @@ pub struct Guard<'a> {
     grant: GrantId,
 }
 impl Guard<'_> {
+    /// The generation is data from the guarded typed object, not user authority.
+    pub fn device_generation(&self) -> Result<u64> {
+        match self.objects.object(self.id)?.value {
+            Value::Device { generation, .. } => Ok(generation),
+            _ => Err(Error::Type),
+        }
+    }
     #[cfg(any(feature = "cap-test", feature = "cap-move-test"))]
     pub fn value_address(&self) -> u64 {
         self.objects.value_address(self.id).expect("guarded value")
@@ -1638,9 +1780,10 @@ impl Guard<'_> {
         match &self.objects.object(self.id)?.value {
             Value::Counter(v) => Ok(*v),
             Value::Flag(v) => Ok(*v as u64),
-            Value::AddressSpace { .. } | Value::Endpoint(_) | Value::MemoryObject(_) => {
-                Err(Error::Type)
-            }
+            Value::AddressSpace { .. }
+            | Value::Endpoint(_)
+            | Value::MemoryObject(_)
+            | Value::Device { .. } => Err(Error::Type),
             Value::None => Err(Error::Object),
         }
     }
@@ -1812,6 +1955,8 @@ impl Lease {
 
 #[cfg(test)]
 mod authority_tests;
+#[cfg(test)]
+mod device_tests;
 #[cfg(test)]
 mod moves_tests;
 #[cfg(test)]

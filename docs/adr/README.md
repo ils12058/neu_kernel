@@ -360,6 +360,23 @@ invalidation. Experimental ABI 0.6 exposes only local scalar authority calls.
 All 324 host tests pass in both configurations, 29 Python observer tests pass,
 all 189 registered QEMU cases pass, and five authority cases pass again with
 identical images. Formatting, lint, default build and the retained-evidence
-audit pass. The bounded four-CPU/two-Node/three-Thread scope remains in force;
-K11 device primitives are next. [K10 completion](../K10_COMPLETION.md) records
-the accepted evidence. Earlier ADRs retain their historical scope.
+audit pass. The bounded four-CPU/two-Node/three-Thread scope remains in force.
+Subsequent device work is recorded below. [K10 completion](../K10_COMPLETION.md)
+records the accepted evidence. Earlier ADRs retain their historical scope.
+
+## K11 record — bounded userspace device primitives
+
+| ADR | Status | Related scope |
+| --- | --- | --- |
+| [0031: Bounded userspace device primitives](0031-bounded-userspace-device-primitives.md) | Accepted for bounded K11 completion | Typed device authority, mediated MMIO, real INTx delivery, driver loss and safe reassignment |
+
+ADR 0031 keeps the EDU page supervisor-only and bus mastering/MSI disabled.
+DeviceResource claims create generation-bound MmioRegion/Interrupt handles;
+blocking delivery and ACK preserve exact receiver/sequence ownership. Old
+commands and neutral resets finish their actual completion raise before reuse.
+Close/revoke, faults, watchdog/budget quarantine and BSP wakeups are verified.
+All 339 host tests pass in three configurations, 42 Python regressions pass,
+198 QEMU profiles pass and nine K11 profiles repeat on identical images.
+The frozen-source/image/conservation audit, lint and default build pass.
+[K11 completion](../K11_COMPLETION.md) records the fixed QEMU scope and limits;
+earlier ADRs retain their historical facts.

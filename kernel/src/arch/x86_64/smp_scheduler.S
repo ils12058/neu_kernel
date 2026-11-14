@@ -172,6 +172,13 @@ neu_smp_sched_syscall:
     call neu_smp_sched_boundary
     ud2
 
+.if NEU_DEVICE
+.global neu_smp_sched_device
+neu_smp_sched_device:
+    push 0
+    push 240
+    jmp neu_smp_sched_irq_common
+.endif
 .global neu_smp_sched_timer, neu_smp_sched_ipi, neu_smp_sched_spurious
 neu_smp_sched_timer:
     push 0
@@ -323,6 +330,7 @@ neu_smp_sched_tlb_probe_end:
 .global neu_smp_sched_barrier
 neu_smp_sched_barrier: .skip 4096
 
+.if !NEU_DEVICE
 # Same payload for every Thread; bootstrap stack words select tag and action.
 # DATA has 128-byte private records per tag: progress, canary, ABI, received
 # value, terminal tag. The two Threads of Node A share DATA but own disjoint
@@ -415,6 +423,8 @@ neu_smp_sched_user_loop_begin:
     cmp qword ptr [r15], 1
     jne neu_smp_sched_user_loop_begin
 neu_smp_sched_user_loop_end:
+    cmp qword ptr [rbp + 40], 18
+    je neu_device_disabled
     cmp qword ptr [rbp + 40], 19
     je neu_authority_disabled
     cmp qword ptr [rbp + 40], 20
@@ -800,6 +810,23 @@ neu_authority_pending_fault_wait:
 neu_authority_pending_fault_site:
     mov qword ptr [rax], 255   # cancels requester while its revoke is pending
     jmp neu_smp_sched_bad
+neu_device_disabled:
+    mov rdi, [rbp + 56]
+    xor esi, esi
+    AUTH_ZERO
+    mov r13d, 0x1b
+neu_device_disabled_loop:
+    mov rax, r13
+    syscall
+    cmp rax, -1
+    jne neu_smp_sched_bad
+    test rdx, rdx
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    inc r13
+    cmp r13, 0x22
+    jne neu_device_disabled_loop
+    jmp neu_smp_sched_user_done
 neu_authority_disabled:
     mov rdi, [rbp + 56]
     mov esi, 1
@@ -823,3 +850,4 @@ neu_authority_disabled:
     inc qword ptr [rbp + 104]
     jmp neu_smp_sched_user_done
 neu_smp_sched_payload_end:
+.endif

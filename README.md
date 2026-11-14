@@ -5,59 +5,53 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-**K10 / Advanced authority is complete for bounded x86-64/QEMU:** at most
-four CPUs, two Nodes and three Threads. Explicit DERIVE/REVOKE rights support
-fresh Node-local handles with exact rights subsets and revocation of strict
-descendants. The source, outside branches and independently granted authority
-survive. Cross-Node delegation uses the existing atomic Channel move.
+**K11 / Device primitives is complete for bounded x86-64/QEMU.** A static
+userspace driver exclusively claims one QEMU EDU device, accesses allowlisted
+32-bit registers through typed capabilities, blocks for real hardware IRQs and
+acknowledges exact delivery sequences. Two/four-CPU profiles demonstrate
+liveness, factorial calculation, rejected unauthorized access, driver faults,
+close/revoke cancellation, watchdog/budget quarantine and safe reassignment.
 
-Revocation purges affected handles and queued transfers, cancels blocked
-operations and removes affected MemoryObject mappings. Mapping provenance and
-backing survive handle close and remain owned until every online CPU completes
-its actual TLB invalidation. A cancelled requester cannot abandon pending
-reclamation. Independent mappings and their data remain usable.
+The trusted backend uses Q35 INTx through I/O APIC GSI 21 to BSP vector 240.
+The device page stays supervisor RW/NX/UC; bus mastering and MSI stay disabled.
+Cleanup waits for the old command and the neutral reset's actual completion,
+drains interrupt state and scrubs register data before the next claim. The
+successor driver also completes its own factorial operation. New service work
+uses the existing wake/IPI protocol when the BSP is idle.
 
-K9 supplies synchronized per-CPU FIFO scheduling, concurrent same-Node Threads,
-saved-context migration, native/timer entry, idle/IPI wakeups and Node-fault
-quiescence. Shared authority, Channel and lifecycle transactions run under one
-explicit lock with IF=0; IRQ handlers publish CPU-local state without taking
-that lock. Allocation, root preparation and final teardown remain BSP-owned.
-K8 supplies shared MemoryObjects and suspended runtime mapping at safe points.
+Validation passes **339 Rust tests in each of default, authority and device
+configurations; 42 Python observer regressions; all 198 QEMU profiles; and nine
+K11 repeats using the exact same images**. Formatting, all profile/host-library
+clippy checks, doctor and the default build pass. The audit verifies all 94
+frozen code/build/observer inputs, tested image hashes, actual IRQ/reset/native
+observations and exact resource conservation in all 29 scheduled profiles.
 
-Current validation passes **324 Rust host tests in both default and authority
-configurations, 29 Python observer tests and 189 registered QEMU executions**,
-plus **five focused authority repeats using identical kernel images**.
-Formatting, all profile/host-library clippy checks and the default build pass.
-All tested image hashes match their manifests. Every scheduled profile restores
-the exact allocator bitmap and original table inventory, with zero final user
-roots, references, pins, authority, mappings or waits.
+[K11 completion](docs/K11_COMPLETION.md) records scope, hashes and preserved
+development corrections. [Implementation status](docs/IMPLEMENTATION_STATUS.md),
+[ADR 0031](docs/adr/0031-bounded-userspace-device-primitives.md),
+[experimental ABI 0.7](docs/abi/experimental-v0.7.md) and
+[the device QMP protocol](docs/testing/device-qmp.md) describe device authority,
+hardware retirement and independent verification.
 
-[The K10 completion contract](docs/K10_COMPLETION.md) records the accepted
-scope, evidence hashes and preserved validation corrections.
-[Implementation status](docs/IMPLEMENTATION_STATUS.md),
-[ADR 0030](docs/adr/0030-bounded-capability-derivation-and-revocation.md) and
-[the authority QMP protocol](docs/testing/authority-qmp.md) cover lineage,
-mapping retirement and independent hardware observations.
-[ADR 0029](docs/adr/0029-bounded-scheduled-smp.md) and
-[the SMP QMP protocol](docs/testing/smp-qmp.md) retain K9's execution contract;
-[the MemoryObject QMP protocol](docs/testing/memory-object-qmp.md) covers K8.
+K10 supplies derivation/revocation and mapping lifetime with actual remote TLB
+invalidation; [its completion contract](docs/K10_COMPLETION.md) retains that
+evidence. K9 supplies synchronized per-CPU scheduling, native/timer contexts,
+idle/IPI wakeups and Node-fault quiescence. K8 supplies shared MemoryObjects.
+Architecture v0.2 remains the baseline and earlier images retain their ABI
+versions. Device profiles advertise ABI 0.7; authority profiles retain 0.6.
 
-Architecture v0.2 remains the baseline. Authority profiles implement
-[experimental ABI 0.6](docs/abi/experimental-v0.6.md); earlier profiles retain
-their existing versions and reject the new operations. The execution model
-uses fixed metadata pools, guarded private Thread stacks, integer execution
-and non-preemptible kernel transactions. **K11 device primitives are next:**
-selected userspace driver support with authorized MMIO/IRQ access. Untrusted
-DMA requires suitable isolation. General object/mapping/Thread factories,
-work stealing, load balancing, kernel preemption, arbitrary AP allocation,
-TLS/FPU/SIMD scheduling, physical hardware, COW and demand paging remain later
-work.
+The accepted environment remains at most four CPUs, two Nodes, three Threads,
+fixed pools, integer contexts and IRQ-disabled shared transactions. The
+roadmap's K0–K11 milestones are bounded kernel proofs. General PCI/driver loading,
+direct user MMIO, DMA/IOMMU, MSI/MSI-X, public object/mapping/Thread factories,
+arbitrary AP allocation, balancing, kernel preemption, TLS/FPU/SIMD scheduling,
+COW and demand paging remain future work.
 
-Default and legacy images boot one vCPU; SMP profiles select 1, 2 or 4.
-Normal profiles use 512 MiB and the longer K9 four-CPU scheduling stress profile
-uses 1 GiB. The verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF,
-Rust 1.95.0 and Limine 12.9.4/base 6 on Apple Silicon. Validation is local;
-physical hardware and hosted CI have not been exercised.
+Default and legacy images boot one vCPU; SMP profiles select 1, 2 or 4. Normal
+profiles use 512 MiB; the longer scheduling stress profile uses 1 GiB. The
+verified platform is QEMU 11.0.0 TCG/q35, UEFI/OVMF, Rust 1.95.0 and
+Limine 12.9.4/base 6 on Apple Silicon. Validation is local; physical hardware
+and hosted CI have not been exercised.
 
 ## Build and run
 
@@ -183,9 +177,25 @@ sibling fault and requires reclamation to finish. `--case smp-authority-disabled
 checks ABI 0.5 rejection. Every page/CPU invalidation requires an actual
 post-instruction, pre-ACK observation, followed by exact final conservation.
 
+Run `python3 tools/neu.py test --case smp-device-2` or `--case smp-device-4`
+for actual userspace claims, register operations, blocking IRQs, factorials and
+safe reassignment. `--case smp-device-fault` contains a direct-MMIO protection
+fault; `--case smp-device-flight-fault` also retires an old in-flight command.
+`--case smp-device-close` and `--case smp-device-revoke` cancel actual blocked
+IRQ waits. `--case smp-device-timeout` and `--case smp-device-budget` enforce
+progress limits; `--case smp-device-disabled` verifies legacy ABI rejection.
+The tool adds EDU only for the eight enabled profiles. Each requires actual
+hardware IRQ and masked-reset completion observations, every returning syscall
+and exact final device/allocator/authority cleanup.
+
 ## Documentation
 
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
+- [Accepted K11 completion contract](docs/K11_COMPLETION.md)
+- [Experimental device ABI 0.7](docs/abi/experimental-v0.7.md)
+- [Device QMP evidence](docs/testing/device-qmp.md)
+- [Accepted K10 completion contract](docs/K10_COMPLETION.md)
+- [Experimental authority ABI 0.6](docs/abi/experimental-v0.6.md)
 - [Accepted K9 completion contract](docs/K9_COMPLETION.md)
 - [Experimental blocking Channel ABI 0.4](docs/abi/experimental-v0.4.md)
 - [Experimental capability-move ABI 0.5](docs/abi/experimental-v0.5.md)

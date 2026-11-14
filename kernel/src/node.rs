@@ -188,6 +188,27 @@ impl Nodes {
         }
         Ok(count)
     }
+    /// Device manager sweep under the same exclusive SMP transaction as leases.
+    #[cfg(feature = "device-test")]
+    pub fn retire_device_authority(
+        &mut self,
+        objects: &mut crate::capability::Objects,
+        generation: u64,
+    ) -> crate::capability::Result<usize> {
+        if self
+            .nodes
+            .iter()
+            .zip(&self.tables)
+            .any(|(n, t)| n.is_some_and(|n| n.state != NodeState::Reclaimed) && t.is_none())
+        {
+            return Err(crate::capability::Error::InUse);
+        }
+        let mut count = 0;
+        for table in self.tables.iter_mut().flatten() {
+            count += table.retire_device_lease(objects, generation)?;
+        }
+        Ok(count)
+    }
     pub fn authority(&self, id: NodeId) -> Result<&crate::capability::Table> {
         if self.node(id)?.state == NodeState::Reclaimed {
             return Err(Error::Identity);

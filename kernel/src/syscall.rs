@@ -144,6 +144,58 @@ pub mod v06 {
     }
 }
 
+/// K11: typed device claims, exact mediated MMIO and one interrupt waiter.
+pub mod v07 {
+    pub const DEVICE_INSPECT: u64 = 0x1b;
+    pub const DEVICE_CLAIM: u64 = 0x1c;
+    pub const DEVICE_INTERRUPT: u64 = 0x1d;
+    pub const MMIO_READ: u64 = 0x1e;
+    pub const MMIO_WRITE: u64 = 0x1f;
+    pub const INTERRUPT_WAIT: u64 = 0x20;
+    pub const INTERRUPT_ACK: u64 = 0x21;
+    pub const FEATURE_DEVICE: u32 = 512;
+    pub const INFO: u64 = super::version(0, 7, 511 | FEATURE_DEVICE);
+    pub fn owns(number: u64) -> bool {
+        (DEVICE_INSPECT..=INTERRUPT_ACK).contains(&number)
+    }
+    pub fn valid_arguments(number: u64, args: [u64; 6]) -> bool {
+        let used = match number {
+            DEVICE_INSPECT | INTERRUPT_ACK => 2,
+            DEVICE_CLAIM | DEVICE_INTERRUPT | INTERRUPT_WAIT => 1,
+            MMIO_READ => 3,
+            MMIO_WRITE => 4,
+            _ => return false,
+        };
+        args[used..].iter().all(|v| *v == 0)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn device_namespace_is_versioned_and_disabled_in_legacy_dispatch() {
+            assert_eq!(INFO, 0x7000003ff);
+            for op in DEVICE_INSPECT..=INTERRUPT_ACK {
+                assert!(owns(op));
+                assert_eq!(
+                    super::super::dispatch(op, [0; 6]),
+                    super::super::Outcome::Return {
+                        status: -1,
+                        scalar: 0
+                    }
+                );
+                assert!(valid_arguments(op, [0; 6]));
+                for i in 4..6 {
+                    let mut a = [0; 6];
+                    a[i] = 1 << 63;
+                    assert!(!valid_arguments(op, a));
+                }
+            }
+            assert!(!owns(0x22));
+            assert!(!valid_arguments(0x22, [0; 6]));
+        }
+    }
+}
+
 pub const KERNEL_CS: u64 = 8;
 pub const KERNEL_SS: u64 = 0x10;
 pub const USER_CS: u64 = 0x3b;
