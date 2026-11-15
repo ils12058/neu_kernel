@@ -37,11 +37,84 @@ neu_smp_sched_payload:
     add rbp, r14
     mov [rbp + 40], r11
     mov [rbp + 48], r10
+.if NEU_CPU_STATE
+    lea rdi, [r12 - 1]
+    shl rdi, 9
+    lea rdi, [rdi + r14 + 0x400]
+    fxsave64 [rdi]
+.endif
     mov eax, 1
     syscall
 neu_smp_sched_query_resume:
     OK
     mov [rbp + 16], rdx
+.if NEU_CPU_STATE
+    xor edi, edi
+    Z
+    mov eax, 0x2a
+    syscall
+    or rax, rdx
+    jne dma_bad
+    mov edi, 0x402200
+    cmp r12, 3
+    jne 20f
+    add edi, 0x20
+20: Z
+    mov eax, 0x29
+    syscall
+    or rax, rdx
+    jne dma_bad
+    mov qword ptr fs:[0], r13
+    mov qword ptr fs:[8], r12
+    mov word ptr fs:[16], 0x37f
+    fldcw word ptr fs:[16]
+    mov dword ptr fs:[16], 0x1f80
+    ldmxcsr dword ptr fs:[16]
+.macro DMA_CPU_ST index
+    mov rax, r12
+    imul rax, 100
+    add rax, \index
+    mov qword ptr fs:[16], rax
+    fild qword ptr fs:[16]
+.endm
+    DMA_CPU_ST 1
+    DMA_CPU_ST 2
+    DMA_CPU_ST 3
+    DMA_CPU_ST 4
+    DMA_CPU_ST 5
+    DMA_CPU_ST 6
+    DMA_CPU_ST 7
+    DMA_CPU_ST 8
+.macro DMA_CPU_XMM register, index
+    mov rax, r12
+    shl rax, 48
+    mov ecx, \index
+    shl rcx, 32
+    or rax, rcx
+    mov edx, 0x11223344
+    or rax, rdx
+    movq \register, rax
+    punpcklqdq \register, \register
+.endm
+    DMA_CPU_XMM xmm0, 0
+    DMA_CPU_XMM xmm1, 1
+    DMA_CPU_XMM xmm2, 2
+    DMA_CPU_XMM xmm3, 3
+    DMA_CPU_XMM xmm4, 4
+    DMA_CPU_XMM xmm5, 5
+    DMA_CPU_XMM xmm6, 6
+    DMA_CPU_XMM xmm7, 7
+    DMA_CPU_XMM xmm8, 8
+    DMA_CPU_XMM xmm9, 9
+    DMA_CPU_XMM xmm10, 10
+    DMA_CPU_XMM xmm11, 11
+    DMA_CPU_XMM xmm12, 12
+    DMA_CPU_XMM xmm13, 13
+    DMA_CPU_XMM xmm14, 14
+    DMA_CPU_XMM xmm15, 15
+.global neu_cpu_dma_seed_done
+neu_cpu_dma_seed_done:
+.endif
     xor edi, edi
     mov eax, 0x10
     syscall
@@ -411,6 +484,17 @@ dma_done_wait:
     inc qword ptr [rbp]
     cmp qword ptr [r15 + 144], 1
     jne dma_done_wait
+.if NEU_CPU_STATE
+    lea rdi, [r12 - 1]
+    shl rdi, 9
+    lea rdi, [rdi + r14 + 0xa00]
+    fxsave64 [rdi]
+    mov rax, qword ptr fs:[0]
+    cmp rax, r13
+    jne dma_bad
+    cmp qword ptr fs:[8], r12
+    jne dma_bad
+.endif
     mov rax, -256
     syscall
 neu_smp_sched_yield_resume:

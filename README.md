@@ -5,45 +5,43 @@ architecture and x86-64 as its initial target under QEMU.
 
 ## Project status
 
-**PCI discovery → IOMMU isolation → authorized DMA is complete for the bounded
-x86-64/QEMU platform.** Reusable ACPI/PCI code discovers functions, bridges,
-capabilities and BARs. The Q35 backend selects EDU dynamically, including an
-alternate slot and a secondary PCIe bus. Intel VT-d constrains the requester to
-explicitly mapped buffers before bus mastering is enabled.
+**FPU/SIMD/TLS is complete for the bounded x86-64/QEMU SMP profiles.** Threads
+own initialized x87/MMX/SSE2 images and all sixteen XMM registers. Eager capture
+preserves FP and current-Thread TLS across native calls, interrupts, blocking,
+migration and Node containment, while restoring original kernel FP/FS/controls.
+Retirement scrubs live and saved state with generation-bound ownership.
 
-Experimental ABI 0.8 adds generation-bound DmaDomain/DmaBuffer capabilities and
-seven scalar operations. Userspace performs real DMA in both directions across
-noncontiguous physical pages, using the existing blocking IRQ/ACK protocol.
-Actual IOMMU faults prove rejection of unmapped, read-only, other-requester and
-revoked translations. Close, descendant revocation and Node fault are tested
-while hardware RUN is still active; ownership persists through completion,
-invalidation and verified host/device-buffer scrub before reassignment.
+Experimental ABI 0.9 adds full-width current-Thread FS_BASE SET/GET. Conventional
+profiles advertise `0x9000018ff`; the combined DMA profile advertises
+`0x900001fff`. Earlier profiles keep their versions, masks and integer guards.
+TLS memory layout, allocation and ELF/runtime policy remain userspace work.
 
-Validation passes **368 Rust tests in each of four configurations; 52 Python
-observer regressions; all 215 QEMU profiles; and all 17 new profiles repeated
-using the exact same images**. Formatting, lint for all 215 profiles and the host
-library, doctor and default build pass. The audit verifies 106 frozen inputs, image and
-firmware hashes, native/IRQ/DMA evidence, and exact final resource conservation
-in all 45 scheduled profiles. Earlier K11 evidence is preserved.
+Validation passes **385 Rust tests in each of five configurations; 64 Python
+observer regressions; all 231 runnable QEMU profiles; and all 16 new profiles
+repeated with the exact same images**. Doctor, formatting, profile/host lint and
+default build pass. The audit verifies 111 frozen inputs, image/firmware hashes,
+FP/TLS context streams and exact final conservation in all 59 scheduled profiles.
+All 1166 inventoried prior evidence and unrelated files remain intact.
 
-[PCI/DMA completion](docs/PCI_DMA_COMPLETION.md) records scope, measured results,
-hashes and development corrections. [ABI 0.8](docs/abi/experimental-v0.8.md),
-[ADR 0032](docs/adr/0032-pci-iommu-authorized-dma.md) and
-[the DMA QMP protocol](docs/testing/dma-qmp.md) define the interface and evidence.
-This is post-K11 work; the architecture roadmap has not assigned a K12.
+[CPU-state completion](docs/CPU_STATE_COMPLETION.md),
+[ABI 0.9](docs/abi/experimental-v0.9.md),
+[ADR 0033](docs/adr/0033-eager-fpu-simd-thread-tls.md) and the
+[FP/TLS QMP protocol](docs/testing/cpu-state-qmp.md) record implementation,
+measured acceptance and limits. QEMU TCG does not deliver unmasked SSE `#XM`;
+the pinned OVMF cannot reach Neu with FXSR disabled. Those paths remain
+explicitly unvalidated. Real `#MF`, SSE status, denied AVX/FSGSBASE and genuine
+SSE2/MMX CPU refusals are verified. Physical hardware and hosted CI are unvalidated.
 
-K11 supplies exclusive device claims, mediated registers, real INTx delivery and
-safe reassignment; its ABI 0.7 profiles retain disabled DMA. K10 supplies derived
-authority and remote TLB invalidation, K9 supplies SMP scheduling and K8 shared
-MemoryObjects. Their dated completion records and older ABI contracts remain.
+The accepted [PCI/IOMMU/DMA slice](docs/PCI_DMA_COMPLETION.md) provides reusable
+discovery, Intel legacy VT-d isolation, typed DMA authority and verified
+in-flight retirement. K11, K10, K9 and K8 retain their dated contracts. This is
+post-K11 work; the architecture roadmap has not assigned a K12.
 
-Executable acceptance uses QEMU 11.0.0 TCG/q35, Intel legacy VT-d, EDU,
-two/four CPUs, two Nodes, three Threads, fixed pools and integer contexts.
-Discovery is reusable; interrupt routing and the DMA engine remain platform
-and device specific. MSI/MSI-X delivery, interrupt remapping, AMD IOMMU,
-hotplug/AML, ATS/PASID/SVA, general driver loading, public factories,
-balancing, kernel preemption, FPU/SIMD/TLS, COW and demand paging remain future
-work. Physical hardware and hosted CI have not been validated.
+Executable acceptance uses QEMU 11.0.0 TCG/q35, two/four CPUs, two Nodes,
+three Threads and fixed pools; the combined profile uses EDU and Intel VT-d.
+MSI/MSI-X, interrupt remapping, AMD IOMMU, hotplug/AML, ATS/PASID/SVA,
+general driver loading, public factories, balancing, kernel preemption,
+AVX/XSAVE, ELF/TLS runtime construction, COW and demand paging remain future work.
 
 Default and legacy images use one vCPU; SMP profiles select 1, 2 or 4. Normal
 profiles use 512 MiB, and scheduling stress uses 1 GiB. The verified host is
@@ -192,8 +190,19 @@ and `--case smp-dma-submit-revoke` for revocation during active DMA. The
 no-IOMMU and ABI 0.5/0.7 controls. DMA profiles add Intel VT-d; ordinary K11
 profiles keep bus mastering disabled.
 
+Run `python3 tools/neu.py test --case cpu-state-2` for x87/MMX/SSE2/TLS,
+`--case cpu-state-migrate` for CPU migration, `--case cpu-state-kernel` for
+nonzero kernel-state restoration, or `--case cpu-state-dma` for combined
+DMA/IRQ preservation. `--case cpu-state-negative` checks full-width TLS errors;
+`--case cpu-state-disabled`, `--case cpu-state-no-sse2` and
+`--case cpu-state-no-mmx` verify legacy rejection and genuine CPU refusals.
+The [FP/TLS test protocol](docs/testing/cpu-state-qmp.md) lists all new cases.
+
 ## Documentation
 
+- [Accepted FPU/SIMD/TLS completion](docs/CPU_STATE_COMPLETION.md)
+- [Experimental CPU-state/TLS ABI 0.9](docs/abi/experimental-v0.9.md)
+- [FP/TLS QMP evidence](docs/testing/cpu-state-qmp.md)
 - [Architecture and design specification](docs/Neu_Kernel_Architecture_v0.2.md)
 - [Accepted PCI/IOMMU/DMA completion contract](docs/PCI_DMA_COMPLETION.md)
 - [Experimental DMA ABI 0.8](docs/abi/experimental-v0.8.md)

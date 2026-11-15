@@ -62,21 +62,30 @@ neu_exception_common:
     push r13
     push r14
     push r15
-    # GPRs already saved. No TLS/per-CPU GS contract exists: discard user
-    # segment/base state before invoking Rust; never use SWAPGS on this path.
+    # GPRs already saved. Extended profiles capture the owned FP/FS state
+    # before Rust; legacy profiles discard FS. Neither path uses SWAPGS here.
     test byte ptr [rsp + 144], 3
     jz 2f
+.if NEU_CPU_STATE
+    call neu_smp_sched_capture_extended
+.endif
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov ss, ax
     xor eax, eax
+.if !NEU_CPU_STATE
     mov fs, ax
+.endif
     mov gs, ax
     xor edx, edx
+.if NEU_CPU_STATE
+    mov ecx, 0xc0000101
+.else
     mov ecx, 0xc0000100
     wrmsr
     inc ecx
+.endif
     wrmsr
     inc ecx
     wrmsr

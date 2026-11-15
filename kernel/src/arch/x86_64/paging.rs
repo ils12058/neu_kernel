@@ -13,7 +13,14 @@ use neu_kernel::paging::{
 };
 
 const WINDOW: u64 = 0xffff_9000_0000_0000;
-const TABLES: usize = 64;
+// The combined FP/DMA diagnostic image holds two complete 2,048-row FP
+// streams. Its kernel mappings are privately reproduced in both Node roots,
+// so this fixture needs more table slots without changing legacy budgets.
+const TABLES: usize = if cfg!(all(feature = "cpu-state-test", feature = "dma-test")) {
+    96
+} else {
+    64
+};
 const SCRATCH_INDEX: usize = 511;
 const SCRATCH: u64 = WINDOW + SCRATCH_INDEX as u64 * PAGE;
 

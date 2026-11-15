@@ -396,3 +396,19 @@ precede reassignment. ABI 0.7 profiles retain ADR 0031's disabled-DMA contract.
 same-image repeats, four 368-test host configurations, 52 observer tests and
 the frozen evidence audit. This is post-K11 work without an assigned K12;
 broader platform and driver support remain separate obligations.
+
+
+## Post-PCI/DMA record — eager CPU state and Thread TLS
+
+| ADR | Status | Related scope |
+| --- | --- | --- |
+| [0033: Eager x87/MMX/SSE2 and Thread TLS](0033-eager-fpu-simd-thread-tls.md) | Accepted for bounded local x86-64/QEMU completion | Complete initialized FP images, exclusive Thread/CPU ownership, assembly capture and current-Thread FS_BASE |
+
+ADR 0033 adds eager FP/TLS ownership to native calls, interrupts, blocking,
+migration and Node containment. Earlier profiles retain their integer guards.
+[CPU-state completion](../CPU_STATE_COMPLETION.md) records 231 runnable QEMU
+profiles, 16 exact-image repeats, five 385-test host configurations,
+64 observer regressions and the frozen evidence audit. Actual `#XM` delivery,
+FXSR-deficient kernel boot, physical hardware and hosted CI remain unvalidated.
+ELF/TLS memory/runtime policy and AVX/XSAVE remain separate obligations.
+This work assigns no new K number.

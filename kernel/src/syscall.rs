@@ -17,6 +17,71 @@ pub const fn version(major: u16, minor: u16, features: u32) -> u64 {
 }
 pub const ABI_INFO: u64 = version(ABI_MAJOR, ABI_MINOR, FEATURE_QUERY | FEATURE_EXIT);
 
+/// Eager x87/SSE2 execution and current-Thread TLS. The underlying feature
+/// mask remains profile-specific; a new version never invents device support.
+pub mod v09 {
+    pub const THREAD_TLS_SET: u64 = 0x29;
+    pub const THREAD_TLS_GET: u64 = 0x2a;
+    pub const FEATURE_FPU_SSE2: u32 = 0x800;
+    pub const FEATURE_TLS: u32 = 0x1000;
+    pub const fn info(previous: u64) -> u64 {
+        super::version(0, 9, previous as u32 | FEATURE_FPU_SSE2 | FEATURE_TLS)
+    }
+    pub fn owns(number: u64) -> bool {
+        (THREAD_TLS_SET..=THREAD_TLS_GET).contains(&number)
+    }
+    pub fn valid_arguments(number: u64, arguments: [u64; 6]) -> bool {
+        match number {
+            THREAD_TLS_SET => {
+                crate::cpu_state::valid_tls(arguments[0]) && arguments[1..].iter().all(|v| *v == 0)
+            }
+            THREAD_TLS_GET => arguments.iter().all(|v| *v == 0),
+            _ => false,
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn version_advertises_only_present_predecessor_features() {
+            assert_eq!(info(super::super::v05::INFO), 0x9000018ff);
+            assert_eq!(info(super::super::v08::INFO), 0x900001fff);
+        }
+        #[test]
+        fn tls_arguments_are_full_width_and_reject_reserved_values() {
+            for base in [0, 0x402200, 0x7fffffffffff] {
+                assert!(valid_arguments(THREAD_TLS_SET, [base, 0, 0, 0, 0, 0]));
+            }
+            for base in [0x800000000000, 0xffff800000000000, u64::MAX] {
+                assert!(!valid_arguments(THREAD_TLS_SET, [base, 0, 0, 0, 0, 0]));
+            }
+            for op in [THREAD_TLS_SET, THREAD_TLS_GET] {
+                for index in if op == THREAD_TLS_SET { 1..6 } else { 0..6 } {
+                    let mut arguments = [0; 6];
+                    arguments[index] = 1 << 63;
+                    assert!(!valid_arguments(op, arguments));
+                }
+            }
+            assert!(valid_arguments(THREAD_TLS_GET, [0; 6]));
+        }
+        #[test]
+        fn legacy_dispatch_does_not_expose_tls_controls() {
+            for number in [THREAD_TLS_SET, THREAD_TLS_GET] {
+                assert!(owns(number));
+                assert_eq!(
+                    super::super::dispatch(number, [0; 6]),
+                    super::super::Outcome::Return {
+                        status: -1,
+                        scalar: 0
+                    }
+                );
+            }
+            assert!(!owns(THREAD_TLS_SET - 1));
+            assert!(!owns(THREAD_TLS_GET + 1));
+        }
+    }
+}
+
 /// Experimental capability ABI. Legacy dispatch/query remains version 0.1.
 pub mod v02 {
     pub const BOOTSTRAP_CAP_GET: u64 = 0x10;

@@ -28,7 +28,12 @@ use neu_kernel::{
     sync::SpinLock,
     syscall::{self as abi, Frame, Outcome},
 };
-global_asm!(".set NEU_DEVICE, {device}", ".set NEU_ABI08_DISABLED, {disabled}", include_str!("smp_scheduler.S"), device = const cfg!(feature = "device-test") as u8, disabled = const cfg!(feature = "test-smp-dma-disabled") as u8);
+global_asm!(".set NEU_DEVICE, {device}", ".set NEU_CPU_STATE, {extended}", ".set NEU_ABI08_DISABLED, {disabled}", include_str!("smp_scheduler.S"), device = const cfg!(feature = "device-test") as u8, extended = const cfg!(feature = "cpu-state-test") as u8, disabled = const cfg!(feature = "test-smp-dma-disabled") as u8);
+#[cfg(feature = "cpu-state-test")]
+#[path = "cpu_state.rs"]
+mod extended;
+#[cfg(all(feature = "cpu-state-test", not(feature = "device-test")))]
+global_asm!(include_str!("cpu_state.S"));
 #[cfg(all(feature = "device-test", not(feature = "dma-test")))]
 global_asm!(".set NEU_DMA_DISABLED, {disabled}", include_str!("smp_device.S"), disabled = const cfg!(feature = "test-smp-device-dma-disabled") as u8);
 #[cfg(feature = "dma-test")]
@@ -41,6 +46,11 @@ mod authority;
 mod devices;
 const MAGIC: u64 = 0x4e45_555f_5343_4831;
 const WORDS: usize = 64;
+const BRIDGE_WORDS: usize = if cfg!(feature = "cpu-state-test") {
+    32
+} else {
+    16
+};
 // DMA retains every AP continuation through up to 16 transfers per claim and
 // masked scrub/IRQ windows. K11 and earlier fixtures retain their own bounds.
 const TRACE_LIMIT: usize = if cfg!(feature = "dma-test") {
@@ -59,21 +69,28 @@ const USER: u64 = 3;
 const IDLE: u64 = 4;
 const STOPPED: u64 = 5;
 const FAILED: u64 = 6;
+#[cfg(not(all(feature = "cpu-state-test", not(feature = "device-test"))))]
 const FAULT_PROFILE: bool = cfg!(feature = "test-smp-schedule-fault");
+#[cfg(not(all(feature = "cpu-state-test", not(feature = "device-test"))))]
 const REJECT_PROFILE: bool = cfg!(feature = "test-smp-schedule-reject");
 const TLB_PROFILE: bool = cfg!(feature = "test-smp-tlb-2")
     || cfg!(feature = "test-smp-tlb-4")
     || cfg!(feature = "test-smp-tlb-invalid");
+#[cfg(not(all(feature = "cpu-state-test", not(feature = "device-test"))))]
 const IPC_PROFILE: bool =
     cfg!(feature = "test-smp-schedule-idle") || cfg!(feature = "test-smp-schedule-ipc");
-const MIGRATE: bool =
-    cfg!(feature = "test-smp-schedule-migrate") || cfg!(feature = "test-smp-schedule-stress");
-const TICKS: u64 = if cfg!(feature = "test-smp-schedule-stress") {
-    90
-} else {
-    40
-};
-const EXECUTION_PROBES: bool = !cfg!(feature = "test-smp-schedule-stress");
+const MIGRATE: bool = cfg!(feature = "test-smp-schedule-migrate")
+    || cfg!(feature = "test-smp-schedule-stress")
+    || cfg!(feature = "test-cpu-state-migrate")
+    || cfg!(feature = "test-cpu-state-stress");
+const TICKS: u64 =
+    if cfg!(feature = "test-smp-schedule-stress") || cfg!(feature = "test-cpu-state-stress") {
+        90
+    } else {
+        40
+    };
+const EXECUTION_PROBES: bool =
+    !cfg!(feature = "test-smp-schedule-stress") && !cfg!(feature = "test-cpu-state-stress");
 pub mod field {
     pub const PHASE: usize = 3;
     pub const THREAD: usize = 4;
@@ -123,7 +140,15 @@ pub mod field {
 struct Cpu {
     words: [AtomicU64; WORDS],
     frame: UnsafeCell<Frame>,
-    bridge: UnsafeCell<[u64; 16]>,
+    bridge: UnsafeCell<[u64; BRIDGE_WORDS]>,
+    #[cfg(feature = "cpu-state-test")]
+    kernel_fx: UnsafeCell<neu_kernel::cpu_state::FxImage>,
+    #[cfg(feature = "cpu-state-test")]
+    user_fx: UnsafeCell<neu_kernel::cpu_state::FxImage>,
+    #[cfg(feature = "cpu-state-test")]
+    baseline_fx: UnsafeCell<neu_kernel::cpu_state::FxImage>,
+    #[cfg(feature = "cpu-state-test")]
+    final_fx: UnsafeCell<neu_kernel::cpu_state::FxImage>,
 }
 // SAFETY: A verified logical CPU is the sole writer of its frame and bridge.
 // IRQ entry and the resumed controller exchange owned copies, never references.
@@ -159,7 +184,15 @@ impl Cpu {
                     ss: 0,
                 },
             }),
-            bridge: UnsafeCell::new([0; 16]),
+            bridge: UnsafeCell::new([0; BRIDGE_WORDS]),
+            #[cfg(feature = "cpu-state-test")]
+            kernel_fx: UnsafeCell::new(neu_kernel::cpu_state::FxImage::zero()),
+            #[cfg(feature = "cpu-state-test")]
+            user_fx: UnsafeCell::new(neu_kernel::cpu_state::FxImage::zero()),
+            #[cfg(feature = "cpu-state-test")]
+            baseline_fx: UnsafeCell::new(neu_kernel::cpu_state::FxImage::zero()),
+            #[cfg(feature = "cpu-state-test")]
+            final_fx: UnsafeCell::new(neu_kernel::cpu_state::FxImage::zero()),
         }
     }
     fn get(&self, index: usize) -> u64 {
@@ -256,6 +289,8 @@ static TLB_ADDRESS: AtomicU64 = AtomicU64::new(0);
 static TLB_TARGETS: AtomicU64 = AtomicU64::new(0);
 static TLB_ACKS: AtomicU64 = AtomicU64::new(0);
 struct State {
+    #[cfg(feature = "cpu-state-test")]
+    cpu_state: neu_kernel::cpu_state::Contexts<{ node::MAX_THREADS }>,
     nodes: Nodes,
     scheduler: Scheduler,
     objects: Objects,
@@ -279,6 +314,8 @@ struct State {
 impl State {
     const fn new() -> Self {
         Self {
+            #[cfg(feature = "cpu-state-test")]
+            cpu_state: neu_kernel::cpu_state::Contexts::new(),
             nodes: Nodes::new(),
             scheduler: Scheduler::empty(),
             objects: {
@@ -310,6 +347,8 @@ impl State {
         }
     }
     fn snapshot(&self) {
+        #[cfg(feature = "cpu-state-test")]
+        extended::snapshot(self);
         #[cfg(feature = "device-test")]
         devices::snapshot(self);
         #[cfg(feature = "authority-test")]
@@ -439,6 +478,19 @@ impl State {
     ) -> node::Result<u64> {
         self.scheduler
             .finish(&mut self.nodes, cpu, active, outcome)?;
+        #[cfg(feature = "cpu-state-test")]
+        for id in self.threads.into_iter().flatten() {
+            let thread = self.nodes.thread(id)?;
+            if thread.state == ThreadState::Exited && self.cpu_state.slots[id.index()].live != 0 {
+                self.cpu_state
+                    .retire(ActiveContext {
+                        node: thread.node,
+                        thread: id,
+                        context: thread.context,
+                    })
+                    .expect("CPU state retirement after all CPU owners release");
+            }
+        }
         if self.nodes.node(active.node)?.state == node::NodeState::Exited {
             #[cfg(feature = "device-test")]
             devices::node_exit(self, active.node);
@@ -724,6 +776,8 @@ fn trace(cpu: usize, f: ExceptionFrame, cr2: u64, address: u64, before: u64, aft
     for (cell, value) in neu_smp_sched_traces[cpu][index].0.iter().zip(words) {
         cell.store(value, Ordering::Release);
     }
+    #[cfg(feature = "cpu-state-test")]
+    extended::trace(cpu, index, f.vector);
     local.set(field::TRACE_COUNT, index as u64 + 1);
 }
 fn stage(cpu: usize, f: ExceptionFrame, cr2: u64) -> ! {
@@ -885,6 +939,26 @@ extern "C" fn neu_smp_sched_interrupt(pointer: *const ExceptionFrame) {
 }
 fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outcome {
     let number = f.registers.rax;
+    #[cfg(feature = "cpu-state-test")]
+    if abi::v09::owns(number) {
+        if !abi::v09::valid_arguments(number, f.registers.arguments()) {
+            return Outcome::Return {
+                status: abi::INVALID_ARGUMENT,
+                scalar: 0,
+            };
+        }
+        let scalar = if number == abi::v09::THREAD_TLS_SET {
+            s.cpu_state
+                .set_tls(active, f.registers.rdi)
+                .expect("validated current Thread TLS");
+            0
+        } else {
+            s.cpu_state
+                .tls(active)
+                .expect("current Thread TLS identity")
+        };
+        return Outcome::Return { status: 0, scalar };
+    }
     #[cfg(feature = "device-test")]
     if abi::v07::owns(number)
         || abi::v06::owns(number)
@@ -914,7 +988,7 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
     let result = (|| -> cap::Result<Outcome> {
         let scalar = match number {
             abi::ABI_QUERY => {
-                if cfg!(feature = "device-test") {
+                let previous = if cfg!(feature = "device-test") {
                     if cfg!(feature = "dma-test") {
                         abi::v08::INFO
                     } else {
@@ -924,6 +998,11 @@ fn operation(s: &mut State, cpu: usize, active: ActiveContext, f: Frame) -> Outc
                     abi::v06::INFO
                 } else {
                     abi::v05::INFO
+                };
+                if cfg!(feature = "cpu-state-test") {
+                    abi::v09::info(previous)
+                } else {
+                    previous
                 }
             }
             abi::v02::BOOTSTRAP_CAP_GET => lease
@@ -1039,6 +1118,8 @@ fn enter(cpu: usize, dispatch: &Dispatch) {
     {
         reject(cpu, 15);
     }
+    #[cfg(feature = "cpu-state-test")]
+    extended::load(cpu, active);
     local.set(field::THREAD, active.thread.raw());
     local.set(field::NODE, active.node.raw());
     local.set(6, active.context.space.raw());
@@ -1066,6 +1147,8 @@ fn enter(cpu: usize, dispatch: &Dispatch) {
     let raw = unsafe { core::slice::from_raw_parts(ptr::from_ref(&owned).cast::<u64>(), 20) };
     entry[10..30].copy_from_slice(raw);
     publish(&neu_smp_sched_entries[cpu][index].0, entry);
+    #[cfg(feature = "cpu-state-test")]
+    extended::entry(cpu, index);
     local.set(field::VECTOR, 0);
     unsafe {
         ptr::write(local.frame.get(), owned);
@@ -1186,6 +1269,8 @@ fn finish_fault(
 }
 fn handle(cpu: usize, dispatch: Dispatch) {
     let local = &neu_smp_sched_cpus[cpu];
+    #[cfg(feature = "cpu-state-test")]
+    extended::save(cpu, dispatch.active);
     let f = unsafe { ptr::read(local.frame.get()) };
     let vector = local.get(field::VECTOR);
     if !(matches!(vector, 128 | 224 | 241) || cfg!(feature = "device-test") && vector == 240) {
@@ -1424,6 +1509,8 @@ fn runtime(cpu: usize, mut bsp_paging: Option<(&mut Paging<'_, '_>, [&UserSpace;
     local.set(field::GS, rdmsr(0xc0000101));
     local.set(field::CR0, smp::cr0());
     local.set(field::EFER, smp::efer());
+    #[cfg(feature = "cpu-state-test")]
+    extended::scrub(cpu);
     unsafe {
         ptr::write_unaligned(
             (local.get(field::TSS) + 4) as *mut u64,
@@ -1490,6 +1577,8 @@ fn shootdown(paging: &mut Paging<'_, '_>, space: &UserSpace) {
     .expect("SMP TLB serial");
 }
 pub(super) fn ap_main(cpu: usize, _apic: u32) -> ! {
+    #[cfg(feature = "cpu-state-test")]
+    extended::probe_cpu(cpu);
     neu_smp_sched_cpus[cpu].set(field::PHASE, READY);
     for _ in 0..WAIT_LIMIT {
         if RELEASE.load(Ordering::Acquire) {
@@ -1765,6 +1854,8 @@ fn negatives(paging: &mut Paging<'_, '_>, space: &UserSpace, foreign_root: u64) 
     probe_wait();
 }
 pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
+    #[cfg(feature = "cpu-state-test")]
+    extended::configure()?;
     calibrate()?;
     let before = paging.stats();
     let tables = paging.table_count();
@@ -1792,10 +1883,26 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
     barrier_word(3).store(paging::text_range().0, Ordering::Release);
     let mut a = paging
         .prepare_domain_shared(payload(), 0, 0, [0; 4], None)
-        .map_err(|_| "SMP Node A root")?;
+        .map_err(|error| {
+            serial::write(format_args!(
+                "[NEU] SMP Node A root error: {error:?}, payload_bytes={}, tables={}\n",
+                payload().len(),
+                paging.table_count(),
+            ))
+            .expect("SMP Node A root diagnostic");
+            "SMP Node A root"
+        })?;
     let mut b = paging
         .prepare_domain_shared(payload(), 0, 0, [0; 4], None)
-        .map_err(|_| "SMP Node B root")?;
+        .map_err(|error| {
+            serial::write(format_args!(
+                "[NEU] SMP Node B root error: {error:?}, payload_bytes={}, tables={}\n",
+                payload().len(),
+                paging.table_count(),
+            ))
+            .expect("SMP Node B root diagnostic");
+            "SMP Node B root"
+        })?;
     neu_smp_sched_evidence[6].store(a.root, Ordering::Release);
     neu_smp_sched_evidence[7].store(b.root, Ordering::Release);
     paging
@@ -1912,7 +2019,12 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
                 .bootstrap_get(&s.objects, t.node, 4)
                 .map_err(|_| "SMP endpoint handle")?
                 .raw();
-            let action = if cfg!(feature = "device-test") {
+            #[cfg(all(feature = "cpu-state-test", not(feature = "device-test")))]
+            let action = extended::action(slot);
+            #[cfg(not(all(feature = "cpu-state-test", not(feature = "device-test"))))]
+            let action = if cfg!(feature = "test-cpu-state-disabled") {
+                17
+            } else if cfg!(feature = "device-test") {
                 30
             } else if cfg!(feature = "test-smp-device-disabled")
                 || cfg!(feature = "test-smp-dma-disabled")
@@ -1967,6 +2079,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
             s.nodes
                 .install_execution(id, SavedContext::initial_preemptible(active, binding))
                 .map_err(|_| "SMP saved context")?;
+            #[cfg(feature = "cpu-state-test")]
+            s.cpu_state
+                .install(active)
+                .map_err(|_| "CPU state initial ownership")?;
             s.data[slot] = paging
                 .smp_data_physical(space)
                 .map_err(|_| "SMP DATA backing")?
@@ -2107,6 +2223,10 @@ pub fn run(paging: &mut Paging<'_, '_>) -> Result<(), &'static str> {
         }
         if s.objects.stats() != cap::Stats::default() {
             return Err("SMP residual capability state");
+        }
+        #[cfg(feature = "cpu-state-test")]
+        if !s.cpu_state.clean() {
+            return Err("CPU state residual ownership or data");
         }
         Ok(())
     })?;

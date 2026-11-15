@@ -11,6 +11,7 @@ pub mod timer;
 extern crate std;
 
 pub mod context;
+pub mod cpu_state;
 pub mod scheduler;
 
 pub mod preemption;

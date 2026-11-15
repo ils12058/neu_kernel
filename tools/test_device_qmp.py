@@ -124,6 +124,48 @@ class DeviceOracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'omitted or fabricated'):
             extension.complete_traces([[]])
 
+    def test_extended_tls_journal_requires_real_frames_and_continuations(self):
+        self.model.tls = [0] * len(THREADS)
+        calls = [self.operation(0x29, [0x402200]),
+                 self.operation(0x2A, scalar=0x402200)]
+        class Observer:
+            require = staticmethod(require)
+        extension = Extension(Observer())
+        extension.model = self.model
+        traces = []
+        for row in calls:
+            before, after = [0]*20, [0]*20
+            before[14] = row[6]
+            for index, value in zip((8, 9, 11, 5, 7, 6), row[7:13]):
+                before[index] = value
+            after[14], after[11] = row[13:15]
+            extension.native_result(before, after, 0, 0, row[5])
+            trace = [0]*40
+            trace[0], trace[4], trace[10:30] = row[5], 128, before
+            traces.append(trace)
+        extension.complete_traces([traces])
+        with self.assertRaisesRegex(AssertionError, 'omitted or fabricated'):
+            extension.complete_traces([traces[1:]])
+        traces[0][18] ^= 1
+        with self.assertRaisesRegex(AssertionError, 'omitted or fabricated'):
+            extension.complete_traces([traces])
+        traces[0][18] ^= 1
+        extension.matched.remove((0, calls[1][5]))
+        with self.assertRaisesRegex(AssertionError, 'lacks observed continuation'):
+            extension.complete_traces([traces])
+
+    def test_tls_journal_rejects_foreign_results_reserved_args_and_legacy_exposure(self):
+        self.model.tls = [0] * len(THREADS)
+        self.operation(0x29, [0x402200])
+        self.operation(0x29, [0x7FFFFFFFFFFF, 1 << 63], status=-2)
+        self.operation(0x2A, scalar=0x402200)
+        self.operation(0x2A, owner=1)
+        with self.assertRaisesRegex(AssertionError, 'independent model'):
+            self.operation(0x2A, owner=1, scalar=0x402200)
+        self.model.tls = None
+        with self.assertRaisesRegex(AssertionError, 'unexpected operation'):
+            self.operation(0x29, [0x402200])
+
 
 class HardwareOracleTests(unittest.TestCase):
     def setUp(self):

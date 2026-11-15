@@ -1,5 +1,5 @@
 # Reusable per-CPU Ring 3 bridge. Every Frame is an owned 160-byte value.
-# Bridge headers are 16 words and owned by the executing CPU alone.
+# Bridge headers are CPU-owned; extended-state profiles add a private tail.
 .section .text.smp_scheduler,"ax"
 .balign 16
 .global neu_smp_sched_enter
@@ -21,9 +21,42 @@ neu_smp_sched_enter:
     mov [r8 + 72], rsi
     mov rax, cr0
     mov [r8 + 32], rax
+.if NEU_CPU_STATE
+    # Capture original controls/FS before enabling the declared x87/SSE2 set.
+    mov rax, cr4
+    mov [r8 + 136], rax
+    mov ax, fs
+    movzx rax, ax
+    mov [r8 + 176], rax
+    mov ecx, 0xc0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [r8 + 144], rax
+    mov rax, [r8 + 32]
+    and rax, -13              # clear EM/TS; eager ownership, never lazy #NM
+    or rax, 34                # MP and NE (architectural #MF)
+    mov cr0, rax
+    mov rax, [r8 + 136]
+    and rax, -327681          # no OSXSAVE or direct FSGSBASE
+    or rax, 1536              # OSFXSR and OSXMMEXCPT
+    mov cr4, rax
+    mov rax, [r8 + 160]
+    fxsave64 [rax]            # original kernel state, before user restore
+    mov rax, [r8 + 168]
+    fxrstor64 [rax]
+    xor eax, eax
+    mov fs, ax
+    mov ecx, 0xc0000100
+    mov rax, [r8 + 152]
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+.else
     or rax, 12                 # no unsaved FPU/SIMD state
     and rax, -3
     mov cr0, rax
+.endif
     mov ecx, 0xc0000080
     rdmsr
     shl rdx, 32
@@ -162,6 +195,9 @@ neu_smp_sched_syscall:
     push 128
     SAVE_GPRS
     swapgs
+.if NEU_CPU_STATE
+    call neu_smp_sched_capture_extended
+.endif
     cld
     mov ax, 0x10
     mov ds, ax
@@ -195,6 +231,12 @@ neu_smp_sched_irq_common:
     cli
     cld
     SAVE_GPRS
+.if NEU_CPU_STATE
+    test byte ptr [rsp + 144], 3
+    jz 8f
+    call neu_smp_sched_capture_extended
+8:
+.endif
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -206,6 +248,9 @@ neu_smp_sched_irq_common:
     mov rsp, rbx
     test byte ptr [rsp + 144], 3
     jz 2f
+.if NEU_CPU_STATE
+    call neu_smp_sched_restore_extended
+.endif
     mov ax, 0x33
     mov ds, ax
     mov es, ax
@@ -222,6 +267,11 @@ neu_smp_sched_resume:
     mov r8, rdi
     mov rax, [r8 + 24]
     mov cr3, rax
+.if NEU_CPU_STATE
+    # The capture stub already restored kernel FP/FS and its original controls.
+    mov rax, [r8 + 136]
+    mov cr4, rax
+.endif
     mov rax, [r8 + 32]
     mov cr0, rax
     mov ax, 0x10
@@ -271,6 +321,67 @@ neu_smp_sched_resume:
     pop rbx
     pop rbp
     ret
+
+.if NEU_CPU_STATE
+# All user GPRs are already on an owned kernel stack. KERNEL_GS_BASE contains
+# the trusted bridge; native entry has performed its second SWAPGS first.
+.global neu_smp_sched_capture_extended
+neu_smp_sched_capture_extended:
+    mov ecx, 0xc0000102
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov r8, rax
+    mov rax, [r8 + 168]
+    fxsave64 [rax]
+    mov ecx, 0xc0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [r8 + 152], rax
+    mov rax, [r8 + 160]
+    fxrstor64 [rax]
+    mov ax, [r8 + 176]
+    mov fs, ax
+    mov ecx, 0xc0000100
+    mov rax, [r8 + 144]
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+    mov rax, [r8 + 136]
+    mov cr4, rax
+    mov rax, [r8 + 32]
+    mov cr0, rax
+    ret
+
+# A handled IRQ may return directly to the same user slice. Restore its
+# freshly captured image/TLS instead of exposing the kernel's register state.
+.global neu_smp_sched_restore_extended
+neu_smp_sched_restore_extended:
+    mov ecx, 0xc0000102
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov r8, rax
+    mov rax, [r8 + 32]
+    and rax, -13
+    or rax, 34
+    mov cr0, rax
+    mov rax, [r8 + 136]
+    and rax, -327681
+    or rax, 1536
+    mov cr4, rax
+    mov rax, [r8 + 168]
+    fxrstor64 [rax]
+    xor eax, eax
+    mov fs, ax
+    mov ecx, 0xc0000100
+    mov rax, [r8 + 152]
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+    ret
+.endif
 
 .global neu_smp_sched_idle, neu_smp_sched_idle_begin, neu_smp_sched_idle_end
 neu_smp_sched_idle:
@@ -330,7 +441,7 @@ neu_smp_sched_tlb_probe_end:
 .global neu_smp_sched_barrier
 neu_smp_sched_barrier: .skip 4096
 
-.if !NEU_DEVICE
+.if !NEU_DEVICE && !NEU_CPU_STATE
 # Same payload for every Thread; bootstrap stack words select tag and action.
 # DATA has 128-byte private records per tag: progress, canary, ABI, received
 # value, terminal tag. The two Threads of Node A share DATA but own disjoint
@@ -423,6 +534,8 @@ neu_smp_sched_user_loop_begin:
     cmp qword ptr [r15], 1
     jne neu_smp_sched_user_loop_begin
 neu_smp_sched_user_loop_end:
+    cmp qword ptr [rbp + 40], 17
+    je neu_cpu_disabled
     cmp qword ptr [rbp + 40], 18
     je neu_device_disabled
     cmp qword ptr [rbp + 40], 19
@@ -810,6 +923,21 @@ neu_authority_pending_fault_wait:
 neu_authority_pending_fault_site:
     mov qword ptr [rax], 255   # cancels requester while its revoke is pending
     jmp neu_smp_sched_bad
+neu_cpu_disabled:
+    mov ebx, 0x29
+neu_cpu_disabled_loop:
+    xor edi, edi
+    xor esi, esi
+    AUTH_ZERO
+    mov rax, rbx
+    syscall
+    cmp rax, -1
+    jne neu_smp_sched_bad
+    inc qword ptr [rbp + 104]
+    inc ebx
+    cmp ebx, 0x2b
+    jb neu_cpu_disabled_loop
+    jmp neu_smp_sched_user_done
 neu_device_disabled:
     mov rdi, [rbp + 56]
     xor esi, esi

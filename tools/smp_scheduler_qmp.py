@@ -39,15 +39,28 @@ DMA = {"smp-dma-2": 2, "smp-dma-4": 4, "smp-dma-slot": 2, "smp-dma-bridge": 4,
        "smp-dma-unmapped": 2, "smp-dma-readonly": 2, "smp-dma-requester": 4, "smp-dma-revoked": 4,
        "smp-dma-close": 2, "smp-dma-revoke": 4, "smp-dma-submit-revoke": 4, "smp-dma-fault": 4,
        "smp-dma-timeout": 2, "smp-dma-quota": 2}
+CPU_STATE = {"cpu-state-2": 2, "cpu-state-4": 4, "cpu-state-migrate": 4, "cpu-state-kernel": 4,
+             "cpu-state-blocked": 2, "cpu-state-blocked-4": 4,
+             "cpu-state-negative": 2, "cpu-state-x87-fault": 4,
+             "cpu-state-sse-status": 4, "cpu-state-avx-denied": 4,
+             "cpu-state-fsgsbase-denied": 4, "cpu-state-stress": 4,
+             "cpu-state-dma": 4}
+EXTENDED_FAULT = {"cpu-state-x87-fault": (16, "neu_cpu_x87_fault"),
+                  "cpu-state-sse-status": (6, "neu_cpu_sse_status_fault"),
+                  "cpu-state-avx-denied": (6, "neu_cpu_avx_fault"),
+                  "cpu-state-fsgsbase-denied": (6, "neu_cpu_fsgsbase_fault")}
+DMA["cpu-state-dma"] = 4
 DEVICE.update(DMA)
 CASES.update(DEVICE)
 CASES["smp-device-disabled"] = 2
 CASES["smp-dma-disabled"] = 2
+CASES.update(CPU_STATE)
+CASES["cpu-state-disabled"] = 2
 AUTHORITY_FAULT = {"smp-authority-2", "smp-authority-4", "smp-authority-queued", "smp-authority-terminate"}
-MIGRATE = {"smp-schedule-migrate", "smp-schedule-stress"}
-IPC = {"smp-schedule-idle", "smp-schedule-ipc"}
+MIGRATE = {"smp-schedule-migrate", "smp-schedule-stress", "cpu-state-migrate", "cpu-state-stress", "cpu-state-kernel"}
+IPC = {"smp-schedule-idle", "smp-schedule-ipc", "cpu-state-blocked", "cpu-state-blocked-4"}
 TLB = {"smp-tlb-2", "smp-tlb-4", "smp-tlb-invalid"}
-CPU_FAULT = TLB | {"smp-schedule-fault", "smp-device-fault", "smp-device-flight-fault", "smp-dma-fault"} | AUTHORITY_FAULT
+CPU_FAULT = TLB | {"smp-schedule-fault", "smp-device-fault", "smp-device-flight-fault", "smp-dma-fault"} | AUTHORITY_FAULT | set(EXTENDED_FAULT)
 FAULT = CPU_FAULT | {"smp-schedule-reject"}
 MAGIC = 0x4E45555F53434831
 LAYOUT = [MAGIC, 4, 64, 832, 512, 672, 256, 32, 256]
@@ -137,6 +150,7 @@ class Observer:
         self.qmp, self.case, self.symbols = qmp, case, symbols
         self.deadline, self.failure, self.output = deadline, failure, output
         self.cpus = CASES[case]
+        self.cpu_stride = 3008 if case in CPU_STATE else 832
         self.trace_limit = 2048 if case in DMA else 512 if case in DEVICE else 256
         self.trace_stride = self.trace_limit * 256
         self.baseline = self.prepared = None
@@ -144,6 +158,10 @@ class Observer:
         self.concurrent = self.blocked = self.migrated = self.quiesced = False
         self.negatives = False
         self.runtime_checks = 0
+        self.cpu_extension = None
+        if case in CPU_STATE:
+            from cpu_state_qmp import Extension
+            self.cpu_extension = Extension(self)
         self.device_extension = None
         if case in DMA:
             from dma_qmp import Extension
@@ -249,6 +267,8 @@ class Observer:
             return False
 
         table_layout = d[48:54]
+        self.require(table_layout[2] == (96 if self.case == "cpu-state-dma" else 64),
+                     "unexpected page-table capacity for this profile")
         tables = []
         for index in range(table_layout[2]):
             row = memory.read(table_layout[0] + index * table_layout[1], table_layout[1])
@@ -371,7 +391,7 @@ class Observer:
                     self.require(live[cpu]["cr3"] == root and cpu_words[cpu][4] == thread
                                  and cpu_words[cpu][5] == node and live[cpu]["gs"] == 0
                                  and live[cpu]["cs"] == CS and live[cpu]["ss"] == SS
-                                 and live[cpu]["rfl"] & 0x200 and live[cpu]["cr0"] & 12 == 12
+                                 and live[cpu]["rfl"] & 0x200 and live[cpu]["cr0"] & 12 == (0 if self.cpu_extension else 12)
                                  and live[cpu]["efer"] & 1, "actual Ring 3 CPU disagrees with its production slot")
                     self.require(CODE <= live[cpu]["rip"] < CODE + 4096, "Ring 3 CPU escaped its executable payload")
                     self.require(KSTACK[slot] == cpu_words[cpu][9] and KSTACK[slot] + 8192 == cpu_words[cpu][10]
@@ -740,7 +760,7 @@ class Observer:
         self.require(scheduler["counters"][0] >= 40 and scheduler["counters"][1] >= 40
                      and scheduler["counters"][5] == (2 if self.case == "smp-authority-terminate" else 3) and not scheduler["active"]
                      and all(not q for q in scheduler["queues"]), "scheduler did not preempt and terminate three Threads")
-        probes_required = self.case != "smp-schedule-stress"
+        probes_required = self.case not in ("smp-schedule-stress", "cpu-state-stress")
         self.require((not probes_required or set(self.native) == set(self.irq) == {0, 1}) and self.concurrent,
                      "missing direct native/IRQ/same-Node concurrent evidence")
         self.require(not any(self.array(memory, "NEU_LAST_FAULT", 24)), "contained user fault touched the fatal kernel record")
@@ -748,7 +768,8 @@ class Observer:
             self.require(self.migrated and scheduler["counters"][4] == 1, "migration did not reach CPU3")
         if self.case in IPC:
             self.require(self.blocked and scheduler["counters"][2:4] == [1, 1], "blocking/wakeup did not commit exactly once")
-            self.require(authority["counters"]["sent"] == [2, 0] and authority["counters"]["received"] == [0, 2]
+            messages = 1 if self.cpu_extension else 2
+            self.require(authority["counters"]["sent"] == [messages, 0] and authority["counters"]["received"] == [0, messages]
                          and authority["counters"]["discarded"] == [0, 0], "scalar/capability messages were lost or duplicated")
         if self.case in FAULT:
             self.require(self.quiesced and (evidence[56] == 0 if self.case == "smp-authority-terminate" else evidence[56] != 0)
@@ -759,7 +780,7 @@ class Observer:
                      "terminal observation lost execution pins before all CPUs were stopped")
         for slot, row in enumerate(data):
             self.require(row[0] > 0 and row[1] == 0x1122334455667788
-                         and row[2] == (0x8000007FF if self.case in DMA else 0x7000003FF if self.device_extension else (0x6000001FF if self.authority_extension else 0x5000000FF))
+                         and row[2] == (self.cpu_extension.info if self.cpu_extension else 0x8000007FF if self.case in DMA else 0x7000003FF if self.device_extension else (0x6000001FF if self.authority_extension else 0x5000000FF))
                          and (self.authority_extension or row[10] == 11) and row[7] != 0,
                          "Thread lost progress/register canary/ABI/inspection result")
             if self.case not in FAULT or slot == 1:
@@ -768,16 +789,18 @@ class Observer:
             self.require(all(row[13] == 7 for row in data), "legacy ABI accepted a device operation")
         if self.case == "smp-authority-disabled":
             self.require(all(row[13] == 2 for row in data), "legacy ABI did not reject both authority operations on every Thread")
+        if self.case == "cpu-state-disabled":
+            self.require(all(row[13] == 2 for row in data), "legacy ABI accepted TLS operations")
         if self.case == "smp-schedule-shared":
             shared = physical.word(self.prepared["data"][0] + 0x300)
             self.require(data[0][5] == data[2][5] == 8 and shared == data[0][0] + data[2][0],
                          "concurrent same-Node atomic increments were lost or fabricated")
         if self.case in IPC:
-            self.require(data[1][3] == 0x1101 and data[0][11] == (-17 & MASK64)
-                         and data[1][11] == 1 and physical.word(self.prepared["barrier"] + 40) == 1,
+            self.require(data[1][3] == 0x1101 and (self.cpu_extension or data[0][11] == (-17 & MASK64)
+                         and data[1][11] == 1 and physical.word(self.prepared["barrier"] + 40) == 1),
                          "scalar receipt, stale moved handle or transferred Flag result missing")
         if self.case in FAULT:
-            fault_vector = 128 if self.case == "smp-schedule-reject" else 14
+            fault_vector = EXTENDED_FAULT[self.case][0] if self.case in EXTENDED_FAULT else 128 if self.case == "smp-schedule-reject" else 14
             self.require(scheduler["threads"][0]["words"][7:9] == [3, THREADS[2]]
                          and scheduler["threads"][2]["words"][7:9] == [2, fault_vector]
                          and physical.word(self.prepared["barrier"] + 32) == 1,
@@ -808,7 +831,7 @@ class Observer:
                          and local[14] == local[15] and live[cpu]["cr3"] == evidence[3]
                          and live[cpu]["gs"] == self.symbol("neu_smp_cpus") + cpu * 384
                          and not live[cpu]["efer"] & 1, "CPU did not restore its root/GS/MSR or pair IRQ acknowledgements")
-            bridges = memory.words(self.symbol("neu_smp_sched_cpus") + cpu * 832 + 672, 16)
+            bridges = memory.words(self.symbol("neu_smp_sched_cpus") + cpu * self.cpu_stride + 672, 16)
             if local[11]:
                 self.require(bridges[3] == evidence[3] and bridges[4] == live[cpu]["cr0"]
                              and bridges[5] == live[cpu]["efer"] and bridges[6] == live[cpu]["gs"], "bridge did not restore saved kernel controls")
@@ -828,7 +851,7 @@ class Observer:
             for row in cpu_traces:
                 # The generic exception stub explicitly clears both GS MSRs
                 # before calling Rust. Native/IRQ stubs retain KERNEL_GS_BASE.
-                expected_gs = self.symbol("neu_smp_sched_cpus") + cpu * 832 + 672 if row[4] in (128, 224, 241) or self.device_extension and row[4] == 240 else 0
+                expected_gs = self.symbol("neu_smp_sched_cpus") + cpu * self.cpu_stride + 672 if row[4] in (128, 224, 241) or self.device_extension and row[4] == 240 else 0
                 self.require(row[0] > 0 and row[1] in THREADS and row[7] == cpu and row[8] == expected_gs,
                              "exit trace has foreign CPU/GS bridge: " + repr(row[:10]))
                 slot = THREADS.index(row[1])
@@ -852,10 +875,15 @@ class Observer:
                                      "rejection trace differs from the actual malformed normalized frame")
                         rejected.append({"cpu": cpu, "address": address, "normalized": normalized, "trace": row})
                 else:
+                    extended_fault = self.case in EXTENDED_FAULT
                     wanted_error = 6 if self.authority_extension else 7
                     wanted_address = 0xffffb00000001000 if self.case in ("smp-device-fault", "smp-device-flight-fault", "smp-dma-fault") else 0x440000 if self.case == "smp-authority-terminate" else (0x410010 if self.authority_extension else (0x410210 if self.case in TLB else self.symbol("__text_start")))
                     wanted_site = "neu_authority_pending_fault_site" if self.case == "smp-authority-terminate" else ("neu_authority_fault_site" if self.authority_extension else ("neu_smp_sched_tlb_fault_site" if self.case in TLB else "neu_smp_sched_fault_site"))
-                    self.require(self.case in CPU_FAULT and slot == 2 and row[4] == 14
+                    wanted_vector = 14
+                    if extended_fault:
+                        wanted_vector, wanted_site = EXTENDED_FAULT[self.case]
+                        wanted_error, wanted_address = 0, 0
+                    self.require(self.case in CPU_FAULT and slot == 2 and row[4] == wanted_vector
                                  and row[9] == wanted_error and row[5] == wanted_address
                                  and row[25] == self.site(wanted_site),
                                  "fault vector/error/CR2/site differs from the actual denied user access")
@@ -864,7 +892,7 @@ class Observer:
                     self.require(walked["present"], "terminal fault's actual stack frame was reclaimed early")
                     normalized = physical.words((walked["leaf"] & PA) + (address & 4095), 22)
                     self.require(normalized[:15] + normalized[17:] == row[10:30]
-                                 and normalized[15:17] == [14, wanted_error]
+                                 and normalized[15:17] == [wanted_vector, wanted_error]
                                  and KSTACK[slot] <= row[6] < address,
                                  "fault trace differs from its actual normalized hardware frame")
                     self.frame_valid(row[10:30], slot, True)
@@ -896,12 +924,18 @@ class Observer:
             streams[str(thread)] = {"cpus": cpu_order, "entries": len(stream), "last_boundary": previous}
         if self.device_extension:
             self.device_extension.complete_traces(traces)
+        if self.cpu_extension:
+            self.cpu_extension.terminal(memory, physical, live, cpu_words, scheduler, data, entries, traces)
         self.output.append({"stage": "terminal", "registers": live, "scheduler": scheduler, "authority": authority,
                             "data": data, "entries": entries, "traces": traces, "streams": streams,
                             "rejected_returns": rejected,
                             "inventory": inventory, "evidence": evidence})
 
     def native_result(self, before, after, slot, cpu=None, entry=None):
+        if self.cpu_extension and self.cpu_extension.native_result(before, after, slot):
+            if self.device_extension:
+                self.device_extension.native_result(before, after, slot, cpu, entry)
+            return
         if self.device_extension:
             return self.device_extension.native_result(before, after, slot, cpu, entry)
         if self.authority_extension:
@@ -909,7 +943,7 @@ class Observer:
         operation = before[14]
         status, value = after[14], after[11]
         if operation == 1:
-            wanted = (0, 0x5000000FF)
+            wanted = (0, self.cpu_extension.info if self.cpu_extension else 0x5000000FF)
         elif operation == 0x12:
             wanted = (0, 11)
         elif operation in (0x11, 0x13, 0x17, (-256 & MASK64)):
@@ -921,7 +955,7 @@ class Observer:
         elif operation == 0x10 or operation == 0x18 and status == 0:
             self.require(status == 0 and value != 0, "bootstrap/received capability did not return a live handle")
             return
-        elif (operation in (0x19, 0x1a) and self.case == "smp-authority-disabled") or (0x1b <= operation <= 0x21 and self.case == "smp-device-disabled") or (0x22 <= operation <= 0x28 and self.case == "smp-dma-disabled"):
+        elif (operation in (0x19, 0x1a) and self.case == "smp-authority-disabled") or (0x1b <= operation <= 0x21 and self.case == "smp-device-disabled") or (0x22 <= operation <= 0x28 and self.case == "smp-dma-disabled") or (operation in (0x29, 0x2a) and self.case == "cpu-state-disabled"):
             wanted = ((-1 & MASK64), 0)
         elif operation == 0x18:
             wanted = ((-32 & MASK64), 0)
@@ -932,7 +966,10 @@ class Observer:
     def snapshot(self):
         memory = VirtualMemory(self.qmp, self.failure)
         physical = PhysicalMemory(self.qmp, 0, self.failure)
-        self.require(self.array(memory, "neu_smp_sched_layout", 9) == LAYOUT[:6] + [self.trace_limit] + LAYOUT[7:],
+        expected_layout = LAYOUT[:]
+        expected_layout[3] = self.cpu_stride
+        expected_layout[6] = self.trace_limit
+        self.require(self.array(memory, "neu_smp_sched_layout", 9) == expected_layout,
                      "unknown scheduler schema")
         evidence = self.array(memory, "neu_smp_sched_evidence", 64)
         descriptor = self.array(memory, "neu_smp_sched_inventory", 64)
@@ -958,7 +995,7 @@ class Observer:
                 self.symbol("neu_smp_sched_probe_begin") <= live[0]["rip"] <
                 self.symbol("neu_smp_sched_probe_end")):
             return None
-        cpu_words = [memory.words(self.symbol("neu_smp_sched_cpus") + cpu * 832, 64) for cpu in range(self.cpus)]
+        cpu_words = [memory.words(self.symbol("neu_smp_sched_cpus") + cpu * self.cpu_stride, 64) for cpu in range(self.cpus)]
         validate_trace_counts(cpu_words, self.trace_limit, self.require)
         blocks = [memory.words(self.symbol("neu_smp_cpus") + cpu * 384, 48) for cpu in range(self.cpus)]
         self.require(all(b[1] == cpu and b[3] == self.apics[cpu] for cpu, b in enumerate(blocks)), "actual CPU blocks disagree with QEMU APIC identities")
@@ -973,6 +1010,8 @@ class Observer:
                          and evidence[8:10] == [divided_hz, initial], "timer quantum does not follow actual PIT calibration samples")
             self.require(not inv["frames"] and not inv["mappings"] and not any(s["live"] for s in inv["spaces"]), "baseline has private user backing")
             self.baseline = {"inventory": inv, "registers": live, "kernel_root": evidence[3]}
+            if self.cpu_extension:
+                self.cpu_extension.baseline(memory, live)
             self.output.append({"stage": "baseline", **self.baseline})
             return phase
         self.require(self.baseline is not None, "user execution began before an independent baseline")
@@ -990,6 +1029,8 @@ class Observer:
             descriptors = self.descriptors(memory, physical, blocks, live, cpu_words, phase, evidence[3])
             self.output.append({"stage": "prepared", "scheduler": scheduler, "authority": authority,
                                 "descriptors": descriptors, "registers": live, "evidence": evidence, **self.prepared})
+            if self.cpu_extension:
+                self.cpu_extension.prepared(memory, physical, scheduler)
         elif phase == 5 and not self.negatives:
             inv = self.inventory(memory, physical, descriptor)
             rows = self.array(memory, "neu_smp_sched_negatives", 176)
@@ -1006,6 +1047,8 @@ class Observer:
             self.negatives = True
             self.output.append({"stage": "negatives", "cases": records, "inventory": inv, "scheduler": scheduler})
         elif phase in (1, 2) and self.prepared is not None:
+            if self.cpu_extension:
+                self.cpu_extension.observe(memory, physical, live, cpu_words, scheduler)
             self.probes(memory, physical, live, cpu_words, scheduler, evidence)
             user_a = [a for a in scheduler["active"] if a["node"] == NODES[0] and live[a["cpu"]]["cpl"] == 3]
             if len(user_a) == 2 and not self.concurrent:
@@ -1061,6 +1104,8 @@ class Observer:
                 self.require(re.search(r"ISR\s+\(none\)", lapic) and re.search(r"IRR\s+\(none\)", lapic), "final LAPIC has a pending/in-service interrupt")
             if self.case == "smp-tlb-invalid":
                 self.require(self.negatives, "missing independently checked negative matrix")
+            if self.cpu_extension:
+                self.cpu_extension.final(memory, live, cpu_words)
             self.output.append({"stage": "final", "inventory": inv, "registers": live, "descriptors": descriptors,
                                 "scheduler": scheduler, "authority": authority, "evidence": evidence})
             return phase

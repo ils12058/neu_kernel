@@ -1,5 +1,46 @@
 # Neu Kernel implementation status
 
+## Post-PCI/DMA / FPU, SIMD and Thread TLS — complete for bounded x86-64/QEMU (2026-11-15)
+
+This slice starts from accepted PCI/DMA commit `c9b370ffa47ed3ef4009e0774a207d94516c2b74`
+on `codex/fpu-simd-tls`. [CPU-state completion](CPU_STATE_COMPLETION.md),
+[ADR 0033](adr/0033-eager-fpu-simd-thread-tls.md),
+[ABI 0.9](abi/experimental-v0.9.md) and the
+[QMP protocol](testing/cpu-state-qmp.md) define its scope and measured evidence.
+No new numbered architecture milestone is assigned.
+
+Eager FXSAVE64/FXRSTOR64 gives each Thread initialized x87/MMX/SSE2 state and
+all sixteen XMM registers. Full Thread/Node/root/AddressSpace identities and
+generations govern exclusive CPU ownership, saved copies and retirement.
+Assembly captures FP/FS before Rust on native/IRQ/exception entry and restores
+original kernel FP, FS selector/base and CR0/CR4. Blocking, direct IRQ return,
+resumption, migration and sibling cancellation preserve or scrub the same state.
+ABI 0.9 exposes only current-Thread FS_BASE SET/GET with full-width validation.
+TLS allocation, ELF templates and runtime layout remain userspace policy.
+
+Validation passes 385 host tests in each of five configurations, 64 Python
+regressions, all 231 runnable QEMU profiles and 16 exact-image repeats.
+Doctor, default build, formatting and all profile/host lint pass. The frozen
+audit checks 111 inputs, 59 scheduled profiles, complete FP/TLS streams,
+DMA/native/IRQ evidence and exact final resource restoration. All
+1166 inventoried prior files retain their hashes. Results and capture hashes
+are recorded in `build/cpu-state-validation-summary.json` and the linked
+completion record. Source aggregate: `8b28e4df05cff150f18d4028503fe8b97f6397662e12f23913a5b8943ad90b6c`.
+
+Real `#MF`, SSE divide status/result, denied AVX/FSGSBASE and actual SSE2/MMX CPU
+refusals pass. The kernel's `#XM` gate/control path and portable containment are
+verified, but stock TCG does not deliver unmasked SIMD exceptions. FXSR-disabled
+OVMF does not reach Neu and is excluded from the runnable pass count. Actual
+`#XM` delivery and FXSR-deficient kernel boot remain explicitly unvalidated,
+along with physical hardware and hosted CI.
+
+The model remains x86-64 QEMU TCG/q35 with two/four CPUs, two Nodes, three
+Threads and fixed pools; combined DMA uses EDU/Intel legacy VT-d. AVX/XSAVE,
+general runtime factories, broader scheduling and kernel preemption remain
+future work. Earlier profiles retain their ABI and integer-only contracts.
+This section supersedes earlier statements that all FPU/SIMD/TLS work is future;
+the dated sections below preserve their historical counts and scope.
+
 ## Post-K11 / PCI, IOMMU and authorized DMA — complete for bounded x86-64/QEMU (2026-11-14)
 
 This work starts from accepted K11 commit

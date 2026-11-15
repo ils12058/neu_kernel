@@ -10,7 +10,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-global_asm!(include_str!("exceptions.S"));
+global_asm!(".set NEU_CPU_STATE, {enabled}", include_str!("exceptions.S"), enabled = const cfg!(feature = "cpu-state-test") as u8);
 
 struct Table<T>(UnsafeCell<T>);
 // SAFETY: One BSP initializes descriptor tables once with IF=0. Thereafter the

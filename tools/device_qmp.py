@@ -96,6 +96,7 @@ class DeviceModel:
         self.deferred_irq = False
         self.reason = self.deadline = self.tick = 0
         self.scrubs = set()
+        self.tls = None
 
     def grant(self, parent=0):
         result = self.next_grant
@@ -168,6 +169,10 @@ class DeviceModel:
             expected = (-101, handle) if handle <= 255 else (-2, 0)
         elif op == (MASK64 - 255):
             expected = 0, 0
+        elif self.tls is not None and op in (0x29, 0x2A):
+            from cpu_state_qmp import tls_result
+            slot = THREADS.index(thread)
+            expected, self.tls[slot] = tls_result(op, args, self.tls[slot])
         elif op == 0x10:
             wanted = self.bootstrap[owner][handle] if handle < 8 else 0
             expected = (0, wanted) if wanted in self.tables[owner] else (-16, 0)
@@ -443,6 +448,9 @@ class Extension:
                          'wrong device bootstrap authority')
             self.initial = copy.deepcopy(result)
             self.model = self.model_class(self.initial, self.require)
+            if self.o.cpu_extension:
+                self.model.info = self.o.cpu_extension.info
+                self.model.tls = [0] * len(THREADS)
             self.model.unsupported_dma = self.o.case == "smp-device-dma-disabled"
         if phase == 4:
             self.require(not grants, 'device lineage leaked at final cleanup')
